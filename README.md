@@ -46,13 +46,24 @@ python -m jrock.web
 # J+Rock dashboard: http://127.0.0.1:8080/?token=...
 ```
 
-Open the printed URL. The page has quick buttons for read-only queries, Autotrade
-ON/OFF buttons, and a box for any command or question.
+Open the printed URL. The page uses the same dark, monospace trader-console look as the
+Bitunix-full-agentic TypeScript dashboard: a controls panel (ENGINE, SCAN, AUTOTRADE,
+REPORT, MID-MGMT, REVERSAL toggles), a watchlist, account and close-position panels,
+quick settings, a read-only panel, a command box, the engine report, and a log.
+Toggle states refresh every 5 seconds from `GET /api/status`.
 
-The **Engine report** panel shows the latest periodic report and refreshes every
+The **engine report** panel shows the latest periodic report and refreshes every
 15 seconds while the page is open. Reports are still printed to the server console
 as before. The panel only reads the last report and never starts one. It shows
 "Report is off" until you run `report on`.
+
+**MID-MGMT** is a toggle: it switches the background management loop on or off. Breakeven
+and trailing stop moves only run inside a management pass, so with the loop stopped they
+never fire. The **run mid mgmt now** button sends `mid management trigger`, which runs one
+pass on demand (breakeven, trailing, ladder, partial and reversal checks on every open
+position) and shows the actions taken. It does not change the toggle. Plain breakeven
+also runs while a TP ladder is set; the ladder's own breakeven step (`ladder breakeven N`)
+then sees breakeven as done and does not send a second stop move.
 
 Autotrade ON sends `turn on autotrade`, which asks for confirmation first. The
 page then shows **Yes, confirm** and **No, cancel** buttons, which send `yes` or
@@ -125,7 +136,7 @@ engine on | engine off              status
 report on | report off              report interval sec 30
 trades_history | tpsl_history | pnl | positions history
 settings trade                      scan on | scan off
-mid management position trigger     reversal=true   reversal_confidence=70
+mid management | mid management trigger  reversal=true   reversal_confidence=70
 scans interval sec 30               breakeven threshold pct 0.6
 trailing trigger stop ROI pct 25    liq sl distance pct 50
 min agreeing strategies 3           timeframes 1m,3m,5m,15m

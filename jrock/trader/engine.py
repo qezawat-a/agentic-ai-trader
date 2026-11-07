@@ -1421,12 +1421,11 @@ class TraderEngine:
 
             # 1) breakeven
             #
-            # Skipped while a ladder is active: the ladder owns the breakeven
-            # move (TP_LADDER_BREAKEVEN_AFTER), and running both would send two
-            # identical modify calls on the same pass.
-            ladder_cfg = self._ladder_or_none()
-            ladder_owns_exits = bool(ladder_cfg and ladder_cfg.levels)
-            if not ladder_owns_exits and should_breakeven(st, roi, self.state.breakeven_pct):
+            # Runs even when a ladder is active. It sets breakeven_done, and the
+            # ladder's own breakeven step (TP_LADDER_BREAKEVEN_AFTER) only runs
+            # while breakeven_done is False, so the two never send a second
+            # modify for the same stop move.
+            if should_breakeven(st, roi, self.state.breakeven_pct):
                 sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
                               rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
                               liq=st.liq or None)
@@ -1836,6 +1835,16 @@ class TraderEngine:
         if low == "scan off":
             s.scan_on = False
             return "Scanner OFF."
+        # `mid management trigger` runs ONE management pass now: breakeven,
+        # trailing, ladder, partial and reversal checks on every open position.
+        # It must stay above the toggle below, which matches the same prefix.
+        if low.startswith("mid management") and "trigger" in low.split():
+            actions = await self.manage_positions()
+            if not actions:
+                return ("Mid management pass done: no open position needed a "
+                        "stop move, partial close or reversal close yet.")
+            return ("Mid management pass done:\n"
+                    + json.dumps(actions, indent=2, default=str))
         if low.startswith("mid management"):
             s.mid_management = not s.mid_management
             return f"Mid management = {s.mid_management}."

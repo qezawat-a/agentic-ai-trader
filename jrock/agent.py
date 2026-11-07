@@ -105,7 +105,10 @@ TRADER ENGINE COMMANDS
   report on | report off            report interval sec 30
   trades_history | tpsl_history | pnl | positions history
   settings trade                    scan on | scan off
-  mid management position trigger   reversal=true  reversal_confidence=70
+  mid management                    toggle the background management loop
+  mid management trigger            run one management pass now (breakeven,
+                                    trailing, partial, reversal) on open positions
+  reversal=true  reversal_confidence=70
   scans interval sec 30             breakeven threshold pct 0.6
   trailing trigger stop ROI pct 25  liq sl distance pct 50
   min agreeing strategies 3         timeframes 1m,3m,5m,15m

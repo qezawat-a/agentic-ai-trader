@@ -75,6 +75,18 @@ def test_command_rejects_non_json(tmp_path):
     _run(_with_client(tmp_path, go))
 
 
+def test_status_requires_token_and_reports_switches(tmp_path):
+    async def go(client):
+        assert (await client.get("/api/status")).status == 401
+        r = await client.get("/api/status", headers={"X-Auth-Token": TOKEN})
+        assert r.status == 200
+        body = await r.json()
+        assert body["autotrade"] is False
+        assert body["engine_on"] is False
+        assert "leverage" in body and "symbols" in body
+    _run(_with_client(tmp_path, go))
+
+
 def test_report_requires_token(tmp_path):
     async def go(client):
         assert (await client.get("/api/report")).status == 401
@@ -91,6 +103,47 @@ def test_report_returns_latest_text(tmp_path):
         assert body["report"] == "=== J+Rock report 12:00:00 ==="
         assert body["report_on"] is False
     _run(_with_client(tmp_path, go))
+
+
+def test_mid_management_trigger_runs_one_pass_and_keeps_toggle(tmp_path, monkeypatch):
+    """`mid management trigger` runs manage_positions once; it must not flip the toggle."""
+    async def go():
+        agent = _agent(tmp_path)
+        calls = []
+
+        async def fake_manage_positions():
+            calls.append(1)
+            return []
+
+        monkeypatch.setattr(agent.engine, "manage_positions", fake_manage_positions)
+        app = make_app(agent, TOKEN)
+        app.on_startup.clear()
+        app.on_cleanup.clear()
+        async with TestClient(TestServer(app)) as client:
+            headers = {"X-Auth-Token": TOKEN}
+
+            # Bare command flips the toggle: the first flip reports the new state.
+            r = await client.post("/api/command", json={"line": "mid management"},
+                                  headers=headers)
+            first = (await r.json())["output"]
+            assert "Mid management = " in first
+
+            # The trigger runs one pass and must not report a toggle change.
+            r = await client.post("/api/command",
+                                  json={"line": "mid management trigger"},
+                                  headers=headers)
+            assert r.status == 200
+            out = (await r.json())["output"]
+            assert "Mid management pass done" in out
+            assert "Mid management = " not in out
+            assert len(calls) == 1
+
+            # A second bare command must flip back, proving the trigger left state alone.
+            r = await client.post("/api/command", json={"line": "mid management"},
+                                  headers=headers)
+            second = (await r.json())["output"]
+            assert first != second
+    _run(go())
 
 
 def test_index_requires_token(tmp_path):

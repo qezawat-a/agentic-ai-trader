@@ -420,13 +420,18 @@ def test_engine_breakeven_after_level_one(tmp_path):
     assert st.sl >= 0.005 - 0.00001
 
 
-def test_engine_breakeven_after_two_waits(tmp_path):
+def test_plain_breakeven_runs_with_ladder_and_ladder_does_not_repeat_it(tmp_path):
+    """Plain breakeven runs alongside a ladder. It sets breakeven_done, so the
+    ladder's own breakeven step (breakeven_after=2 here, not yet due) and any
+    later ladder breakeven send no second stop move."""
     eng = _engine(tmp_path, "1R:25,2R:25,3R:25")
     eng.state.tp_ladder_breakeven_after = 2
     _pos(eng)
     _client(eng, 0.0052)
-    asyncio.run(eng.manage_positions())
-    assert eng.positions["P1"].breakeven_done is False
+    actions = asyncio.run(eng.manage_positions())
+    assert eng.positions["P1"].breakeven_done is True
+    assert [a for a in actions if a["action"] == "breakeven"]
+    assert not [a for a in actions if a["action"] == "ladder_breakeven"]
 
 
 def test_engine_runner_close_closes_the_remainder(tmp_path):
