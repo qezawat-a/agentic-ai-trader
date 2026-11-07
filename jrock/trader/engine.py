@@ -1283,6 +1283,43 @@ class TraderEngine:
             return False
         return True
 
+    def _managed_tp(self, st: "PositionState", side: str, entry: float,
+                    mark: float, rules: PairRules, action: str) -> float | None:
+        """The TP to re-send with a managed stop update, repaired if stale.
+
+        `st.tp` is captured once, when the position is opened, and is then
+        re-sent verbatim on every breakeven/trailing update. That is a trap:
+        once price runs far enough that the stored TP is no longer on the
+        correct side of the *mark*, the exchange validator refuses the whole
+        request - so the stop silently stops moving at exactly the moment a
+        trade is winning.
+
+        This re-clamps the TP against the CURRENT mark and returns a value that
+        will pass validation. When the stored TP had to be moved, that is
+        recorded on the position and logged, never hidden.
+
+        Returns None when the position has no take-profit.
+        """
+        if st.tp is None or st.tp <= 0:
+            return None
+        repaired = clamp_tp(side=side, tp=st.tp, entry=entry, mark=mark,
+                            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+        if repaired != st.tp:
+            old_tp = st.tp
+            log.warning("%s %s: stored TP %.8f is no longer on the correct "
+                        "side of mark %.8f - re-clamped to %.8f",
+                        st.symbol, action, old_tp, mark, repaired)
+            self.state.errors.append(
+                f"{st.symbol} {action}: TP was {old_tp:.8f} but the mark is now "
+                f"{mark:.8f}, so the update would have been rejected; TP "
+                f"re-clamped to {repaired:.8f}")
+            self._log_tpsl({"event": "tp_repaired", "ts": time.time(),
+                            "symbol": st.symbol, "position_id": st.position_id,
+                            "action": action, "old_tp": old_tp,
+                            "new_tp": repaired, "mark": mark})
+            st.tp = repaired
+        return repaired
+
     async def manage_positions(self) -> list[dict]:
         actions: list[dict] = []
         positions = await self.open_positions()
@@ -1390,10 +1427,14 @@ class TraderEngine:
                 sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
                               rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
                               liq=st.liq or None)
-                if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
+                # The stored TP is re-sent with the new stop, so it must be
+                # valid against the CURRENT mark or the exchange rejects the
+                # whole request and the stop never moves.
+                tp = self._managed_tp(st, side, entry, mark, rules, "breakeven")
+                if self._tpsl_side_ok(sym, side, entry, mark, sl, tp, rules):
                     try:
                         await self.client.modify_position_tp_sl_order(
-                            sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
+                            sym, pid, tp_price=format_price(tp, rules) if tp else None,
                             sl_price=format_price(sl, rules),
                             tp_stop_type=trigger_type, sl_stop_type=trigger_type)
                         st.breakeven_done = True
@@ -1418,10 +1459,11 @@ class TraderEngine:
                     sl = clamp_sl(side=side, sl=new_stop, entry=entry, mark=mark,
                                   rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
                                   liq=st.liq or None)
-                    if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
+                    tp = self._managed_tp(st, side, entry, mark, rules, "trail")
+                    if self._tpsl_side_ok(sym, side, entry, mark, sl, tp, rules):
                         try:
                             await self.client.modify_position_tp_sl_order(
-                                sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
+                                sym, pid, tp_price=format_price(tp, rules) if tp else None,
                                 sl_price=format_price(sl, rules),
                                 tp_stop_type=trigger_type, sl_stop_type=trigger_type)
                             st.trailing_stop = sl

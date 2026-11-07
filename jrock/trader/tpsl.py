@@ -185,16 +185,30 @@ def should_trail(state: PositionState, roi: float, trigger_roi_pct: float) -> bo
 
 def next_trailing_stop(state: PositionState, price: float, atr_value: float,
                        min_step_pct: float = 0.15) -> float | None:
-    """Ratchet the trailing stop; never loosen it."""
+    """Ratchet the trailing stop; never loosen it.
+
+    The floor is the stop that is ACTUALLY live on the exchange: the trailing
+    stop once trailing has armed, and the current ``sl`` before that (which is
+    the breakeven stop). Comparing only against ``trailing_stop`` was a bug -
+    on the first trailing tick it is still None, so the candidate was returned
+    unconditionally and could sit BELOW the breakeven stop, i.e. the very first
+    trailing update loosened the stop it was supposed to tighten.
+    """
     if atr_value <= 0:
         atr_value = price * 0.002
-    if state.side.upper() in ("LONG", "BUY"):
+    is_long = state.side.upper() in ("LONG", "BUY")
+    floor = state.trailing_stop if state.trailing_stop is not None else state.sl
+    if is_long:
         candidate = price - atr_value * 1.5
-        if state.trailing_stop is None or candidate > state.trailing_stop * (1 + min_step_pct / 100):
+        if floor is None or floor <= 0:
+            return candidate
+        if candidate > floor * (1 + min_step_pct / 100):
             return candidate
     else:
         candidate = price + atr_value * 1.5
-        if state.trailing_stop is None or candidate < state.trailing_stop * (1 - min_step_pct / 100):
+        if floor is None or floor <= 0:
+            return candidate
+        if candidate < floor * (1 - min_step_pct / 100):
             return candidate
     return None
 
