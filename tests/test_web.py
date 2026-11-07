@@ -75,6 +75,24 @@ def test_command_rejects_non_json(tmp_path):
     _run(_with_client(tmp_path, go))
 
 
+def test_report_requires_token(tmp_path):
+    async def go(client):
+        assert (await client.get("/api/report")).status == 401
+    _run(_with_client(tmp_path, go))
+
+
+def test_report_returns_latest_text(tmp_path):
+    async def go(client):
+        agent = client.app["agent"]
+        agent.engine.last_report = "=== J+Rock report 12:00:00 ==="
+        r = await client.get("/api/report", headers={"X-Auth-Token": TOKEN})
+        assert r.status == 200
+        body = await r.json()
+        assert body["report"] == "=== J+Rock report 12:00:00 ==="
+        assert body["report_on"] is False
+    _run(_with_client(tmp_path, go))
+
+
 def test_index_requires_token(tmp_path):
     async def go(client):
         assert (await client.get("/")).status == 401

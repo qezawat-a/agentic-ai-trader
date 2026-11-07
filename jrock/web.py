@@ -48,6 +48,10 @@ pre{white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px;max-heigh
 button{background:#2a3140;color:#e6e6e6;border:0;border-radius:6px;padding:8px 10px;margin:3px;font-size:13px}
 input{width:68%;padding:8px;border-radius:6px;border:1px solid #2a3140;background:#0f1115;color:#e6e6e6}
 .wide{grid-column:1/-1}
+.danger{background:#5a2630}
+.confirm{display:none}
+.confirm.show{display:block;margin-top:8px}
+.confirm button{font-weight:600}
 </style>
 </head>
 <body>
@@ -58,11 +62,26 @@ input{width:68%;padding:8px;border-radius:6px;border:1px solid #2a3140;backgroun
 <div id="quick"></div>
 </section>
 <section>
+<h2>Autotrade (asks before it runs)</h2>
+<div>
+<button class="danger" data-line="turn on autotrade">Autotrade ON</button>
+<button data-line="turn off autotrade">Autotrade OFF</button>
+</div>
+<div id="confirm" class="confirm">
+<button class="danger" id="yes">Yes, confirm</button>
+<button id="no">No, cancel</button>
+</div>
+</section>
+<section>
 <h2>Command or question</h2>
 <form id="form">
 <input id="line" placeholder="e.g. balance, close my AKEUSDT position, why did the last order fail" autocomplete="off">
 <button type="submit">Run</button>
 </form>
+</section>
+<section class="wide">
+<h2>Engine report (refreshes every 15s while this page is open)</h2>
+<pre id="report">No report yet. Turn it on with the "report on" command.</pre>
 </section>
 <section class="wide">
 <h2>Output</h2>
@@ -75,6 +94,14 @@ const out = document.getElementById("out");
 const QUICK = ["status", "balance", "positions", "orders", "pnl", "price",
                "funding", "leverage", "settings", "symbols", "help"];
 
+const confirmBox = document.getElementById("confirm");
+
+// The server answers a destructive request with a yes/no prompt. Show the
+// Yes/No buttons only while that prompt is pending.
+function setPending(text) {
+  confirmBox.classList.toggle("show", /'yes'.*'no'|yes\/no|reply 'yes'/i.test(text || ""));
+}
+
 async function run(line) {
   out.textContent = "> " + line + "\\n...";
   try {
@@ -84,12 +111,39 @@ async function run(line) {
       body: JSON.stringify({line: line})
     });
     const j = await r.json();
-    out.textContent = r.ok ? ("> " + line + "\\n" + j.output)
-                           : ("HTTP " + r.status + ": " + (j.error || "request failed"));
+    if (r.ok) {
+      out.textContent = "> " + line + "\\n" + j.output;
+      setPending(j.output);
+    } else {
+      out.textContent = "HTTP " + r.status + ": " + (j.error || "request failed");
+    }
   } catch (e) {
     out.textContent = "Request failed: " + e;
   }
 }
+
+const reportBox = document.getElementById("report");
+async function refreshReport() {
+  try {
+    const r = await fetch("/api/report", {headers: {"X-Auth-Token": token}});
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.report) {
+      reportBox.textContent = j.report;
+    } else if (!j.report_on) {
+      reportBox.textContent = "Report is off. Turn it on with the \"report on\" command.";
+    } else {
+      reportBox.textContent = "Report is on; the first report has not been produced yet.";
+    }
+  } catch (e) { /* keep the last report on screen */ }
+}
+refreshReport();
+setInterval(refreshReport, 15000);
+
+document.querySelectorAll("[data-line]").forEach((b) =>
+  b.addEventListener("click", () => run(b.dataset.line)));
+document.getElementById("yes").addEventListener("click", () => run("yes"));
+document.getElementById("no").addEventListener("click", () => run("no"));
 
 const quick = document.getElementById("quick");
 for (const cmd of QUICK) {
@@ -145,6 +199,18 @@ async def command(request: web.Request) -> web.Response:
     return web.json_response({"output": output})
 
 
+async def report(request: web.Request) -> web.Response:
+    """Latest periodic report text. Read-only: it does not run a new report."""
+    if not _authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    engine = request.app["agent"].engine
+    return web.json_response({
+        "report_on": engine.state.report_on,
+        "report": engine.last_report,
+        "last_report_ts": engine.state.last_report_ts,
+    })
+
+
 def make_app(agent: JRockAgent, token: str) -> web.Application:
     app = web.Application(client_max_size=MAX_BODY_BYTES)
     app["agent"] = agent
@@ -161,6 +227,7 @@ def make_app(agent: JRockAgent, token: str) -> web.Application:
     app.on_cleanup.append(on_cleanup)
     app.router.add_get("/", index)
     app.router.add_post("/api/command", command)
+    app.router.add_get("/api/report", report)
     return app
 
 

@@ -46,8 +46,17 @@ python -m jrock.web
 # J+Rock dashboard: http://127.0.0.1:8080/?token=...
 ```
 
-Open the printed URL. The page has quick buttons for read-only queries and a box
-for any command or question.
+Open the printed URL. The page has quick buttons for read-only queries, Autotrade
+ON/OFF buttons, and a box for any command or question.
+
+The **Engine report** panel shows the latest periodic report and refreshes every
+15 seconds while the page is open. Reports are still printed to the server console
+as before. The panel only reads the last report and never starts one. It shows
+"Report is off" until you run `report on`.
+
+Autotrade ON sends `turn on autotrade`, which asks for confirmation first. The
+page then shows **Yes, confirm** and **No, cancel** buttons, which send `yes` or
+`no` to the same agent. Autotrade OFF needs no confirmation.
 
 | Setting | Default | Meaning |
 |---|---|---|

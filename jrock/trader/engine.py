@@ -147,6 +147,9 @@ class TraderEngine:
         #: rest mode, so rest mode still opens zero sockets.
         self.private_feed: PrivateFeed | None = None
         self.private_feed_error: str = ""
+        #: Latest periodic report text, kept so a UI can show it. The console
+        #: print in _report_loop is unchanged.
+        self.last_report: str = ""
         self.rest_price_calls: int = 0
         self.rest_kline_calls: int = 0
         self.kline_warmup_calls: int = 0
@@ -1568,6 +1571,7 @@ class TraderEngine:
                 if self.state.report_on:
                     rep = await self.report()
                     print("\n" + rep + "\n", flush=True)
+                    self.last_report = rep
                     self.state.last_report_ts = time.time()
             except asyncio.CancelledError:
                 raise
