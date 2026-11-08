@@ -630,6 +630,48 @@ class TraderEngine:
         except BitunixAPIError as e:
             self.state.errors.append(f"load_rules: {e}")
 
+    async def _sync_exchange_leverage(self, symbol: str, want: int,
+                                      margin_mode: str) -> int | None:
+        """Make the exchange hold `want` and return the leverage it really has.
+
+        Ported from the JS engine's ``syncExchangeLeverage``. ``change_leverage``
+        is advisory: the pair's own min/max and the position tier can clamp it,
+        and an open position blocks the change outright (20006). Sizing margin
+        at the CONFIGURED leverage while the exchange holds a lower one makes
+        the real requirement bigger than the one the pre-flight checked, and the
+        exchange answers 20003 Insufficient balance.
+
+        Returns the held leverage, or ``None`` when it could not be determined
+        (the caller then falls back to the configured value rather than
+        refusing a trade on a read-back failure).
+        """
+        try:
+            res = await self.client.change_leverage(symbol, int(want))
+            row = res[0] if isinstance(res, list) and res else (res or {})
+            applied = int(float(row.get("leverage") or 0)) if isinstance(row, dict) else 0
+            if applied > 0:
+                if applied != int(want):
+                    log.warning("%s: change_leverage answered %sx for a request "
+                                "of %sx", symbol, applied, want)
+                return applied
+        except BitunixAPIError as e:
+            # NOT fatal: the exchange may already hold this value, and a
+            # "position exists, leverage cannot change" error must not stop an
+            # honest read-back from deciding what we really hold.
+            if e.code not in (20006,):
+                log.warning("%s: change_leverage(%s) failed: %s", symbol, want, e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: change_leverage(%s) raised %s", symbol, want, e)
+        try:
+            back = await self.client.get_leverage_and_margin_mode(symbol)
+            row = back[0] if isinstance(back, list) and back else (back or {})
+            held = int(float(row.get("leverage") or 0)) if isinstance(row, dict) else 0
+            if held > 0:
+                return held
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: leverage read-back failed: %s", symbol, e)
+        return None
+
     async def load_tiers(self, symbol: str) -> list[Tier]:
         if symbol in self.tiers:
             return self.tiers[symbol]
@@ -863,37 +905,50 @@ class TraderEngine:
 
         tiers = await self.load_tiers(sym)
 
-        # The largest notional this account could open at the configured
-        # leverage. Used for tier selection: a bigger notional lands in a
-        # higher tier with a higher maintenance-margin rate, so this is the
-        # conservative choice for the liquidation estimate.
-        max_notional = equity * self.state.leverage
+        # --- the leverage the EXCHANGE actually holds -----------------------
+        # change_leverage is advisory: the pair's own range and the position
+        # tier can clamp it, and an open position can block the change outright
+        # (20006). Sizing margin at the CONFIGURED leverage while the exchange
+        # holds a lower one makes the real requirement bigger than the one we
+        # checked, and the exchange answers 20003 Insufficient balance. Read
+        # the held value back and size against THAT - the same thing the JS
+        # engine's syncExchangeLeverage does.
+        held_leverage = await self._sync_exchange_leverage(
+            sym, self.state.leverage, self.state.margin_mode)
+        if held_leverage is None:
+            held_leverage = self.state.leverage
+        if held_leverage != self.state.leverage:
+            log.warning("%s: exchange holds %sx, configured %sx - sizing at %sx",
+                        sym, held_leverage, self.state.leverage, held_leverage)
+            self.state.errors.append(
+                f"leverage {sym}: exchange holds {held_leverage}x "
+                f"(configured {self.state.leverage}x); sizing at {held_leverage}x")
+        leverage = held_leverage
 
-        # The tier for that notional band CAPS the leverage. Check it BEFORE
-        # planning: if the leverage is not allowed there is no valid plan, and
-        # the exchange would answer 20003 (it wants more margin than we
-        # computed) rather than a leverage error.
+        # The largest notional this account could actually send at that
+        # leverage, fee included. A bigger notional lands in a higher tier with
+        # a higher maintenance-margin rate, so this is the conservative choice
+        # for the LIQUIDATION estimate below.
+        max_notional = max_notional_for_balance(
+            equity, leverage, self.s.taker_fee_rate, self.s.margin_safety_pct)
         tier = pick_tier(tiers, max_notional)
-        if self.state.leverage > tier.leverage:
-            msg = (f"leverage {self.state.leverage}x exceeds the maximum "
-                   f"{tier.leverage}x allowed for a {max_notional:.2f} USDT "
-                   f"position on {sym} (risk tier {tier.level}). The exchange "
-                   f"would require "
-                   f"{margin_required(max_notional, tier.leverage):.4f} USDT "
-                   f"margin, not {margin_required(max_notional, self.state.leverage):.4f}. "
-                   f"Lower the leverage or reduce the position size.")
-            self.state.errors.append(f"preflight {sym}: {msg}")
-            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+
+        # NOTE: the tier's leverage cap is deliberately NOT checked here.
+        # `max_notional` is the balance-capped MAXIMUM, not the order we will
+        # send, and checking the cap against it refused trades that were well
+        # inside a lower tier (a 10x order of 100 USDT on a 10k balance was
+        # refused because 100k would have been tier 5). The cap is checked
+        # against the REAL notional after sizing, below.
 
         # Liquidation must sit BEHIND the entry price, or the exchange closes
         # the position before any stop can fire. At L >= 1/mmr the maintenance
         # requirement swallows the whole margin and liq lands at/through entry;
         # refuse with the numbers instead of planning a stop that cannot exist.
-        if liq_unsafe(price, self.state.leverage, side, tier.maintenance_margin_rate):
+        if liq_unsafe(price, leverage, side, tier.maintenance_margin_rate):
             safe_lev = max_safe_leverage(
                 price, price * 0.01, tier.maintenance_margin_rate,
                 buffer=self.state.liq_sl_distance_pct / 100.0)
-            msg = (f"refusing {sym}: at {self.state.leverage}x liquidation sits at "
+            msg = (f"refusing {sym}: at {leverage}x liquidation sits at "
                    f"the entry price {price:.{rules.quote_precision}f} "
                    f"(maintenance margin rate {tier.maintenance_margin_rate:.4%} "
                    f"on tier {tier.level}). Lower the leverage "
@@ -903,7 +958,7 @@ class TraderEngine:
 
         try:
             plan = plan_tpsl(
-                side=side, entry=price, leverage=self.state.leverage,
+                side=side, entry=price, leverage=leverage,
                 notional=max_notional,
                 strength=agg.strength, confidence=agg.confidence, tiers=tiers, rules=rules,
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
@@ -916,7 +971,7 @@ class TraderEngine:
             return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
 
         qty = position_size_by_risk(equity, self.state.risk_pct, price, plan.sl,
-                                    self.state.leverage, rules,
+                                    leverage, rules,
                                     fee_rate=self.s.taker_fee_rate,
                                     safety_pct=self.s.margin_safety_pct,
                                     slots_left=max(1, self.state.max_open_positions
@@ -928,7 +983,7 @@ class TraderEngine:
             min_notional = min_order_notional(price, rules.min_trade_volume,
                                               rules.base_precision)
             min_margin = min_margin_for_min_order(price, rules.min_trade_volume,
-                                                  self.state.leverage,
+                                                  leverage,
                                                   rules.base_precision)
             if min_notional > 0 and min_margin > equity:
                 return {"ok": False,
@@ -936,7 +991,7 @@ class TraderEngine:
                                    f"minimum order is {rules.min_trade_volume:g} "
                                    f"({min_notional:.4f} USDT notional, "
                                    f"{min_margin:.4f} USDT margin at "
-                                   f"{self.state.leverage}x) but only "
+                                   f"{leverage}x) but only "
                                    f"{equity:.4f} USDT is available. Raise the "
                                    f"leverage, lower risk_pct, or add funds."),
                         "hint": "20003 Insufficient balance"}
@@ -946,6 +1001,24 @@ class TraderEngine:
                                f"{abs(price - plan.sl):.{rules.quote_precision}f} stop "
                                f"is below the {rules.min_trade_volume:g} minimum)")}
 
+        # --- the tier that governs the order is the one its REAL notional
+        # lands in. The tier above is picked from the balance-capped MAXIMUM,
+        # which is the conservative choice for the liquidation estimate but the
+        # wrong basis for the leverage cap. Check the cap against what we will
+        # actually send, so a small order is not refused for a band it never
+        # reaches - and a genuinely oversized one still is.
+        tier_real = pick_tier(tiers, qty * price)
+        if leverage > tier_real.leverage:
+            msg = (f"leverage {leverage}x exceeds the maximum "
+                   f"{tier_real.leverage}x allowed for a {qty * price:.2f} USDT "
+                   f"position on {sym} (risk tier {tier_real.level}). The "
+                   f"exchange would require "
+                   f"{margin_required(qty * price, tier_real.leverage):.4f} USDT "
+                   f"margin, not {margin_required(qty * price, leverage):.4f}. "
+                   f"Lower the leverage or reduce the position size.")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+
         # ORDER_UNIT only changes how the size is EXPRESSED; the wire format is
         # always base-coin qty. QUANTITY (the default) is a no-op, so the
         # historical behaviour is unchanged. NOTIONAL/COST re-derive qty from
@@ -953,8 +1026,8 @@ class TraderEngine:
         order_unit = (self.s.order_unit or "QUANTITY").upper()
         if order_unit != "QUANTITY":
             sized_notional = qty * price
-            amount = unit_from_qty(qty, order_unit, price, self.state.leverage)
-            qty = qty_from_unit(amount, order_unit, price, self.state.leverage, rules)
+            amount = unit_from_qty(qty, order_unit, price, leverage)
+            qty = qty_from_unit(amount, order_unit, price, leverage, rules)
             if qty <= 0:
                 return {"ok": False,
                         "reason": f"computed qty is 0 in {order_unit} units "
@@ -964,7 +1037,7 @@ class TraderEngine:
         # balance, and the engine's own bounds. Without this the request is
         # sent and the exchange answers 20003 Insufficient balance.
         notional_real = qty * price
-        margin_real = margin_required(notional_real, self.state.leverage)
+        margin_real = margin_required(notional_real, leverage)
         # Opening a MARKET order costs the initial margin AND a taker fee, and
         # the exchange deducts BOTH from the available balance at once. Checking
         # only the margin let `margin == equity` pass locally and then fail on
@@ -983,7 +1056,7 @@ class TraderEngine:
                       f"MARGIN_SAFETY_PCT={self.s.margin_safety_pct:g}%)"
                       if self.s.margin_safety_pct else "")
                    + f" for qty={qty}, notional={notional_real:.4f} at "
-                     f"{self.state.leverage}x. Lower the leverage, lower risk_pct, "
+                     f"{leverage}x. Lower the leverage, lower risk_pct, "
                      f"or add funds.")
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
@@ -1009,7 +1082,7 @@ class TraderEngine:
         # re-plan with the real notional
         try:
             plan = plan_tpsl(
-                side=side, entry=price, leverage=self.state.leverage,
+                side=side, entry=price, leverage=leverage,
                 notional=qty * price, strength=agg.strength, confidence=agg.confidence,
                 tiers=tiers, rules=rules,
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
@@ -1021,17 +1094,15 @@ class TraderEngine:
             self.state.errors.append(f"tpsl {sym}: {e}")
             return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
 
-        # ensure leverage / margin mode
+        # ensure margin mode. Leverage was already applied AND read back by
+        # _sync_exchange_leverage() before sizing, so it is not re-sent here:
+        # a second change_leverage could move the exchange to a value the size
+        # was not computed against.
         try:
             await self.client.change_margin_mode(sym, self.state.margin_mode)
         except BitunixAPIError as e:
             if e.code not in (20006, 20009):
                 self.state.errors.append(f"margin_mode {sym}: {e}")
-        try:
-            await self.client.change_leverage(sym, self.state.leverage)
-        except BitunixAPIError as e:
-            if e.code not in (20006,):
-                self.state.errors.append(f"leverage {sym}: {e}")
 
         order_side = "BUY" if side == "LONG" else "SELL"
 
