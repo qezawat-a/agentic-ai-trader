@@ -13,6 +13,7 @@ Bitunix futures notes (from the official docs + support article):
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
@@ -271,14 +272,97 @@ def pick_tier(tiers: list[Tier], notional: float) -> Tier:
 
 def liquidation_price(entry: float, leverage: int, side: str,
                       maintenance_margin_rate: float) -> float:
-    """Isolated-margin liquidation estimate (Bitunix formula)."""
+    """Isolated-margin liquidation estimate (Bitunix formula).
+
+    Long  : liq = entry * (1 - 1/L + mmr)
+    Short : liq = entry * (1 + 1/L - mmr)
+
+    At ``L >= 1/mmr`` the maintenance requirement swallows the entire margin
+    and the formula puts liquidation AT or THROUGH the entry price - a LONG
+    would report a liq price ABOVE entry, which is not a price at all. The JS
+    engine returns ``entry`` in that case so the caller can see the position is
+    unopenable at that leverage and refuse it. Returning the raw value instead
+    produced a nonsense liq price that then failed the TP/SL feasibility check
+    with a confusing "no valid stop-loss exists" message rather than naming the
+    real cause (leverage too high for this pair's MMR).
+    """
     L = max(1, leverage)
     mmr = max(0.0, maintenance_margin_rate)
     if side.upper() in ("LONG", "BUY"):
         p = entry * (1 - 1 / L + mmr)
+        if p >= entry:
+            return entry
     else:
         p = entry * (1 + 1 / L - mmr)
+        if p <= entry:
+            return entry
     return max(p, 0.0)
+
+
+def liq_unsafe(entry: float, leverage: int, side: str,
+               maintenance_margin_rate: float) -> bool:
+    """True when liquidation sits at/through entry, i.e. the trade cannot open.
+
+    Mirrors the JS ``liqUnsafe`` flag: at this leverage the exchange closes the
+    position before any stop could fire, so the caller must refuse rather than
+    size a position that can only end in liquidation.
+    """
+    if entry <= 0:
+        return True
+    liq = liquidation_price(entry, leverage, side, maintenance_margin_rate)
+    if side.upper() in ("LONG", "BUY"):
+        return liq >= entry
+    return liq <= entry
+
+
+def mmr_for(max_leverage: int) -> float:
+    """Maintenance-margin-rate FALLBACK when the tier lookup is unavailable.
+
+    The authoritative source is ``get_position_tiers`` (see ``pick_tier``).
+    This heuristic only runs when that call fails (network, brand-new listing).
+
+    Ported from the JS ``mmrFor``: the old ``1/maxLev`` made
+    ``liqPrice == entry`` at any leverage where ``1/lev >= 1 - mmr``, which
+    blocked EVERY trade at 50x+ with a false ``liqUnsafe``. Capped at 1% so high
+    leverage does not falsely trip the guard while staying conservative - it
+    over-states MMR on every pair measured (BTC real tier-1 is 0.30%, this
+    returns 0.50%), which places liquidation closer to entry than reality. That
+    is the safe direction to be wrong in.
+    """
+    try:
+        max_lev = float(max_leverage)
+    except (TypeError, ValueError):
+        return 0.005
+    if not (max_lev > 0):
+        return 0.005
+    return max(0.004, min(min(1.0 / max_lev, 0.01), 0.05))
+
+
+def max_safe_leverage(entry: float, sl_dist: float,
+                      maintenance_margin_rate: float = 0.005,
+                      buffer: float = 0.5) -> int:
+    """Highest leverage at which this stop still fits inside liquidation.
+
+    Solves ``|entry - liq| >= sl_dist / (1 - buffer)`` for leverage using the
+    published liq formula ``|entry - liq| = entry * (1/lev - mmr)``::
+
+        lev = 1 / (sl_dist / (1 - buffer) / entry + mmr)
+
+    ``buffer`` is the safety gap kept between the stop and liquidation, as a
+    fraction of the entry->liq distance (the engine's ``liq_sl_distance_pct``).
+    Informational: the engine does NOT lower the configured leverage to fit the
+    stop - it pulls the stop inside liquidation instead. This is what the
+    engine reports as the ceiling, and what ``liq_unsafe`` refuses on.
+    """
+    if entry <= 0 or sl_dist <= 0:
+        return 1
+    b = max(0.05, min(0.9, float(buffer)))
+    needed = float(sl_dist) / (1.0 - b)
+    frac = needed / float(entry)
+    denom = frac + max(0.0, float(maintenance_margin_rate))
+    if denom <= 0:
+        return 1
+    return max(1, int(1.0 / denom))
 
 
 def sl_from_liq_distance(entry: float, liq: float, side: str,
@@ -301,10 +385,41 @@ def roi_pct(entry: float, price: float, side: str, leverage: int) -> float:
     return raw * leverage * 100.0
 
 
+def min_order_notional(price: float, min_trade_volume: float,
+                       precision: int = 4) -> float:
+    """Smallest order value (USDT) the exchange will accept for a symbol.
+
+    ``minTradeVolume`` is a BASE-COIN amount, so the notional is
+    ``minTradeVolume * price``. The minimum is rounded UP to ``precision``
+    digits so that, after ``round_step`` floors a qty to the same precision,
+    the order still clears the exchange's minimum. Ported from the JS
+    ``minOrderNotional``.
+    """
+    if price <= 0:
+        return 0.0
+    p = max(0, int(precision))
+    f = 10 ** p
+    min_qty = math.ceil(max(0.0, min_trade_volume) * f) / f
+    return min_qty * price
+
+
+def min_margin_for_min_order(price: float, min_trade_volume: float,
+                             leverage: int, precision: int = 4) -> float:
+    """Margin (USDT) needed so that qty = minTradeVolume at this leverage.
+
+    ``qty = margin * leverage / price``  =>  ``margin = minTradeVolume * price / leverage``.
+    Ported from the JS ``minMarginForMinOrder``. Used to explain WHY an order
+    was refused (the minimum is bigger than the balance allows) instead of
+    reporting a bare "qty is 0".
+    """
+    return min_order_notional(price, min_trade_volume, precision) / max(1, leverage)
+
+
 def position_size_by_risk(equity: float, risk_pct: float, entry: float,
                           stop: float, leverage: int, rules: PairRules,
                           fee_rate: float = TAKER_FEE_RATE,
-                          safety_pct: float = 0.0) -> float:
+                          safety_pct: float = 0.0,
+                          slots_left: int = 1) -> float:
     """Size so that hitting the stop loses ~risk_pct of equity.
 
     The size is capped by what the balance can actually PAY FOR, not by
@@ -312,6 +427,12 @@ def position_size_by_risk(equity: float, risk_pct: float, entry: float,
     so the cap is ``max_notional_for_balance`` - using ``equity * leverage``
     made margin equal the whole balance, the local pre-flight passed, and the
     exchange rejected the order with 20003 once it added the fee.
+
+    ``slots_left`` is the number of open-position slots still free. The JS
+    engine caps each order's margin at ``available / slotsLeft`` so the book
+    can never commit the whole balance to the first of several positions; the
+    same cap is applied here. It defaults to 1 (no cap) so a caller that does
+    not track slots keeps the previous behaviour exactly.
     """
     stop_dist = abs(entry - stop)
     if stop_dist <= 0 or entry <= 0:
@@ -319,6 +440,11 @@ def position_size_by_risk(equity: float, risk_pct: float, entry: float,
     risk_usd = equity * (risk_pct / 100.0)
     qty = risk_usd / stop_dist
     max_notional = max_notional_for_balance(equity, leverage, fee_rate, safety_pct)
+    # Never let one order commit more than its share of the balance.
+    slots = max(1, int(slots_left or 1))
+    if slots > 1:
+        max_notional = min(max_notional, max_notional_for_balance(
+            equity / slots, leverage, fee_rate, safety_pct))
     qty = min(qty, max_notional / entry)
     qty = round_step(qty, rules.base_precision)
     if qty < rules.min_trade_volume:

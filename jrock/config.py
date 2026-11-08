@@ -51,6 +51,19 @@ class Settings:
     full_device_access: bool = False
     block_destructive: bool = True
     symbols: list[str] = field(default_factory=lambda: ["BTCUSDT"])
+    #: AUTO = build the universe from the exchange's full pair list, ranked by
+    #: `universe_rank` and filtered by `min_24h_volume_usd`. Any other value is
+    #: an explicit comma-separated list and is honoured verbatim (the universe
+    #: settings are then inert, exactly as in the JS engine).
+    universe_auto: bool = False
+    #: VOLUME | GAINERS | LOSERS | MOVERS - see jrock/trader/universe.py.
+    universe_rank: str = "VOLUME"
+    #: How many ranked pairs to keep. A CEILING, not a quota: a change-ranked
+    #: mode returns fewer when fewer qualify, and never pads with non-qualifiers.
+    universe_size: int = 40
+    #: Liquidity floor in USDT. Pairs thinner than this are never scanned - a
+    #: stop can be swept on an illiquid book. 0 disables the floor.
+    min_24h_volume_usd: float = 20_000_000.0
     leverage: int = 10
     margin_mode: str = "ISOLATION"
     position_mode: str = "ONE_WAY"
@@ -194,6 +207,10 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         full_device_access=_b("FULL_DEVICE_ACCESS", False),
         block_destructive=_b("BLOCK_DESTRUCTIVE", True),
         symbols=syms or ["BTCUSDT"],
+        universe_auto=_universe_auto(),
+        universe_rank=_universe_rank(),
+        universe_size=_i("UNIVERSE_SIZE", 40),
+        min_24h_volume_usd=_f("MIN_24H_VOLUME_USD", 20_000_000.0),
         leverage=_i("TRADE_LEVERAGE", 10),
         margin_mode=os.getenv("TRADE_MARGIN_MODE", "ISOLATION").upper(),
         position_mode=os.getenv("TRADE_POSITION_MODE", "ONE_WAY").upper(),
@@ -263,6 +280,30 @@ def _order_unit() -> str:
     """
     v = (os.getenv("ORDER_UNIT") or "QUANTITY").strip().upper()
     return v if v in ("QUANTITY", "NOTIONAL", "COST") else "QUANTITY"
+
+
+def _universe_rank() -> str:
+    """UNIVERSE_RANK=VOLUME|GAINERS|LOSERS|MOVERS, default VOLUME.
+
+    VOLUME is the safe default (deepest books first), so an unset or
+    unrecognised value keeps it rather than guessing a momentum mode.
+    """
+    v = (os.getenv("UNIVERSE_RANK") or "VOLUME").strip().upper()
+    return v if v in ("VOLUME", "GAINERS", "LOSERS", "MOVERS") else "VOLUME"
+
+
+def _universe_auto() -> bool:
+    """True when the universe should be built from the exchange pair list.
+
+    Two ways to ask for it, both matching the JS engine's `symbols: 'AUTO'`:
+      * SYMBOLS=AUTO
+      * UNIVERSE_AUTO=1
+    An explicit symbol list always wins, so setting SYMBOLS=BTCUSDT,ETHUSDT
+    turns the universe layer off without touching the other settings.
+    """
+    if _b("UNIVERSE_AUTO", False):
+        return True
+    return (os.getenv("SYMBOLS") or "").strip().upper() == "AUTO"
 
 
 def _market_data_source() -> str:

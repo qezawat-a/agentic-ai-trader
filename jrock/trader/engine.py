@@ -33,14 +33,17 @@ from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
-                   fee_for_notional, format_price, format_qty, margin_required,
-                   max_notional_for_balance, pick_tier, position_size_by_risk,
+                   fee_for_notional, format_price, format_qty, liq_unsafe,
+                   margin_required, max_notional_for_balance,
+                   max_safe_leverage, min_margin_for_min_order,
+                   min_order_notional, pick_tier, position_size_by_risk,
                    qty_from_notional, qty_from_unit, required_cost, roi_pct,
                    round_price, round_step, tick_size, unit_from_qty,
                    validate_tpsl_side)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
                    plan_tpsl, should_breakeven, should_trail)
+from .universe import UNIVERSE_RANKS, UniverseResult, build_universe
 from .ws import MarketDataFeed, PrivateFeed, WSConfig
 
 log = logging.getLogger("jrock.engine")
@@ -58,6 +61,14 @@ class EngineState:
     reversal_confidence: float = 70.0
     mid_management: bool = True
     symbols: list[str] = field(default_factory=lambda: ["BTCUSDT"])
+    # --- universe selection (see jrock/trader/universe.py)
+    #: True = the symbol list is rebuilt from the exchange's pair list each
+    #: scan, ranked by `universe_rank` and filtered by `min_24h_volume_usd`.
+    #: False = `symbols` is an explicit list and the universe settings are inert.
+    universe_auto: bool = False
+    universe_rank: str = "VOLUME"
+    universe_size: int = 40
+    min_24h_volume_usd: float = 20_000_000.0
     leverage: int = 10
     margin_mode: str = "ISOLATION"
     position_mode: str = "ONE_WAY"
@@ -97,6 +108,10 @@ class TraderEngine:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state = EngineState(
             symbols=list(settings.symbols),
+            universe_auto=settings.universe_auto,
+            universe_rank=settings.universe_rank,
+            universe_size=settings.universe_size,
+            min_24h_volume_usd=settings.min_24h_volume_usd,
             leverage=settings.leverage,
             margin_mode=settings.margin_mode,
             position_mode=settings.position_mode,
@@ -179,6 +194,7 @@ class TraderEngine:
         "scan_on", "report_on", "report_interval", "scan_interval",
         "reversal", "reversal_confidence", "mid_management",
         "symbols", "leverage", "margin_mode", "position_mode",
+        "universe_auto", "universe_rank", "universe_size", "min_24h_volume_usd",
         "max_open_positions", "risk_pct", "breakeven_pct",
         "trailing_trigger_roi_pct", "liq_sl_distance_pct",
         "min_agreeing", "timeframes", "min_confidence", "tf_min_confidence",
@@ -542,7 +558,68 @@ class TraderEngine:
         self._tasks.clear()
         return "Engine OFF (all loops stopped, autotrade disabled)."
 
-    # ================================================================ market data
+    # ================================================================ universe
+    async def refresh_universe(self) -> UniverseResult | None:
+        """Rebuild `state.symbols` from the exchange pair list.
+
+        Only runs when `universe_auto` is on; an explicit symbol list is never
+        touched. Returns the result so the caller can log or show it, and
+        returns None when the universe layer is off.
+
+        The selection itself is pure (jrock/trader/universe.py); this method
+        only does the two network reads and applies the outcome. A failure
+        leaves the previous symbol list in place rather than emptying it -
+        an empty universe would silently stop all scanning.
+        """
+        if not self.state.universe_auto:
+            return None
+        try:
+            pairs = await self.client.get_trading_pairs()
+            tickers = await self.client.get_tickers()
+        except BitunixAPIError as e:
+            self.state.errors.append(f"universe: {e}")
+            log.warning("universe refresh failed, keeping %d symbols: %s",
+                        len(self.state.symbols), e)
+            return None
+
+        res = build_universe(
+            pairs or [], tickers or [],
+            mode=self.state.universe_rank,
+            size=self.state.universe_size,
+            min_24h_volume_usd=self.state.min_24h_volume_usd,
+        )
+        if not res.symbols:
+            self.state.errors.append("universe: no symbol passed the filters")
+            log.warning("universe refresh produced no symbols, keeping %d",
+                        len(self.state.symbols))
+            return res
+
+        # Keep any symbol we already hold a position on, even if it dropped out
+        # of the ranking - the management loop must still see it.
+        held = [p.symbol for p in self.positions.values()]
+        merged = list(res.symbols)
+        for sym in held:
+            if sym and sym not in merged:
+                merged.append(sym)
+
+        changed = merged != self.state.symbols
+        self.state.symbols = merged
+        if changed:
+            await self.load_rules(merged)
+            log.info("universe by %s: %d pairs - %s", res.mode, len(merged),
+                     ", ".join(f"{x.symbol} {x.chg:+.1f}%" for x in res.top[:5]))
+        return res
+
+    def universe_report(self) -> str:
+        """One honest line for `settings`/`status`."""
+        s = self.state
+        if not s.universe_auto:
+            return (f"universe: OFF (explicit symbols={','.join(s.symbols)}) - "
+                    f"set SYMBOLS=AUTO or UNIVERSE_AUTO=1 to rank the full pair list")
+        return (f"universe: AUTO rank={s.universe_rank} size={s.universe_size} "
+                f"min_24h_volume_usd={s.min_24h_volume_usd:g} "
+                f"-> {len(s.symbols)} symbols")
+
     async def load_rules(self, symbols: list[str] | None = None) -> None:
         syms = symbols or self.state.symbols
         try:
@@ -708,6 +785,10 @@ class TraderEngine:
         while not self._stop.is_set():
             try:
                 if self.state.scan_on:
+                    # Rebuild the universe first when it is on AUTO. A failure
+                    # keeps the previous list, so the loop never goes blind.
+                    if self.state.universe_auto:
+                        await self.refresh_universe()
                     for sym in self.state.symbols:
                         agg = await self.scan_symbol(sym)
                         if self.state.autotrade and agg.actionable:
@@ -804,6 +885,22 @@ class TraderEngine:
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
 
+        # Liquidation must sit BEHIND the entry price, or the exchange closes
+        # the position before any stop can fire. At L >= 1/mmr the maintenance
+        # requirement swallows the whole margin and liq lands at/through entry;
+        # refuse with the numbers instead of planning a stop that cannot exist.
+        if liq_unsafe(price, self.state.leverage, side, tier.maintenance_margin_rate):
+            safe_lev = max_safe_leverage(
+                price, price * 0.01, tier.maintenance_margin_rate,
+                buffer=self.state.liq_sl_distance_pct / 100.0)
+            msg = (f"refusing {sym}: at {self.state.leverage}x liquidation sits at "
+                   f"the entry price {price:.{rules.quote_precision}f} "
+                   f"(maintenance margin rate {tier.maintenance_margin_rate:.4%} "
+                   f"on tier {tier.level}). Lower the leverage "
+                   f"(~{safe_lev}x or less for a 1% stop) or pick a deeper pair.")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg}
+
         try:
             plan = plan_tpsl(
                 side=side, entry=price, leverage=self.state.leverage,
@@ -821,9 +918,33 @@ class TraderEngine:
         qty = position_size_by_risk(equity, self.state.risk_pct, price, plan.sl,
                                     self.state.leverage, rules,
                                     fee_rate=self.s.taker_fee_rate,
-                                    safety_pct=self.s.margin_safety_pct)
+                                    safety_pct=self.s.margin_safety_pct,
+                                    slots_left=max(1, self.state.max_open_positions
+                                                   - len(positions)))
         if qty <= 0:
-            return {"ok": False, "reason": "computed qty is 0 (risk too small or below min volume)"}
+            # Say WHY it is zero. "risk too small or below min volume" hid the
+            # real case: the exchange minimum order is bigger than the balance
+            # can open at this leverage, which is a different fix entirely.
+            min_notional = min_order_notional(price, rules.min_trade_volume,
+                                              rules.base_precision)
+            min_margin = min_margin_for_min_order(price, rules.min_trade_volume,
+                                                  self.state.leverage,
+                                                  rules.base_precision)
+            if min_notional > 0 and min_margin > equity:
+                return {"ok": False,
+                        "reason": (f"computed qty is 0 for {sym}: the exchange "
+                                   f"minimum order is {rules.min_trade_volume:g} "
+                                   f"({min_notional:.4f} USDT notional, "
+                                   f"{min_margin:.4f} USDT margin at "
+                                   f"{self.state.leverage}x) but only "
+                                   f"{equity:.4f} USDT is available. Raise the "
+                                   f"leverage, lower risk_pct, or add funds."),
+                        "hint": "20003 Insufficient balance"}
+            return {"ok": False,
+                    "reason": (f"computed qty is 0 for {sym} (risk {self.state.risk_pct}% "
+                               f"of {equity:.4f} USDT over a "
+                               f"{abs(price - plan.sl):.{rules.quote_precision}f} stop "
+                               f"is below the {rules.min_trade_volume:g} minimum)")}
 
         # ORDER_UNIT only changes how the size is EXPRESSED; the wire format is
         # always base-coin qty. QUANTITY (the default) is a no-op, so the
@@ -1722,6 +1843,7 @@ class TraderEngine:
             f"report_on={s.report_on} mid_management={s.mid_management}",
             f"symbols={','.join(s.symbols)} leverage={s.leverage}x "
             f"margin={s.margin_mode} position={s.position_mode} max_open={s.max_open_positions}",
+            self.universe_report(),
             f"risk_pct={s.risk_pct}% breakeven_pct={s.breakeven_pct}% "
             f"trailing_trigger_roi={s.trailing_trigger_roi_pct}% "
             f"liq_sl_distance={s.liq_sl_distance_pct}%",
@@ -1748,6 +1870,7 @@ class TraderEngine:
         "trailing trigger", "liq sl distance", "min agreeing", "timeframes",
         "min confidence", "tf min confidence", "positions history", "close position",
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
+        "universe",
         "leverage", "risk ",
         # the four documented TP/SL methods
         "tpsl method", "partial close pct", "partial at roi",
@@ -1932,9 +2055,16 @@ class TraderEngine:
             syms = [x.strip().upper() for x in val.replace("=", " ").split(",") if x.strip()]
             if syms:
                 s.symbols = syms
+                # An explicit list turns the universe layer off, so the two can
+                # never fight over `state.symbols` on the next scan.
+                s.universe_auto = False
                 await self.load_rules(syms)
-                return f"Symbols = {','.join(syms)}"
-            return "Usage: Symbols BTCUSDT,ETHUSDT"
+                return (f"Symbols = {','.join(syms)}\n"
+                        f"universe: OFF (explicit list) - use 'universe auto' to rank the full pair list")
+            return "Usage: Symbols BTCUSDT,ETHUSDT | Symbols AUTO"
+        # ------------------------------------------------------------- universe
+        if low == "universe" or low.startswith("universe "):
+            return await self._universe_command(raw)
         if low.startswith("max open positions"):
             try:
                 s.max_open_positions = int(arg("max open positions").split()[-1])
@@ -2005,6 +2135,70 @@ class TraderEngine:
                 return "Usage: risk 1.0"
 
         return f"Unknown engine command: {raw!r}. Type 'help' for the list."
+
+    async def _universe_command(self, raw: str) -> str:
+        """`universe ...` - show, set rank/size/floor, and turn AUTO on/off.
+
+        Every setter validates BEFORE writing, so a bad value leaves the
+        previous setting in place rather than silently disabling the layer.
+        """
+        s = self.state
+        rest = raw.strip()[len("universe"):].strip()
+        low = rest.lower()
+
+        if not rest or low in ("show", "status"):
+            lines = [self.universe_report()]
+            if s.universe_auto:
+                res = await self.refresh_universe()
+                if res is not None:
+                    lines.append(res.report())
+            return "\n".join(lines)
+
+        if low in ("auto", "on"):
+            s.universe_auto = True
+            res = await self.refresh_universe()
+            if res is None:
+                return "universe: AUTO on, but the pair list could not be read."
+            return "universe: AUTO on\n" + res.report()
+
+        if low in ("off", "manual"):
+            s.universe_auto = False
+            return (f"universe: OFF - scanning the explicit list "
+                    f"({','.join(s.symbols)})")
+
+        if low.startswith("rank"):
+            val = rest[len("rank"):].strip().upper()
+            if val not in UNIVERSE_RANKS:
+                return f"Usage: universe rank {'|'.join(UNIVERSE_RANKS)}"
+            s.universe_rank = val
+            return f"universe rank = {val}"
+
+        if low.startswith("size"):
+            val = rest[len("size"):].strip()
+            try:
+                n = int(val.split()[-1])
+            except (ValueError, IndexError):
+                return "Usage: universe size 40"
+            if n < 1:
+                return "universe size must be >= 1."
+            s.universe_size = n
+            return f"universe size = {n} (a ceiling, not a quota)"
+
+        if low.startswith("min volume") or low.startswith("min 24h volume"):
+            key = "min volume" if low.startswith("min volume") else "min 24h volume"
+            val = rest[len(key):].strip()
+            try:
+                v = float(val.split()[-1])
+            except (ValueError, IndexError):
+                return "Usage: universe min volume 20000000"
+            if v < 0:
+                return "min 24h volume must be >= 0 (0 disables the floor)."
+            s.min_24h_volume_usd = v
+            return f"min 24h volume = {v:g} USDT"
+
+        return ("Usage: universe | universe auto | universe off | "
+                f"universe rank {'|'.join(UNIVERSE_RANKS)} | universe size 40 | "
+                "universe min volume 20000000")
 
     def _ladder_command(self, raw: str) -> str:
         """`ladder ...` - show, set, disable, and the two sub-settings.
