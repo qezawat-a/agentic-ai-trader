@@ -196,8 +196,10 @@ async def main() -> int:
     print('subscribe frame: {"op":"subscribe","args":['
           + ",".join(f'{{"ch":"{c}"}}' for c in PRIVATE_CHANNELS) + "]}")
     print("documented push shape:")
-    print('  {"ch":"tpsl","data":{"id":..,"positionId":..,"symbol":..,"tpPrice":..,')
-    print('                       "slPrice":..,"tpQty":..,"slQty":..,"status":..,"ctime":..}}')
+    print('  {"ch":"tpsl","ts":..,"data":{"event":..,"positionId":..,"orderId":..,')
+    print('                       "symbol":..,"status":..,"tpPrice":..,"slPrice":..,')
+    print('                       "tpQty":..,"slQty":..,"ctime":..}}')
+    print("  NOTE: data is ALWAYS an object (never an array); there is no `id` field.")
     has_keys = bool(os.environ.get("BITUNIX_API_KEY") and os.environ.get("BITUNIX_API_SECRET"))
     print(f"\ncredentials present: {has_keys}")
     if not has_keys:

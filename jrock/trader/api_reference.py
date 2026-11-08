@@ -286,18 +286,21 @@ _add(Endpoint("get_history_tp_sl_order", "GET", "/api/v1/futures/tpsl/get_histor
 # ------------------------------------------------------------------ websocket
 WS_CHANNELS = {
     "public": {
-        "depth_books": "order book depth",
+        "price": "market price / index price / funding rate (mp, ip, fr, ft, nft)",
+        "ticker": "one symbol, 24h rolling stats (object)",
+        "tickers": "all symbols, aggregated (LIST, adds bd/ak/bv/av)",
+        "trade": "public trades (list of p/v/s/t)",
+        "depth_books": "full snapshot then deltas",
+        "depth_book1": "1 depth level",
+        "depth_book5": "5 depth levels",
+        "depth_book15": "15 depth levels",
         "market_kline_<interval>": "kline, e.g. market_kline_1min / market_kline_15min",
-        "market_price": "last price",
-        "market_ticker": "single ticker",
-        "market_tickers": "all tickers",
-        "market_trade": "trades",
     },
     "private": {
         "balance": "account balance updates",
         "order": "order updates",
         "position": "position updates",
-        "tpsl": "TP/SL updates",
+        "tpsl": "TP/SL updates (auto-pushed after login)",
     },
 }
 

@@ -1,7 +1,12 @@
 """Bitunix WebSocket client: public + private channels, heartbeat, reconnect.
 
 Everything here is checked against the official docs and against live frames
-captured from wss://fapi.bitunix.com/public/ on 2026-11-06.
+captured from wss://fapi.bitunix.com/public/ on 2026-11-08.
+
+DOMAINS (docs: websocket/prepare/WebSocket.html)
+-----------------------------------------------
+    wss://fapi.bitunix.com/public/    public channels
+    wss://fapi.bitunix.com/private/   private channels (login required)
 
 CHANNEL NAMES (this is where the old code was wrong)
 ----------------------------------------------------
@@ -32,10 +37,16 @@ Client sends {"op":"ping","ping":<unix seconds>}; the server answers
 The server does NOT send its own ping (verified: 45s idle, zero frames), so
 the client must drive the heartbeat. A missing pong means a dead socket.
 
+CONNECTION LIMITS (docs: websocket/prepare/WebSocket.html)
+---------------------------------------------------------
+Max 5 messages/second (PING, PONG and JSON frames all count) and max 300
+channel subscriptions per connection. Exceeding either disconnects the socket.
+
 LOGIN (private)
 ---------------
     sign = sha256( sha256(nonce + timestamp + apiKey) + secretKey )
 timestamp is SECONDS. nonce is a 32-char random string. Same order as REST.
+The ack is {"op":"login",...} (the Java demo switches on WsOpCh.LOGIN).
 """
 from __future__ import annotations
 
@@ -60,7 +71,11 @@ Handler = Callable[["Event"], Awaitable[None] | None]
 
 # ---------------------------------------------------------------- channels
 
+#: Documented limit: max 300 channel subscriptions per connection.
+MAX_SUBS_PER_FRAME = 300
+
 #: Public channel names, exactly as the exchange spells them.
+#: Verified live against wss://fapi.bitunix.com/public/ on 2026-11-08.
 PUBLIC_CHANNELS: dict[str, str] = {
     "price": "price",
     "ticker": "ticker",
@@ -110,7 +125,13 @@ def kline_channel(interval: str) -> str:
 
 
 def _nonce(n: int = 32) -> str:
-    alphabet = string.ascii_lowercase + string.digits
+    """32-char random nonce.
+
+    The official demos use letters AND digits (open_api_ws_sign.py:
+    `string.ascii_letters + string.digits`). Lowercase-only still works, but
+    matching the demo removes any doubt about the accepted alphabet.
+    """
+    alphabet = string.ascii_letters + string.digits
     return "".join(random.choices(alphabet, k=n))
 
 
@@ -168,10 +189,17 @@ class Event:
         ch = msg.get("ch")
         if not ch:
             return None
+        # `ts` is documented as int64 on most channels but String on `trade`.
+        # A non-numeric ts must not raise: an exception here escapes _pump and
+        # forces a full reconnect on a single malformed frame.
+        try:
+            ts = int(msg.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0
         return cls(
             channel=ch,
             symbol=msg.get("symbol"),
-            ts=int(msg.get("ts") or 0),
+            ts=ts,
             data=msg.get("data"),
             raw=msg,
         )
@@ -222,6 +250,10 @@ class BitunixWebSocket:
         self._queue: asyncio.Queue | None = None
         self._stop = asyncio.Event()
         self._pong = asyncio.Event()
+        #: The `ping` value of the heartbeat we are currently waiting on. A pong
+        #: is only accepted when it echoes THIS value, so a late pong from the
+        #: previous ping cannot satisfy the current wait.
+        self._ping_value = 0
 
         self.connected = False
         self.logged_in = False
@@ -327,7 +359,12 @@ class BitunixWebSocket:
                     if self.private:
                         await self._login(ws)
                     if self.subs:
-                        await ws.send(json.dumps(build_subscribe(self.subs)))
+                        # Documented limit: max 300 channel subscriptions per
+                        # connection. Chunk so a large universe cannot be
+                        # silently rejected by the server.
+                        for i in range(0, len(self.subs), MAX_SUBS_PER_FRAME):
+                            chunk = self.subs[i:i + MAX_SUBS_PER_FRAME]
+                            await ws.send(json.dumps(build_subscribe(chunk)))
                     log.info("ws connected %s (%d subs)", self.url, len(self.subs))
 
                     await self._pump(ws)
@@ -353,41 +390,82 @@ class BitunixWebSocket:
                 self._ws = None
 
     async def _read_connect_ack(self, ws) -> None:
-        """The server's first frame is {"op":"connect","data":{"result":true}}."""
-        try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=self.cfg.login_timeout)
-        except asyncio.TimeoutError:
-            return
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-        if msg.get("op") == "connect" and not (msg.get("data") or {}).get("result", True):
-            raise RuntimeError(f"ws connect rejected: {msg}")
+        """The server's first frame is {"op":"connect","data":{"result":true}}.
+
+        A push frame that arrives BEFORE the ack is queued, not dropped: the
+        private socket can start pushing `tpsl` the moment it is open.
+        """
+        deadline = time.time() + self.cfg.login_timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                log.warning("ws connect: no connect ack within %.0fs",
+                            self.cfg.login_timeout)
+                return
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                log.warning("ws connect: no connect ack within %.0fs",
+                            self.cfg.login_timeout)
+                return
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("op") == "connect":
+                data = msg.get("data")
+                if isinstance(data, dict) and data.get("result") is False:
+                    raise RuntimeError(f"ws connect rejected: {msg}")
+                return
+            ev = Event.from_message(msg)
+            if ev is not None:
+                self._enqueue(ev)
 
     async def _login(self, ws) -> None:
         if not self.cfg.api_key or not self.cfg.api_secret:
             raise RuntimeError("private WS needs BITUNIX_API_KEY and BITUNIX_API_SECRET")
         frame = build_login(self.cfg.api_key, self.cfg.api_secret)
         await ws.send(json.dumps(frame))
-        # The docs do not define a login ack; the Go demo does not wait for one.
-        # Read one frame if it arrives, fail on an explicit error, otherwise go on.
-        try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=self.cfg.login_timeout)
-        except asyncio.TimeoutError:
-            self.logged_in = True
-            log.debug("ws login: no ack within %.0fs, continuing", self.cfg.login_timeout)
-            return
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            self.logged_in = True
-            return
-        code = msg.get("code")
-        if code not in (None, 0, "0"):
-            raise RuntimeError(f"ws login failed: code={code} msg={msg.get('msg')}")
-        self.logged_in = True
-        log.debug("ws login ok")
+        # The ack is {"op":"login",...} - the Java demo switches on
+        # WsOpCh.LOGIN and calls afterLogin(). The private socket may push
+        # `tpsl` BEFORE that ack, so every non-ack frame is queued instead of
+        # being consumed and thrown away (the old code read exactly one frame
+        # and discarded it, losing the first TP/SL push on every reconnect).
+        deadline = time.time() + self.cfg.login_timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                # The docs do not define a login ack, so a missing one is not
+                # fatal - but it is NOT success either. Report it honestly.
+                self.logged_in = False
+                log.warning("ws login: no login ack within %.0fs",
+                            self.cfg.login_timeout)
+                return
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                self.logged_in = False
+                log.warning("ws login: no login ack within %.0fs",
+                            self.cfg.login_timeout)
+                return
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            code = msg.get("code")
+            if code not in (None, 0, "0"):
+                raise RuntimeError(
+                    f"ws login failed: code={code} msg={msg.get('msg')}")
+            op = msg.get("op")
+            if op == "login":
+                self.logged_in = True
+                log.debug("ws login ok")
+                return
+            if op == "connect":
+                continue
+            ev = Event.from_message(msg)
+            if ev is not None:
+                self._enqueue(ev)
 
     async def _pump(self, ws) -> None:
         pinger = asyncio.create_task(self._pinger(ws), name="ws-pinger")
@@ -401,13 +479,25 @@ class BitunixWebSocket:
                     log.debug("ws non-json frame ignored: %r", raw[:120])
                     continue
 
-                # heartbeat reply
+                # heartbeat reply: {"op":"ping","ts":..,"pong":<echo>,"ping":<server>}
                 if msg.get("op") == "ping" and "pong" in msg:
                     self.pongs_received += 1
                     self.last_pong_ts = time.time()
-                    self._pong.set()
+                    # only the pong echoing the ping we are waiting on counts
+                    if msg.get("pong") == self._ping_value:
+                        self._pong.set()
                     continue
-                if msg.get("op") in ("connect", "subscribe", "unsubscribe", "login"):
+                if msg.get("op") in ("subscribe", "unsubscribe"):
+                    # A rejected subscription used to be dropped silently, so a
+                    # bad channel name looked like "the market is quiet".
+                    code = msg.get("code")
+                    if code not in (None, 0, "0"):
+                        self.last_error = (
+                            f"{msg.get('op')} rejected: code={code} "
+                            f"{msg.get('msg') or ''}").strip()
+                        log.warning("ws %s", self.last_error)
+                    continue
+                if msg.get("op") in ("connect", "login"):
                     continue
 
                 ev = Event.from_message(msg)
@@ -451,12 +541,25 @@ class BitunixWebSocket:
                 q.task_done()
 
     def _handlers_for(self, ch: str) -> list[Handler]:
+        """Handlers for `ch`, plus the longest matching channel FAMILY.
+
+        A family prefix must end on a boundary: 'market_kline' matches
+        'market_kline_1min' and 'depth_book' matches 'depth_book1', but
+        'ticker' must NOT match 'tickers'. That collision sent the aggregated
+        `tickers` array (a LIST) to the single-ticker handler, which then did
+        `d.get("la")` on a list and raised AttributeError on every frame.
+        """
         out = list(self.handlers.get(ch, []))
         best = ""
         for key in self.handlers:
             if key in ("*", ch):
                 continue
-            if ch.startswith(key) and len(key) > len(best):
+            if not ch.startswith(key) or len(ch) <= len(key):
+                continue
+            nxt = ch[len(key)]
+            if nxt != "_" and not nxt.isdigit():
+                continue
+            if len(key) > len(best):
                 best = key
         if best:
             out += self.handlers[best]
@@ -468,8 +571,10 @@ class BitunixWebSocket:
         while True:
             await asyncio.sleep(self.cfg.ping_interval)
             self._pong.clear()
+            value = int(time.time())
+            self._ping_value = value
             try:
-                await ws.send(json.dumps(build_ping()))
+                await ws.send(json.dumps(build_ping(value)))
                 self.pings_sent += 1
             except Exception:  # noqa: BLE001
                 return
@@ -502,7 +607,11 @@ class MarketDataFeed:
         self.cache = cache if cache is not None else PriceCache()
         self.kline_cache = kline_cache
         self.latest_price: dict[str, float] = {}
-        self.latest_mark: dict[str, float] = {}
+        #: `ip` on the `price` channel is the INDEX price, not the mark price.
+        #: The mark price is not published on any public WS channel - it must
+        #: come from REST (get_tickers -> markPrice). Naming this `latest_mark`
+        #: made the engine believe it had a mark price it never had.
+        self.latest_index: dict[str, float] = {}
         self.latest_funding: dict[str, float] = {}
         self.latest_kline: dict[tuple[str, str], dict] = {}
         self._wire()
@@ -521,7 +630,14 @@ class MarketDataFeed:
         self.ws.on("market_kline", self._on_kline)
 
     def _on_price(self, ev: Event) -> None:
-        d = ev.data or {}
+        """`price` push: {mp, ip, fr, ft, nft} - all strings.
+
+        mp = market (last) price, ip = INDEX price, fr = funding rate.
+        There is no mark price on this channel.
+        """
+        d = ev.data
+        if not isinstance(d, dict):
+            return
         sym = ev.symbol or d.get("s")
         if not sym:
             return
@@ -531,14 +647,21 @@ class MarketDataFeed:
                 self.latest_price[sym] = px
                 self.cache.put_ws(sym, px, exchange_ts=(ev.ts / 1000.0) if ev.ts else 0.0)
             if d.get("ip"):
-                self.latest_mark[sym] = float(d["ip"])
+                self.latest_index[sym] = float(d["ip"])
             if d.get("fr"):
                 self.latest_funding[sym] = float(d["fr"])
         except (TypeError, ValueError):
             pass
 
     def _on_ticker(self, ev: Event) -> None:
-        d = ev.data or {}
+        """`ticker` push: a single object with la = last price.
+
+        `tickers` (plural) is a LIST and must never reach this handler - see
+        `_handlers_for`, which used to prefix-match 'ticker' against 'tickers'.
+        """
+        d = ev.data
+        if not isinstance(d, dict):
+            return
         sym = ev.symbol or d.get("s")
         px = d.get("la")
         if sym and px:
@@ -606,18 +729,23 @@ class PrivateFeed:
 
     The official Tp Sl channel doc defines the push as:
 
-        {"ch": "tpsl", "data": {"id": ..., "positionId": ..., "symbol": ...,
-         "tpPrice": ..., "slPrice": ..., "tpQty": ..., "slQty": ...,
-         "status": ..., "ctime": ...}}
+        {"ch": "tpsl", "ts": <ms>, "data": {"event": ..., "positionId": ...,
+         "orderId": ..., "symbol": ..., "status": ..., "tpPrice": ...,
+         "slPrice": ..., "tpQty": ..., "slQty": ..., "ctime": ...}}
+
+    `data` is ALWAYS an object, never an array, and there is no `id` field.
+    The docs also say this channel is pushed AUTOMATICALLY after a successful
+    private login; subscribing to it explicitly (as the Node demo does) is
+    harmless and is kept so the subscription list is complete.
 
     This class subscribes all four private channels, keeps the latest frame per
     channel, and exposes counters so `/ws` can report real state.
 
     UNVERIFIED WITHOUT CREDENTIALS: the private login handshake needs
     BITUNIX_API_KEY / BITUNIX_API_SECRET. The frame shapes and the login
-    signature are implemented from the official docs and the Go demo, but the
-    live handshake has NOT been exercised in this sandbox. Do not read this
-    class as "tested against the live private server".
+    signature are implemented from the official docs and the Go/Java/Node
+    demos, but the live handshake has NOT been exercised in this sandbox. Do
+    not read this class as "tested against the live private server".
     """
 
     def __init__(self, cfg: WSConfig, channels: list[str] | None = None):
