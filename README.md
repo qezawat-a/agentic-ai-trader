@@ -169,8 +169,14 @@ universe size 40            how many ranked pairs to keep
 universe min volume 20000000   liquidity floor in USDT (0 disables)
 ```
 
-The same settings are read from `.env` at startup: `SYMBOLS=AUTO`,
-`UNIVERSE_RANK`, `UNIVERSE_SIZE`, `MIN_24H_VOLUME_USD`.
+The same settings are read from `.env` at startup: `SYMBOLS=AUTO` (or
+`UNIVERSE_AUTO=1`), `UNIVERSE_RANK`, `UNIVERSE_SIZE`, `MIN_24H_VOLUME_USD`.
+All four are documented with their defaults in `.env.example`.
+
+**`universe_auto` is OFF by default.** Until you set `SYMBOLS=AUTO` or
+`UNIVERSE_AUTO=1`, the engine scans your explicit `TRADE_SYMBOLS` list and the
+universe settings are inert - so turning this on is a deliberate act, never a
+surprise. An explicit symbol list always wins over `UNIVERSE_AUTO`.
 
 **The rules, and why they are what they are**
 
@@ -708,7 +714,7 @@ python scripts/verify_restart.py   # the same through the real agent command pat
 python -m pytest -q tests
 ```
 
-912 tests covering indicators, risk math, all 16 strategies (including empty and
+939 tests covering indicators, risk math, all 16 strategies (including empty and
 short-data inputs), aggregation rules, TP/SL planning and side validation
 (30020-30033), the **running-engine** TP/SL path (breakeven + trailing, the
 second 30029), the order-size pre-flight (20003, tier leverage caps, margin
@@ -721,9 +727,12 @@ MIN_POOL and VOLUME fallbacks, engine wiring, and JS-parity checks for the
 sizing and liquidation math), the thinking-level system (levels, aliases,
 persistence, and the exact request parameter sent), the balance command,
 empty-model-response diagnosis, the order builder's per-field validation, the
-price and kline caches, the WebSocket layer, and the persistent store
+price and kline caches, the WebSocket layer, the persistent store
 (round-trip, SIGKILL survival, precedence, atomicity, corruption recovery,
-schema migration, memory eviction, and the secret guard).
+schema migration, memory eviction, and the secret guard), and the **docs/code
+parity guard** (every universe and margin variable in `.env.example` is read by
+`config.py` and vice versa, the documented defaults match the code, and the
+README keeps its universe, 20003 and margin sections).
 
 ---
 
@@ -785,7 +794,9 @@ The fix:
 
 ### 20003 `Insufficient balance`
 
-Two independent causes, both now caught before sending:
+Four independent causes, all now caught before sending. The first two were the
+original fix; the last two are the ones that kept the error coming back on a
+live account.
 
 1. **The tier caps the leverage.** `get_position_tiers` returns a `leverage`
    that is the *maximum* for that notional band (AKEUSDT: 50x under 10k, 25x
@@ -794,6 +805,35 @@ Two independent causes, both now caught before sending:
    error. The pre-flight now compares the engine's leverage against the tier.
 2. **No balance check.** The pre-flight compares the required margin against
    the real available balance and refuses with both numbers.
+3. **The margin was sized at the CONFIGURED leverage, not the one the exchange
+   actually holds.** `change_leverage` is *advisory*: the pair's own min/max and
+   the position tier can clamp it, and an open position blocks the change
+   outright (20006). The engine ignored the answer and sized every order at
+   `state.leverage`. On AKEUSDT (price `0.005594`, 1000 USDT equity, configured
+   10x, exchange holding 3x) the engine computed a 333.33 USDT margin while the
+   exchange required 1111.11 - a 3.3x shortfall that surfaces as 20003.
+   `_sync_exchange_leverage()` (ported from the JS `syncExchangeLeverage`) now
+   applies the leverage, **reads back what the exchange really holds**, and
+   sizes against that. A read-back failure falls back to the configured value
+   (so a transient API error never blocks a trade) and is recorded in
+   `state.errors` and the log, never swallowed.
+4. **The tier cap was checked against the balance-capped MAXIMUM notional, not
+   the order's real notional.** The pre-flight built `max_notional = equity *
+   leverage` - the largest order the account *could* send - and picked the tier
+   from that. A 10,000 USDT order on a 10,000 USDT account was judged against a
+   100,000 USDT band (tier 5, 5x cap) and refused, even though its real notional
+   sat in tier 1 (50x cap). The cap is now checked against `qty * price` after
+   sizing, so a small order is never refused for a band it never reaches - and a
+   genuinely oversized one still is.
+
+**The 80% buffer is not the fix.** The JS `computeMargin` multiplies margin by
+`0.80`, a fixed factor. It cannot cover cause 3 (a 3.3x shortfall needs a 70%
+cut, and at 2x held leverage even that fails) and it does not touch cause 4 at
+all. The Python engine already had something better - `max_notional_for_balance`
+reserves the real taker fee (`equity / (1/lev + fee)`) - so the fixed buffer was
+deliberately **not** ported. `MARGIN_SAFETY_PCT` (default 2%) is the engine's own
+headroom knob, and it is a *reserve on top of* the correct math, not a
+replacement for it.
 
 ### Sizing and liquidation - parity with the JavaScript engine
 
@@ -841,6 +881,8 @@ Configurable bounds (all default `0` = disabled, so behaviour is unchanged):
 | `TP_SL_MIN_STOP_TICKS` | minimum stop distance from mark/entry, in ticks |
 | `TP_SL_TRIGGER_TYPE` | `MARK_PRICE` (default) or `LAST_PRICE` |
 | `ORDER_UNIT` | `QUANTITY` (default), `NOTIONAL` or `COST` |
+| `TAKER_FEE_RATE` | taker fee reserved on top of margin (default `0.0006` = 0.06%) |
+| `MARGIN_SAFETY_PCT` | extra headroom reserved when sizing, % of balance (default `2.0`) |
 
 Verify against live data: `python scripts/verify_tpsl_side.py`
 
