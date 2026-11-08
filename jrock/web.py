@@ -129,6 +129,34 @@ header{display:flex;align-items:center;justify-content:space-between;flex-wrap:w
     </div>
 
     <div class="panel">
+      <div class="h"><span>universe</span><span id="uniChip" class="note"></span></div>
+      <div class="row">
+        <button class="btn act btn-small" data-line="universe">show</button>
+        <button class="btn act btn-small btn-green" data-confirm="universe auto">auto on</button>
+        <button class="btn act btn-small" data-confirm="universe off">auto off</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button class="btn act btn-small" data-confirm="universe rank VOLUME">VOLUME</button>
+        <button class="btn act btn-small" data-confirm="universe rank GAINERS">GAINERS</button>
+        <button class="btn act btn-small" data-confirm="universe rank LOSERS">LOSERS</button>
+        <button class="btn act btn-small" data-confirm="universe rank MOVERS">MOVERS</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px">
+        <div class="qrow">
+          <span>size (pairs)</span>
+          <input class="input qin" id="uniSize" inputmode="numeric" autocomplete="off">
+          <button class="btn act btn-small" id="uniSizeBtn">set</button>
+        </div>
+        <div class="qrow">
+          <span>min 24h vol $</span>
+          <input class="input qin" id="uniVol" inputmode="numeric" autocomplete="off" style="width:110px">
+          <button class="btn act btn-small" id="uniVolBtn">set</button>
+        </div>
+      </div>
+      <div class="note" style="margin-top:6px">Universe changes which symbols the engine trades, so each change asks you to confirm first. "show" only reads.</div>
+    </div>
+
+    <div class="panel">
       <div class="h"><span>watchlist</span></div>
       <div class="row" id="symbols"></div>
       <div class="row" style="margin-top:8px"><button class="btn act btn-small" data-line="price">prices</button></div>
@@ -317,6 +345,38 @@ function fillQuickSettings() {
   });
 }
 
+// Universe changes alter the symbol set, so they need an explicit OK in the
+// browser. Bare commands do not pass through the server's yes/no prompt.
+function runConfirmed(line) {
+  if (busy) return;
+  if (!window.confirm("Change the trading universe?\\n\\n" + line +
+      "\\n\\nThis changes which symbols the engine scans and trades.")) return;
+  run(line);
+}
+
+function runUniverseNumber(input, prefix) {
+  const v = input.value.trim();
+  if (!/^\d+$/.test(v) || Number(v) <= 0) {
+    out.textContent = "Enter a positive whole number first.";
+    return;
+  }
+  runConfirmed(prefix + v);
+}
+
+function paintUniverse(s) {
+  const parts = [
+    s.universe_auto ? "auto" : "fixed list",
+    s.universe_rank,
+    s.universe_size != null ? "top " + s.universe_size : null,
+    s.min_24h_volume_usd != null ? "min $" + s.min_24h_volume_usd : null,
+  ].filter((p) => p !== null && p !== undefined && p !== "");
+  $("uniChip").textContent = parts.length ? parts.join(" · ") : "universe –";
+  for (const [id, key] of [["uniSize", "universe_size"], ["uniVol", "min_24h_volume_usd"]]) {
+    const inp = $(id);
+    if (document.activeElement !== inp && s[key] != null) inp.value = s[key];
+  }
+}
+
 async function refreshStatus() {
   try {
     const r = await api("/api/status");
@@ -338,6 +398,7 @@ async function refreshStatus() {
     $("pChip").textContent = "position " + S.position_mode;
     $("maxChip").textContent = "max " + S.max_open_positions + " pos";
     paintSymbols(S.symbols || []);
+    paintUniverse(S);
     fillQuickSettings();
   } catch (e) { /* keep the last status on screen */ }
 }
@@ -371,6 +432,12 @@ $("yes").addEventListener("click", () => run("yes"));
 $("no").addEventListener("click", () => run("no"));
 document.querySelectorAll("[data-line]").forEach((b) =>
   b.addEventListener("click", () => run(b.dataset.line)));
+document.querySelectorAll("[data-confirm]").forEach((b) =>
+  b.addEventListener("click", () => runConfirmed(b.dataset.confirm)));
+$("uniSizeBtn").addEventListener("click", () => runUniverseNumber($("uniSize"), "universe size "));
+$("uniVolBtn").addEventListener("click", () => runUniverseNumber($("uniVol"), "universe min volume "));
+$("uniSize").addEventListener("keydown", (e) => { if (e.key === "Enter") runUniverseNumber($("uniSize"), "universe size "); });
+$("uniVol").addEventListener("keydown", (e) => { if (e.key === "Enter") runUniverseNumber($("uniVol"), "universe min volume "); });
 $("form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const input = $("line");
@@ -428,7 +495,14 @@ async def status(request: web.Request) -> web.Response:
     if not _authorized(request):
         return web.json_response({"error": "unauthorized"}, status=401)
     st = request.app["agent"].engine.state
+    # Universe fields come from the universe layer. Read them defensively so
+    # this dashboard still starts on a checkout that does not have it yet.
+    s = request.app["agent"].s
     return web.json_response({
+        "universe_auto": bool(getattr(s, "universe_auto", False)),
+        "universe_rank": getattr(s, "universe_rank", None),
+        "universe_size": getattr(s, "universe_size", None),
+        "min_24h_volume_usd": getattr(s, "min_24h_volume_usd", None),
         "engine_on": st.engine_on,
         "scan_on": st.scan_on,
         "autotrade": st.autotrade,
