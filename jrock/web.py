@@ -356,7 +356,7 @@ function runConfirmed(line) {
 
 function runUniverseNumber(input, prefix) {
   const v = input.value.trim();
-  if (!/^\d+$/.test(v) || Number(v) <= 0) {
+  if (!/^\\d+$/.test(v) || Number(v) <= 0) {
     out.textContent = "Enter a positive whole number first.";
     return;
   }
