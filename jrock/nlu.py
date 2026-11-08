@@ -107,6 +107,32 @@ def _num_after(text: str, *anchors: str) -> float | None:
     return None
 
 
+#: Multipliers people write after a number ("20 million", "5m", "500k").
+_SCALES = {"k": 1e3, "thousand": 1e3, "m": 1e6, "million": 1e6,
+           "b": 1e9, "billion": 1e9}
+
+
+def _num_after_scaled(text: str, *anchors: str) -> float | None:
+    """Like `_num_after`, but honours a k/m/b/million suffix.
+
+    "only scan coins with at least 20 million volume" must become 20_000_000,
+    not 20 - a 20 USDT floor would let every dust pair through, which is the
+    opposite of what the sentence asks for.
+    """
+    for a in anchors:
+        m = re.search(
+            rf"\b{re.escape(a)}\b[^\d\-]*(-?\d+(?:\.\d+)?)\s*"
+            rf"(k|thousand|m|million|b|billion)?\b", text, re.I)
+        if m:
+            try:
+                n = float(m.group(1))
+            except ValueError:
+                return None
+            suffix = (m.group(2) or "").lower()
+            return n * _SCALES.get(suffix, 1.0)
+    return None
+
+
 def _symbols_in(text: str) -> list[str]:
     return _SYMBOL_RE.findall(text.upper())
 
@@ -177,6 +203,56 @@ def _b_symbols(t: str) -> Intent:
     syms = _symbols_in(t)
     return Intent("symbols", f"symbols {syms[0]}" if syms else "symbols", 0.85,
                   symbols=syms, describe="list tradable symbols")
+
+
+def _b_universe_show(t: str) -> Intent:
+    # The bare `\buniverse\b` catch-all is deliberately LOW confidence so any
+    # specific universe rule (rank/size/auto/off) outranks it. At equal
+    # confidence the parser treats the pair as ambiguous and asks, which would
+    # make "universe off" a question instead of a command.
+    conf = 0.9 if re.search(r"\b(show|list|what|which|display|print|see|view|check|get|tell)\b", t, re.I) else 0.6
+    return Intent("universe_show", "universe", conf,
+                  describe="show the trading universe and its ranking")
+
+
+def _b_universe_auto(t: str) -> Intent:
+    return Intent("universe_auto", "universe auto", 0.9, destructive=True,
+                  describe="build the universe from the exchange's full pair list")
+
+
+def _b_universe_off(t: str) -> Intent:
+    return Intent("universe_off", "universe off", 0.9,
+                  describe="stop ranking the universe and use the explicit symbol list")
+
+
+def _b_universe_rank(t: str) -> Intent:
+    m = re.search(r"\b(volume|gainers?|losers?|movers?)\b", t)
+    if not m:
+        return Intent("universe_rank", "", 0.5, needs="ranking mode",
+                      describe="set the universe ranking")
+    word = m.group(1).upper()
+    mode = {"GAINER": "GAINERS", "LOSER": "LOSERS", "MOVER": "MOVERS"}.get(word, word)
+    return Intent("universe_rank", f"universe rank {mode}", 0.9, destructive=True,
+                  describe=f"rank the universe by {mode}")
+
+
+def _b_universe_size(t: str) -> Intent:
+    n = _num_after(t, "size", "top", "to", "at")
+    if n is None:
+        return Intent("universe_size", "", 0.5, needs="universe size",
+                      describe="set the universe size")
+    return Intent("universe_size", f"universe size {int(n)}", 0.9, destructive=True,
+                  describe=f"keep the top {int(n)} ranked pairs")
+
+
+def _b_universe_min_volume(t: str) -> Intent:
+    n = _num_after_scaled(t, "volume", "to", "at")
+    if n is None:
+        return Intent("universe_min_volume", "", 0.5, needs="minimum 24h volume",
+                      describe="set the minimum 24h volume")
+    return Intent("universe_min_volume", f"universe min volume {n}", 0.9,
+                  destructive=True,
+                  describe=f"only scan pairs doing at least {n:g} USDT in 24h")
 
 
 def _b_price(t: str) -> Intent:
@@ -479,6 +555,50 @@ RULES: list[tuple[str, re.Pattern, object]] = [
     ("price", re.compile(r"\b(price|quote|how much is|whats the price of|"
                          r"what's the price of)\b", re.I), _b_price),
     ("funding", re.compile(r"\bfunding\b", re.I), _b_funding),
+    # --- universe (before `symbols`, so "which coins are you scanning" is not
+    # read as a plain symbol list)
+    ("universe_rank", re.compile(
+        r"\b(rank|sort|order|pick)\b.*\b(by\s+)?"
+        r"(volume|gainers?|losers?|movers?)\b", re.I), _b_universe_rank),
+    ("universe_rank", re.compile(
+        r"\b(volume|gainers?|losers?|movers?)\b.*\b(rank|ranking|mode)\b", re.I),
+     _b_universe_rank),
+    ("universe_min_volume", re.compile(
+        r"\b(min|minimum|at least|only)\b.*\b(24h\s+)?volume\b", re.I),
+     _b_universe_min_volume),
+    ("universe_size", re.compile(
+        r"\buniverse\b.*\b(size|top|how many)\b", re.I), _b_universe_size),
+    ("universe_size", re.compile(
+        r"\bhow many\b.*\b(pairs|symbols|coins)\b.*\b(universe|scan|trade)\b", re.I),
+     _b_universe_size),
+    ("universe_auto", re.compile(
+        r"\b(auto|automatic|all pairs|full pair list|whole market|every pair)\b"
+        r".*\b(universe|symbols|pairs|scan)\b", re.I), _b_universe_auto),
+    ("universe_auto", re.compile(
+        r"\b(universe|symbols|pairs)\b.*\b(auto|automatic|all|full)\b", re.I),
+     _b_universe_auto),
+    ("universe_auto", re.compile(r"\b(use|scan|trade)\s+all\s+pairs\b", re.I),
+     _b_universe_auto),
+    ("universe_auto", re.compile(
+        r"\b(full|whole|entire)\s+(pair\s+list|market)\b", re.I), _b_universe_auto),
+    ("universe_off", re.compile(
+        r"\b(universe|symbols|pairs)\b.*\b(off|manual|stop|disable)\b", re.I),
+     _b_universe_off),
+    ("universe_off", re.compile(
+        r"\b(turn|switch|shut)\s+off\b.*\b(universe|symbols|pairs)\b", re.I),
+     _b_universe_off),
+    ("universe_off", re.compile(
+        r"\b(stop|disable)\b.*\b(universe|symbols|pairs)\b", re.I), _b_universe_off),
+    ("universe_off", re.compile(r"\buse\s+manual\s+symbols?\b", re.I), _b_universe_off),
+    ("universe_show", re.compile(
+        r"\b(which|what)\s+(coins|symbols|pairs|markets)\b.*"
+        r"\b(scan|scanning|trade|trading|watch|watching|use|using)\b", re.I),
+     _b_universe_show),
+    ("universe_show", re.compile(
+        r"\b(show|list|what|whats|what's|display|print|see|view|check|get|tell)\b"
+        r".*\b(universe|which (coins|symbols|pairs)|what (coins|symbols|pairs))\b",
+        re.I), _b_universe_show),
+    ("universe_show", re.compile(r"\buniverse\b", re.I), _b_universe_show),
     ("symbols", re.compile(
         r"\b(show|list|what|whats|what's|display|print|see|check|get|tell)\b"
         r".*\b(symbols?|pairs?)\b", re.I), _b_symbols),

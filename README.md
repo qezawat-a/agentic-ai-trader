@@ -144,7 +144,60 @@ min confidence 70                   tf min confidence 60
 close position [SYMBOL]             margin mode ISOLATION|CROSS
 position mode HEDGE|ONE_WAY         symbols BTCUSDT,ETHUSDT
 max open positions 3                leverage 10 | risk 1.0
+universe                            universe auto | universe off
+universe rank VOLUME|GAINERS|LOSERS|MOVERS
+universe size 40                    universe min volume 20000000
 ```
+
+---
+
+## Universe selection (rank, size, 24h volume floor)
+
+Ported from the JavaScript engine (`src/scanner/scanner.js`). When
+`SYMBOLS=AUTO` (or `UNIVERSE_AUTO=1`) the engine rebuilds its symbol list from
+the exchange's full pair list on every scan, instead of scanning a fixed list.
+
+```
+universe                    show the current universe and its ranking
+universe auto               build it from the exchange's full pair list
+universe off                go back to the explicit symbol list
+universe rank VOLUME        deepest books first (default)
+universe rank GAINERS       only coins UP on the day, biggest gain first
+universe rank LOSERS        only coins DOWN on the day, biggest fall first
+universe rank MOVERS        biggest move either way
+universe size 40            how many ranked pairs to keep
+universe min volume 20000000   liquidity floor in USDT (0 disables)
+```
+
+The same settings are read from `.env` at startup: `SYMBOLS=AUTO`,
+`UNIVERSE_RANK`, `UNIVERSE_SIZE`, `MIN_24H_VOLUME_USD`.
+
+**The rules, and why they are what they are**
+
+* **VOLUME** scores `liquidity*0.75 + movement*0.25`, where liquidity is
+  `quoteVol / max(quoteVol)` and movement is `min(range, 25%) / 25%`. The old
+  score was `log10(volume) * (1 + range*4)`, which compressed a 2000x volume
+  gap into 1.5x of score and let a 70% daily range erase it - BTC ($2.4B)
+  ranked 64th, behind coins doing $600k. Liquidity now dominates by design.
+* **GAINERS/LOSERS FILTER, they do not just sort.** A flat or opposite-moving
+  coin is dropped, even when the pool is smaller than `universe_size`. The old
+  code sorted and sliced, so a ceiling larger than the qualifying set swept in
+  every flat and red name - the literal "I set GAINERS but it isn't scanning
+  gainers" report.
+* **`universe_size` is a ceiling, not a quota.** A change-ranked mode returns
+  fewer pairs when fewer qualify, and never pads with non-qualifiers.
+* **`min_24h_volume_usd` is applied before ranking**, and matters more in the
+  change-ranked modes: the biggest movers on an exchange are usually the
+  thinnest books, which is exactly where a stop gets swept.
+* **A failure never empties the list.** If the pair list or tickers cannot be
+  read, the previous symbols stay in place - an empty universe would silently
+  stop all scanning. If the floor leaves fewer than 10 pairs it falls back to
+  the most liquid ones; if a change-ranked mode finds nothing it falls back to
+  VOLUME. Both are reported in the log and in `universe`.
+* **Held positions are always kept**, even if they drop out of the ranking, so
+  the management loop still sees them.
+* **An explicit symbol list turns the layer off** (`symbols BTCUSDT,ETHUSDT`),
+  so the two can never fight over `state.symbols`.
 
 ---
 
@@ -655,7 +708,7 @@ python scripts/verify_restart.py   # the same through the real agent command pat
 python -m pytest -q tests
 ```
 
-772 tests covering indicators, risk math, all 16 strategies (including empty and
+912 tests covering indicators, risk math, all 16 strategies (including empty and
 short-data inputs), aggregation rules, TP/SL planning and side validation
 (30020-30033), the **running-engine** TP/SL path (breakeven + trailing, the
 second 30029), the order-size pre-flight (20003, tier leverage caps, margin
@@ -663,11 +716,14 @@ bounds), API-reference/client drift, model probing, request signing, CLI
 routing, the **natural-language intent layer** (sentence -> command mapping,
 destructive-action confirmation, ambiguity clarification, and a regression
 guard proving every existing command string still routes identically), the
-thinking-level system (levels, aliases, persistence, and the exact request
-parameter sent), the balance command, empty-model-response diagnosis, the order
-builder's per-field validation, the price and kline caches, the WebSocket layer,
-and the persistent store (round-trip, SIGKILL survival, precedence, atomicity,
-corruption recovery, schema migration, memory eviction, and the secret guard).
+**universe layer** (rank/size/24h-volume floor, the GAINERS/LOSERS filter, the
+MIN_POOL and VOLUME fallbacks, engine wiring, and JS-parity checks for the
+sizing and liquidation math), the thinking-level system (levels, aliases,
+persistence, and the exact request parameter sent), the balance command,
+empty-model-response diagnosis, the order builder's per-field validation, the
+price and kline caches, the WebSocket layer, and the persistent store
+(round-trip, SIGKILL survival, precedence, atomicity, corruption recovery,
+schema migration, memory eviction, and the secret guard).
 
 ---
 
@@ -734,10 +790,46 @@ Two independent causes, both now caught before sending:
 1. **The tier caps the leverage.** `get_position_tiers` returns a `leverage`
    that is the *maximum* for that notional band (AKEUSDT: 50x under 10k, 25x
    under 20k, 10x under 80k). Asking for more makes the exchange require more
-   margin than the engine computed — which surfaces as 20003, not a leverage
+   margin than the engine computed - which surfaces as 20003, not a leverage
    error. The pre-flight now compares the engine's leverage against the tier.
 2. **No balance check.** The pre-flight compares the required margin against
    the real available balance and refuses with both numbers.
+
+### Sizing and liquidation - parity with the JavaScript engine
+
+The sizing and liquidation math is kept in step with `bitunix-ai-trader`
+(`src/trading/risk.js`), and `tests/test_universe_parity.py` pins each rule so
+an edit to either side is caught.
+
+* **`liquidation_price`** is the published isolated-margin form,
+  `entry * (1 -/+ 1/L + mmr)`. At `L >= 1/mmr` the maintenance requirement
+  swallows the whole margin and the formula puts liquidation at or through
+  entry; it returns `entry` in that case so the caller can refuse the trade
+  instead of planning a stop that cannot exist.
+* **`liq_unsafe`** is the guard that refuses such a trade, and `try_enter`
+  reports the numbers (leverage, MMR, tier, a safe leverage) rather than a
+  confusing "no valid stop-loss exists".
+* **`mmr_for`** is the fallback MMR when the tier lookup fails. The old
+  `1/maxLev` made `liq == entry` at 50x+, blocking *every* trade with a false
+  `liqUnsafe`; it is now capped at 1% like the JS `mmrFor`.
+* **`max_safe_leverage`** solves `lev = 1 / (slDist/(1-buffer)/entry + mmr)`,
+  the same solver the JS engine uses.
+* **`position_size_by_risk`** caps the order at what the balance can actually
+  pay for (`max_notional_for_balance`, which reserves the taker fee) and, when
+  several position slots are free, at `available / slots_left` - the JS
+  `computeMargin` rule that stops the first of several positions from
+  committing the whole balance.
+* **`min_order_notional` / `min_margin_for_min_order`** explain *why* a size
+  came out zero: the exchange minimum is bigger than the balance can open at
+  this leverage, which is a different fix from "risk too small".
+* **The profit-side stop pass-through.** `clamp_sl(..., allow_profit_side=True)`
+  is used on the management path only. A breakeven or trailing stop sits on the
+  profit side of entry, and the old clamp pulled it back to `entry - maxDist` -
+  below entry - so every breakeven/trailing update rewrote the stop to the same
+  fixed level, the ratchet saw no improvement, and `breakeven_pct` /
+  `trailing_trigger_roi_pct` appeared to do nothing. The pass-through requires
+  the stop to clear the **mark** as well as sit on the profit side of entry, so
+  a position in loss is still clamped. The entry-plan path is unchanged.
 
 Configurable bounds (all default `0` = disabled, so behaviour is unchanged):
 

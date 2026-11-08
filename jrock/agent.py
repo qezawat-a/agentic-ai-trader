@@ -116,6 +116,9 @@ TRADER ENGINE COMMANDS
   close position [SYMBOL]           margin mode ISOLATION|CROSS
   position mode HEDGE|ONE_WAY       symbols BTCUSDT,ETHUSDT
   max open positions 3              leverage 10 | risk 1.0
+  universe                          universe auto | universe off
+  universe rank VOLUME|GAINERS|LOSERS|MOVERS
+  universe size 40                  universe min volume 20000000
   tpsl method POSITION|PARTIAL|TRAILING|ACCOUNT
   partial close pct 50              partial at roi 50
   account tp usdt 100               account sl usdt 50
@@ -136,6 +139,22 @@ ENV SETTINGS (in .env, read at startup)
                             sizing, so an order never asks for more than the
                             balance can pay for (20003 Insufficient balance).
   MARGIN_SAFETY_PCT=2       extra headroom reserved when sizing, % of balance.
+  SYMBOLS=AUTO              build the trading universe from the exchange's full
+                            pair list instead of a fixed list. Same as
+                            UNIVERSE_AUTO=1. An explicit list (SYMBOLS=BTCUSDT)
+                            turns the universe layer off.
+  UNIVERSE_RANK=VOLUME      VOLUME | GAINERS | LOSERS | MOVERS. VOLUME ranks by
+                            24h liquidity (deepest books first); GAINERS/LOSERS
+                            keep only coins actually up/down on the day and
+                            never pad with non-qualifiers; MOVERS ranks by the
+                            biggest move either way.
+  UNIVERSE_SIZE=40          how many ranked pairs to keep. A CEILING, not a
+                            quota - a change-ranked mode returns fewer when
+                            fewer qualify.
+  MIN_24H_VOLUME_USD=20000000
+                            liquidity floor. Pairs thinner than this are never
+                            scanned (a stop can be swept on an illiquid book).
+                            0 disables the floor.
 
 PERMISSIONS
   auto accept edit on|off    apply self-edits automatically vs. show diff

@@ -1400,7 +1400,10 @@ class TraderEngine:
         """
         violations = validate_tpsl_side(
             symbol=sym, side=side, entry=entry, mark=mark, sl=sl, tp=tp,
-            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
+            # This is the MANAGEMENT path: a stop on the profit side of entry
+            # is a breakeven/trailing stop, which is the goal, not a mistake.
+            allow_profit_side=True)
         if violations:
             self.state.errors.append(
                 "manage TP/SL refused locally: " + "; ".join(violations))
@@ -1549,7 +1552,7 @@ class TraderEngine:
             if should_breakeven(st, roi, self.state.breakeven_pct):
                 sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
                               rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
-                              liq=st.liq or None)
+                              liq=st.liq or None, allow_profit_side=True)
                 # The stored TP is re-sent with the new stop, so it must be
                 # valid against the CURRENT mark or the exchange rejects the
                 # whole request and the stop never moves.
@@ -1581,7 +1584,7 @@ class TraderEngine:
                 if new_stop is not None:
                     sl = clamp_sl(side=side, sl=new_stop, entry=entry, mark=mark,
                                   rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
-                                  liq=st.liq or None)
+                                  liq=st.liq or None, allow_profit_side=True)
                     tp = self._managed_tp(st, side, entry, mark, rules, "trail")
                     if self._tpsl_side_ok(sym, side, entry, mark, sl, tp, rules):
                         try:
@@ -1634,7 +1637,7 @@ class TraderEngine:
                     sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
                                   rules=rules,
                                   min_ticks=self.s.tpsl_min_stop_ticks,
-                                  liq=st.liq or None)
+                                  liq=st.liq or None, allow_profit_side=True)
                     # The trailing branch above may already have moved the stop
                     # to this exact price on this pass. Sending the same modify
                     # twice is a wasted round-trip and a second chance to be

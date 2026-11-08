@@ -496,7 +496,8 @@ def tpsl_bounds(*, side: str, entry: float, mark: float,
 
 def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
              rules: "PairRules", min_ticks: int = 3,
-             liq: float | None = None) -> float:
+             liq: float | None = None,
+             allow_profit_side: bool = False) -> float:
     """Force a stop-loss onto the correct side of BOTH entry and mark.
 
     This is THE single place a stop-loss price is made safe, and every path that
@@ -514,6 +515,34 @@ def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
     d = min_stop_distance(rules, min_ticks)
     tick = tick_size(rules)
     is_long = side.upper() in ("LONG", "BUY")
+
+    # A stop already on the PROFIT side of entry is in front of liquidation by
+    # construction: price cannot reach it without first closing the position in
+    # profit. It must be passed through untouched.
+    #
+    # This guard is the one the JS engine documents at length. Without it the
+    # clamp measures |entry - stop| and pulls anything "too far" back to
+    # `entry - maxDist`, which for a breakeven or trailing stop is BELOW entry -
+    # so every breakeven/trailing update rewrote the stop to the same fixed
+    # level just inside liquidation. The write "succeeded", the ratchet saw no
+    # improvement next pass, and the stop sat at the original wide level forever
+    # while breakeven_pct and trailing_trigger_roi_pct appeared to do nothing.
+    #
+    # The pass-through requires BOTH conditions, not just the entry side: the
+    # stop must also still clear the MARK. A position in LOSS has mark < entry,
+    # so a breakeven stop at entry is on the profit side of entry yet ABOVE the
+    # mark - the exchange rejects that with 30029, and it must fall through to
+    # the normal clamp (which pulls it below the mark) instead of being sent.
+    #
+    # Opt-in (`allow_profit_side`) so the entry-plan path keeps its existing
+    # behaviour exactly: at entry time a stop on the profit side is a mistake
+    # and must be corrected, whereas on the management path it is the goal.
+    if allow_profit_side:
+        if is_long:
+            if sl >= entry and sl < mark - d:
+                return round_price(sl, p)
+        elif sl <= entry and sl > mark + d:
+            return round_price(sl, p)
 
     # The exchange requires the stop to be STRICTLY beyond the limit, so the
     # clamp must land strictly beyond it too - a stop that sits exactly on the
@@ -568,7 +597,8 @@ def clamp_tp(*, side: str, tp: float, entry: float, mark: float,
 def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
                        sl: float | None, tp: float | None,
                        rules: "PairRules", min_ticks: int = 3,
-                       liq: float | None = None) -> list[str]:
+                       liq: float | None = None,
+                       allow_profit_side: bool = False) -> list[str]:
     """Return a list of human-readable violations (empty == valid).
 
     Covers the documented exchange rules:
@@ -589,6 +619,18 @@ def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
     if tp is not None and tp <= 0:
         tp = None
 
+    if sl is not None:
+        # A stop on the profit side of entry that ALSO clears the mark is a
+        # breakeven/trailing stop: it is in front of liquidation and the
+        # exchange accepts it. Only the entry-plan path treats it as a
+        # violation. Both conditions are required - a position in loss has
+        # mark < entry, so a breakeven stop at entry is on the profit side of
+        # entry yet above the mark, and that IS a 30029 violation.
+        if allow_profit_side:
+            if is_long and sl >= entry and sl < mark - d:
+                sl = None
+            elif not is_long and sl <= entry and sl > mark + d:
+                sl = None
     if sl is not None:
         if is_long:
             limit = min(entry, mark) - d
