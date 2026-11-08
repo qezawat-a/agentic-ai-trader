@@ -60,7 +60,7 @@ async def main() -> int:
 
     # ---------------------------------------------------------------- 3
     hdr("3) LIVE: funding rate (batch) - the symbols filter is IGNORED")
-    raw = await c.get_funding_rate_batch("BTCUSDT,ETHUSDT")
+    raw = await c.get_funding_rate_batch()
     rows = raw if isinstance(raw, list) else (raw or {}).get("data") or []
     print(f"  GET /api/v1/futures/market/funding_rate/batch?symbols=BTCUSDT,ETHUSDT")
     print(f"    rows returned: {len(rows)}  <- the filter did NOT apply")

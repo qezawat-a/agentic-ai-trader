@@ -199,19 +199,35 @@ class BitunixClient:
         raise BitunixAPIError(10001, f"Network error after {self.cfg.max_retries} attempts: {last_err}")
 
     async def sync_time(self) -> int:
-        """Align local clock with the exchange (error 10011 guard)."""
+        """Align local clock with the exchange (error 10011 guard).
+
+        BUG FIX: the old implementation called
+        `GET /api/v1/futures/market/time`, which is NOT a documented Bitunix
+        endpoint and returns `{"code":404,"msg":"Not Found"}` live. The 10011
+        retry therefore never corrected the offset and every clock-skewed
+        request failed twice before surfacing the error.
+
+        There is no server-time endpoint in the official docs, so the offset is
+        derived from the HTTP `Date` response header of a public endpoint
+        (second resolution, which is enough for the 60s window) and refined
+        with the round-trip midpoint.
+        """
         await self.start()
         assert self._session is not None
         t0 = time.time() * 1000
-        async with self._session.get(f"{self.cfg.base_url}/api/v1/futures/market/time") as r:
+        async with self._session.get(
+            f"{self.cfg.base_url}/api/v1/futures/market/tickers"
+        ) as r:
             if r.status == 200:
-                d = await r.json()
-                server = d.get("data")
-                if isinstance(server, dict):
-                    server = server.get("serverTime") or server.get("time")
-                if server:
-                    t1 = time.time() * 1000
-                    self._time_offset_ms = int(float(server) - (t0 + t1) / 2)
+                date_hdr = r.headers.get("Date")
+                t1 = time.time() * 1000
+                if date_hdr:
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        server_s = parsedate_to_datetime(date_hdr).timestamp()
+                        self._time_offset_ms = int(server_s * 1000 - (t0 + t1) / 2)
+                    except (TypeError, ValueError):
+                        pass
         return self._time_offset_ms
 
     # ============================================================ MARKET (public)
@@ -220,17 +236,52 @@ class BitunixClient:
                                   params={"symbols": symbols}, signed=False)
 
     async def get_ticker(self, symbol: str) -> Any:
-        return await self.request("GET", "/api/v1/futures/market/ticker",
-                                  params={"symbol": symbol}, signed=False)
+        """Single-symbol ticker.
 
-    async def get_depth(self, symbol: str, limit: int = 15) -> Any:
+        BUG FIX: `/api/v1/futures/market/ticker` does not exist - the official
+        docs only document `/market/tickers` (plural) with an optional
+        `symbols` filter, and the singular path returns
+        `{"code":404,"msg":"Not Found"}` live. This now delegates to the
+        documented endpoint and returns the first row, so callers that expect a
+        single object keep working.
+        """
+        data = await self.get_tickers(symbol)
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data
+
+    #: Documented depth gears. `limit` is a STRING enum, not an int.
+    DEPTH_LIMITS = ("1", "5", "15", "50", "max")
+
+    async def get_depth(self, symbol: str, limit: str = "15") -> Any:
+        """Order book depth.
+
+        BUG FIX: the docs type `limit` as a STRING with a fixed gear enum
+        `1/5/15/50/max`. The old signature took an int, which made the
+        documented `max` gear impossible to request and sent the wrong type.
+        """
+        lim = str(limit)
+        if lim not in self.DEPTH_LIMITS:
+            raise ValueError(
+                f"get_depth limit must be one of {', '.join(self.DEPTH_LIMITS)}, "
+                f"got {limit!r}")
         return await self.request("GET", "/api/v1/futures/market/depth",
-                                  params={"symbol": symbol, "limit": limit}, signed=False)
+                                  params={"symbol": symbol, "limit": lim}, signed=False)
 
-    async def get_kline(self, symbol: str, interval: str, limit: int = 200,
+    async def get_kline(self, symbol: str, interval: str, limit: int = 100,
                         end_time: int | None = None, ktype: str = "LAST_PRICE") -> Any:
+        """Klines (closed candles only).
+
+        Official: `limit` default 100, MAX 200; `type` is LAST_PRICE|MARK_PRICE;
+        `endTime` is an EXCLUSIVE bound. `startTime` was removed from the docs
+        (2026-10-27 changelog) and is deliberately not sent.
+        """
+        if ktype not in ("LAST_PRICE", "MARK_PRICE"):
+            raise ValueError(
+                f"get_kline type must be LAST_PRICE or MARK_PRICE, got {ktype!r}")
+        lim = max(1, min(200, int(limit)))
         return await self.request("GET", "/api/v1/futures/market/kline",
-                                  params={"symbol": symbol, "interval": interval, "limit": limit,
+                                  params={"symbol": symbol, "interval": interval, "limit": lim,
                                           "endTime": end_time, "type": ktype}, signed=False)
 
     async def get_trading_pairs(self, symbols: str | None = None) -> Any:
@@ -241,22 +292,21 @@ class BitunixClient:
         return await self.request("GET", "/api/v1/futures/market/funding_rate",
                                   params={"symbol": symbol}, signed=False)
 
-    async def get_funding_rate_batch(self, symbols: str = "") -> Any:
-        """Funding rates for many symbols.
+    async def get_funding_rate_batch(self, _legacy_symbols: str | None = None) -> Any:
+        """Funding rates for every symbol.
 
-        Official: `symbols` is OPTIONAL - omitting it returns every symbol.
+        BUG FIX: the official docs list NO request parameters for this endpoint
+        (it always returns the whole market). The old code sent `symbols`, which
+        is undocumented and is ignored by the live server anyway. The parameter
+        is no longer SENT; callers filter the response with
+        `filter_funding_rows`.
 
-        VERIFIED LIVE 2026-11-07: this endpoint IGNORES the `symbols` filter.
-        `?symbols=BTCUSDT,ETHUSDT`, `?symbol=BTCUSDT` and no parameter at all
-        all return the same 931 rows. So the caller must filter the response
-        itself; `filter_funding_rows` does that. Sending the parameter is
-        harmless and kept for forward compatibility, but do not rely on it.
+        `_legacy_symbols` is accepted and deliberately ignored so existing
+        callers that still pass a symbol list keep working without a signature
+        change. It never reaches the wire.
         """
-        params: dict[str, Any] = {}
-        if symbols:
-            params["symbols"] = symbols
         return await self.request("GET", "/api/v1/futures/market/funding_rate/batch",
-                                  params=params, signed=False)
+                                  signed=False)
 
     async def get_funding_rate_history(self, symbol: str,
                                        start_time: int | None = None,
@@ -300,7 +350,14 @@ class BitunixClient:
                 if str(r.get("symbol", "")).upper() in want]
 
     async def get_accounts(self) -> Any:
-        return await self.request("GET", "/api/v1/futures/account/accounts")
+        """All margin-coin accounts.
+
+        BUG FIX: `/api/v1/futures/account/accounts` is not a documented path and
+        returns `{"code":404,"msg":"Not Found"}` live. The only documented
+        account endpoint is `GET /api/v1/futures/account` (get_single_account),
+        which already returns a LIST of margin coins. This delegates to it.
+        """
+        return await self.get_single_account()
 
     async def change_leverage(self, symbol: str, leverage: int, margin_coin: str = "USDT") -> Any:
         return await self.request("POST", "/api/v1/futures/account/change_leverage",
@@ -377,9 +434,15 @@ class BitunixClient:
         return await self.request("POST", "/api/v1/futures/account/adjust_position_margin",
                                   body=body)
 
-    async def asset_query(self, margin_coin: str = "USDT") -> Any:
-        return await self.request("GET", "/api/v1/futures/copyTrading/asset/query",
-                                  params={"marginCoin": margin_coin})
+    async def asset_query(self) -> Any:
+        """Copy-trading asset query.
+
+        BUG FIX: the path is `/api/v1/cp/asset/query`, not
+        `/api/v1/futures/copyTrading/asset/query` (which returns 404 live).
+        The docs also list NO request parameters - `marginCoin` was an
+        undocumented extra field and has been removed.
+        """
+        return await self.request("GET", "/api/v1/cp/asset/query")
 
     # ============================================================ POSITION
     async def get_pending_positions(self, symbol: str | None = None,
@@ -388,12 +451,18 @@ class BitunixClient:
                                   params={"symbol": symbol, "positionId": position_id})
 
     async def get_history_positions(self, symbol: str | None = None, skip: int = 0,
-                                    limit: int = 20,
+                                    limit: int = 10,
                                     start_time: int | None = None,
-                                    end_time: int | None = None) -> Any:
-        """Closed positions. Official paging params are `skip`/`limit`."""
+                                    end_time: int | None = None,
+                                    position_id: str | None = None) -> Any:
+        """Closed positions.
+
+        Official: paging is `skip`/`limit` (default 10, MAX 100); `positionId`
+        is a documented optional filter that the old signature could not send.
+        """
         return await self.request("GET", "/api/v1/futures/position/get_history_positions",
-                                  params={"symbol": symbol, "skip": skip, "limit": limit,
+                                  params={"symbol": symbol, "positionId": position_id,
+                                          "skip": skip, "limit": max(1, min(100, int(limit))),
                                           "startTime": start_time, "endTime": end_time})
 
     async def get_position_tiers(self, symbol: str) -> Any:
@@ -403,22 +472,31 @@ class BitunixClient:
     # ============================================================ TRADE
     # Official required params for place_order, from the docs. Validated here so
     # a malformed order is refused locally instead of costing a round trip.
-    PLACE_ORDER_REQUIRED = ("symbol", "qty", "side", "tradeSide", "orderType")
-    MODIFY_ORDER_REQUIRED = ("qty", "price")
+    #: Always-required place_order fields per the official docs.
+    PLACE_ORDER_REQUIRED = ("symbol", "qty", "side", "orderType")
+    #: `tradeSide` is documented as "Only required in hedge-mode".
+    PLACE_ORDER_HEDGE_REQUIRED = ("tradeSide",)
+    #: `price` is documented as "Required if the order type is LIMIT".
+    MODIFY_ORDER_REQUIRED = ("qty",)
 
     async def place_order(self, **kwargs) -> Any:
         """Place an order.
 
-        Official required: symbol, qty, side, tradeSide, orderType.
-        Optional: price, positionId, effect, clientId, reduceOnly, and the
-        tp*/sl* family. The body is passed through verbatim, but the required
-        set is checked first.
+        Official required: symbol, qty, side, orderType. `tradeSide` is only
+        required in HEDGE mode, and `price` only for LIMIT orders - the old
+        code demanded `tradeSide` unconditionally, which rejected valid
+        one-way-mode orders. Optional: price, positionId, effect, clientId,
+        reduceOnly, and the tp*/sl* family.
         """
         missing = [k for k in self.PLACE_ORDER_REQUIRED if not kwargs.get(k)]
         if missing:
             raise ValueError(
                 f"place_order is missing required parameter(s): {', '.join(missing)} "
                 f"(official required: {', '.join(self.PLACE_ORDER_REQUIRED)})")
+        if str(kwargs.get("orderType", "")).upper() == "LIMIT" and not kwargs.get("price"):
+            raise ValueError("place_order: price is required when orderType is LIMIT")
+        if str(kwargs.get("tradeSide", "")).upper() == "CLOSE" and not kwargs.get("positionId"):
+            raise ValueError("place_order: positionId is required when tradeSide is CLOSE")
         return await self.request("POST", "/api/v1/futures/trade/place_order", body=kwargs)
 
     async def batch_order(self, symbol: str, order_list: list[dict]) -> Any:
@@ -458,9 +536,14 @@ class BitunixClient:
     async def modify_order(self, **kwargs) -> Any:
         """Modify a pending order.
 
-        Official required: qty, price. Optional: orderId or clientId (one of
-        them identifies the order), plus the tp*/sl* family.
+        Official: `qty` required; `price` required only for LIMIT orders;
+        `orderId` or `clientId` identifies the order. `symbol` is NOT a
+        documented parameter for this endpoint and is rejected if sent.
         """
+        if "symbol" in kwargs:
+            raise ValueError(
+                "modify_order does not take `symbol` (not a documented parameter); "
+                "identify the order with orderId or clientId")
         missing = [k for k in self.MODIFY_ORDER_REQUIRED if not kwargs.get(k)]
         if missing:
             raise ValueError(
@@ -471,22 +554,39 @@ class BitunixClient:
         return await self.request("POST", "/api/v1/futures/trade/modify_order", body=kwargs)
 
     async def get_pending_orders(self, symbol: str | None = None, skip: int = 0,
-                                 limit: int = 20) -> Any:
+                                 limit: int = 10, order_id: str | None = None,
+                                 client_id: str | None = None,
+                                 status: str | None = None) -> Any:
         """Pending orders.
 
-        Official paging params are `skip`/`limit` (max 100), NOT
-        `page`/`pageSize` - the live server ignores the latter and returns the
-        default page.
+        Official paging params are `skip`/`limit` (default 10, max 100), NOT
+        `page`/`pageSize`. `orderId`, `clientId` and `status` (NEW|PART_FILLED)
+        are documented optional filters.
         """
         return await self.request("GET", "/api/v1/futures/trade/get_pending_orders",
-                                  params={"symbol": symbol, "skip": skip, "limit": limit})
+                                  params={"symbol": symbol, "orderId": order_id,
+                                          "clientId": client_id, "status": status,
+                                          "skip": skip, "limit": max(1, min(100, int(limit)))})
 
     async def get_history_orders(self, symbol: str | None = None, skip: int = 0,
-                                 limit: int = 20, start_time: int | None = None,
-                                 end_time: int | None = None) -> Any:
-        """Order history. Official paging params are `skip`/`limit`."""
+                                 limit: int = 10, start_time: int | None = None,
+                                 end_time: int | None = None,
+                                 order_id: str | None = None,
+                                 client_id: str | None = None,
+                                 status: str | None = None,
+                                 order_type: str | None = None,
+                                 query_canceled: bool | None = None) -> Any:
+        """Order history.
+
+        Official: paging `skip`/`limit` (default 10, max 100); optional filters
+        `orderId`, `clientId`, `status`, `type`, `queryCanceled`.
+        """
         return await self.request("GET", "/api/v1/futures/trade/get_history_orders",
-                                  params={"symbol": symbol, "skip": skip, "limit": limit,
+                                  params={"symbol": symbol, "orderId": order_id,
+                                          "clientId": client_id, "status": status,
+                                          "type": order_type,
+                                          "queryCanceled": query_canceled,
+                                          "skip": skip, "limit": max(1, min(100, int(limit))),
                                           "startTime": start_time, "endTime": end_time})
 
     async def get_order_detail(self, order_id: str | None = None,
@@ -495,11 +595,19 @@ class BitunixClient:
                                   params={"orderId": order_id, "clientId": client_id})
 
     async def get_history_trades(self, symbol: str | None = None, skip: int = 0,
-                                 limit: int = 20, start_time: int | None = None,
-                                 end_time: int | None = None) -> Any:
-        """Trade history. Official paging params are `skip`/`limit`."""
+                                 limit: int = 10, start_time: int | None = None,
+                                 end_time: int | None = None,
+                                 order_id: str | None = None,
+                                 position_id: str | None = None) -> Any:
+        """Trade history.
+
+        Official: paging `skip`/`limit` (default 10, max 100); optional filters
+        `orderId` and `positionId`.
+        """
         return await self.request("GET", "/api/v1/futures/trade/get_history_trades",
-                                  params={"symbol": symbol, "skip": skip, "limit": limit,
+                                  params={"symbol": symbol, "orderId": order_id,
+                                          "positionId": position_id,
+                                          "skip": skip, "limit": max(1, min(100, int(limit))),
                                           "startTime": start_time, "endTime": end_time})
 
     async def close_all_position(self, symbol: str | None = None) -> Any:
@@ -567,15 +675,27 @@ class BitunixClient:
     async def place_position_tp_sl_order(self, symbol: str, position_id: str,
                                          tp_price: str | None = None,
                                          sl_price: str | None = None,
-                                         tp_stop_type: str = "MARK_PRICE",
-                                         sl_stop_type: str = "MARK_PRICE") -> Any:
-        """Position TP/SL - closes the ENTIRE position. One per position."""
-        body: dict[str, Any] = {"symbol": symbol, "positionId": position_id,
-                                "tpStopType": tp_stop_type, "slStopType": sl_stop_type}
+                                         tp_stop_type: str | None = None,
+                                         sl_stop_type: str | None = None) -> Any:
+        """Position TP/SL - closes the ENTIRE position. One per position.
+
+        Official: `symbol` + `positionId` required; at least one of
+        tpPrice/slPrice required. `tpStopType`/`slStopType` are OPTIONAL
+        (LAST_PRICE | MARK_PRICE, default market price) - the old signature
+        hard-coded MARK_PRICE, silently overriding the documented default.
+        """
+        if not tp_price and not sl_price:
+            raise ValueError(
+                "place_position_tp_sl_order needs at least one of tpPrice/slPrice")
+        body: dict[str, Any] = {"symbol": symbol, "positionId": str(position_id)}
         if tp_price:
             body["tpPrice"] = str(tp_price)
         if sl_price:
             body["slPrice"] = str(sl_price)
+        if tp_stop_type:
+            body["tpStopType"] = str(tp_stop_type).upper()
+        if sl_stop_type:
+            body["slStopType"] = str(sl_stop_type).upper()
         return await self.request("POST", "/api/v1/futures/tpsl/position/place_order", body=body)
 
     async def modify_tp_sl_order(self, order_id: str,
@@ -589,7 +709,12 @@ class BitunixClient:
                                  sl_order_price: str | None = None,
                                  tp_qty: str | None = None,
                                  sl_qty: str | None = None) -> Any:
-        """Modify a standalone TP/SL order. Official: `orderId` required."""
+        """Modify a standalone TP/SL order.
+
+        Official: `orderId` required; at least one of tpPrice/slPrice required.
+        """
+        if not tp_price and not sl_price:
+            raise ValueError("modify_tp_sl_order needs at least one of tpPrice/slPrice")
         body: dict[str, Any] = {"orderId": str(order_id)}
         if tp_price is not None and tp_price != "":
             body["tpPrice"] = str(tp_price)
@@ -618,6 +743,14 @@ class BitunixClient:
                                           sl_price: str | None = None,
                                           tp_stop_type: str | None = None,
                                           sl_stop_type: str | None = None) -> Any:
+        """Modify a position's TP/SL (used for breakeven + trailing).
+
+        Official: `symbol` + `positionId` required; at least one of
+        tpPrice/slPrice required. `tpStopType`/`slStopType` optional.
+        """
+        if not tp_price and not sl_price:
+            raise ValueError(
+                "modify_position_tp_sl_order needs at least one of tpPrice/slPrice")
         body: dict[str, Any] = {"symbol": symbol, "positionId": position_id}
         if tp_price:
             body["tpPrice"] = str(tp_price)
@@ -649,12 +782,12 @@ class BitunixClient:
         """Pending TP/SL orders.
 
         Official path is get_pending_orders (PLURAL) and the paging params are
-        `skip`/`limit` (max 100), not `page`/`pageSize`.
+        `skip`/`limit` (default 10, max 100), not `page`/`pageSize`.
         """
         return await self.request("GET", "/api/v1/futures/tpsl/get_pending_orders",
                                   params={"symbol": symbol, "positionId": position_id,
                                           "side": side, "positionMode": position_mode,
-                                          "skip": skip, "limit": limit})
+                                          "skip": skip, "limit": max(1, min(100, int(limit)))})
 
     async def get_history_tp_sl_order(self, symbol: str | None = None,
                                       side: int | None = None,
@@ -665,17 +798,18 @@ class BitunixClient:
         """TP/SL history.
 
         Official path is get_history_orders (PLURAL) and the paging params are
-        `skip`/`limit` (max 100), not `page`/`pageSize`.
+        `skip`/`limit` (default 10, max 100), not `page`/`pageSize`.
         """
         return await self.request("GET", "/api/v1/futures/tpsl/get_history_orders",
                                   params={"symbol": symbol, "side": side,
                                           "positionMode": position_mode,
                                           "startTime": start_time, "endTime": end_time,
-                                          "skip": skip, "limit": limit})
+                                          "skip": skip, "limit": max(1, min(100, int(limit)))})
 
     # ============================================================ misc
-    async def change_log(self) -> Any:
-        return await self.request("GET", "/api/v1/futures/market/change_log", signed=False)
+    # NOTE: `change_log` was removed. The Bitunix "Change Log" page is
+    # DOCUMENTATION, not an API endpoint - it has no path in the official docs
+    # and `/api/v1/futures/market/change_log` returns 404 live.
 
     async def ping(self) -> bool:
         try:

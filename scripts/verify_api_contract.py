@@ -76,7 +76,7 @@ async def main() -> int:
 
         # funding rate batch - the symbols filter is ignored server-side
         try:
-            d = await client.get_funding_rate_batch("BTCUSDT,ETHUSDT")
+            d = await client.get_funding_rate_batch()
             rows = d if isinstance(d, list) else []
             print(f"funding_rate_batch        -> {len(rows)} rows returned "
                   f"(the symbols filter is IGNORED by the server)")
@@ -118,7 +118,7 @@ async def main() -> int:
 
         # depth
         try:
-            d = await client.get_depth("BTCUSDT", limit=5)
+            d = await client.get_depth("BTCUSDT", limit="5")
             print(f"depth BTCUSDT             -> bids={len((d or {}).get('bids', []))} "
                   f"asks={len((d or {}).get('asks', []))}")
         except Exception as e:  # noqa: BLE001

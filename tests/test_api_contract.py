@@ -233,14 +233,19 @@ def test_paging_uses_skip_and_limit_not_page():
 
 
 def test_place_order_declares_the_official_required_set():
+    """`tradeSide` is only required in HEDGE mode, so it is NOT in the
+    always-required set (the docs say "Only required in hedge-mode")."""
     from jrock.trader.client import BitunixClient
     assert set(BitunixClient.PLACE_ORDER_REQUIRED) == {
-        "symbol", "qty", "side", "tradeSide", "orderType"}
+        "symbol", "qty", "side", "orderType"}
+    assert set(BitunixClient.PLACE_ORDER_HEDGE_REQUIRED) == {"tradeSide"}
 
 
 def test_modify_order_declares_the_official_required_set():
+    """`price` is only required for LIMIT orders, so only `qty` is always
+    required; `symbol` is not a documented parameter at all."""
     from jrock.trader.client import BitunixClient
-    assert set(BitunixClient.MODIFY_ORDER_REQUIRED) == {"qty", "price"}
+    assert set(BitunixClient.MODIFY_ORDER_REQUIRED) == {"qty"}
 
 
 # ------------------------------------------------- reachability from commands

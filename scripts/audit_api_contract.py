@@ -43,6 +43,16 @@ OUT_OF_SCOPE = {
 # optional and unused. Recorded so the report is honest about the gap.
 KNOWN_OMISSIONS: dict[str, set[str]] = {}
 
+# Params the docs table marks `required` but whose own description makes them
+# CONDITIONAL. The engine enforces the condition at call time (see client.py),
+# so they must not be reported as "missing required" by a static check.
+CONDITIONAL_REQUIRED: dict[str, set[str]] = {
+    # "Only required in hedge-mode"
+    "/api/v1/futures/trade/place_order": {"tradeSide"},
+    # "Required if the order type is LIMIT"
+    "/api/v1/futures/trade/modify_order": {"price"},
+}
+
 
 def load_contract() -> dict:
     with open(CONTRACT, encoding="utf-8") as fh:
@@ -212,6 +222,11 @@ def audit() -> dict:
                        if p["required"] and not p["name"].startswith(">")}
         doc_opt_top = {p["name"] for p in e["request_params"]
                        if not p["required"] and not p["name"].startswith(">")}
+        # Conditionally-required params are enforced at call time, not by the
+        # static required-set check.
+        conditional = CONDITIONAL_REQUIRED.get(path, set())
+        doc_req_top = doc_req_top - conditional
+        doc_opt_top = doc_opt_top | conditional
 
         impl = by_path.get(path)
         if not impl:
