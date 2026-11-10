@@ -1,7 +1,9 @@
 """Configuration loading for J+Rock."""
 from __future__ import annotations
 
+import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +16,75 @@ except Exception:  # pragma: no cover
         return False
 
 ROOT = Path(__file__).resolve().parent.parent
+
+#: One message per `.env` line python-dotenv refused to parse, from the last
+#: `_load_env`. `scripts/check_env.py` reads the file itself; this is kept so a
+#: diagnostic (or a test) can see what the loader saw without loading twice.
+ENV_PARSE_WARNINGS: list[str] = []
+
+
+class _WarningCollector(logging.Handler):
+    """Hold python-dotenv's parse warnings instead of printing them.
+
+    It emits ONE warning per unparseable line, so a `.env` carrying a pasted
+    block (JSON, YAML, a multi-line value) prints dozens of identical lines at
+    every start-up and buries the real output. Collecting them lets us print a
+    single actionable message naming the line numbers.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D102 - Handler API
+        self.messages.append(record.getMessage())
+
+
+def _line_list(numbers: list[int], limit: int = 6) -> str:
+    """'267, 276, 280, ... (+18 more)' - enough to find the block."""
+    uniq = sorted(set(numbers))
+    shown = ", ".join(str(n) for n in uniq[:limit])
+    if len(uniq) > limit:
+        shown += f", ... (+{len(uniq) - limit} more)"
+    return shown
+
+
+def _load_env(env_path: Path) -> None:
+    """Load `.env`, reporting parse failures as ONE line instead of a wall.
+
+    python-dotenv keeps the lines it understands and drops the rest, so a bad
+    line is not just noise: the setting it carried is silently missing. The
+    message therefore says how many lines were dropped and where they start.
+    """
+    ENV_PARSE_WARNINGS.clear()
+    logger = logging.getLogger("dotenv.main")
+    collector = _WarningCollector()
+    level, propagate = logger.level, logger.propagate
+    logger.addHandler(collector)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+    try:
+        load_dotenv(env_path, override=False)
+    finally:
+        logger.removeHandler(collector)
+        logger.setLevel(level)
+        logger.propagate = propagate
+
+    bad = [m for m in collector.messages if "could not parse" in m]
+    if not bad:
+        return
+    ENV_PARSE_WARNINGS.extend(bad)
+    numbers = []
+    for m in bad:
+        hit = re.search(r"line (\d+)", m)
+        if hit:
+            numbers.append(int(hit.group(1)))
+    where = f" at line{'s' if len(numbers) != 1 else ''} {_line_list(numbers)}" if numbers else ""
+    logging.getLogger("jrock.config").warning(
+        "%s: %d line%s could not be parsed%s and were ignored. A value that "
+        "spans lines must be quoted (KEY=\"line1\\nline2\"); a pasted block must "
+        "be removed. Run `python scripts/check_env.py` to list them.",
+        env_path.name, len(bad), "" if len(bad) == 1 else "s", where)
 
 
 def _b(name: str, default: bool = False) -> bool:
@@ -203,7 +274,7 @@ class Settings:
 def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
     env_path = Path(env_file) if env_file else ROOT / ".env"
     if env_path.exists():
-        load_dotenv(env_path, override=False)
+        _load_env(env_path)
     else:
         load_dotenv(override=False)
 
