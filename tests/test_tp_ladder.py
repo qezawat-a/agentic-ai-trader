@@ -285,6 +285,10 @@ def test_disabled_ladder_decides_nothing():
 
 
 class FakeClient:
+    #: serial shared across instances so order ids stay unique when a test
+    #: replaces the client mid-flow (the engine re-parks TP orders by id)
+    _tp_serial = 0
+
     def __init__(self, positions, price, mark):
         self._positions, self._price, self._mark = positions, price, mark
         self.calls: list[tuple[str, dict]] = []
@@ -298,7 +302,26 @@ class FakeClient:
 
     async def place_order(self, **kw):
         self.calls.append(("place_order", kw))
+        # A reduce-only fill shrinks the live position; the engine re-reads
+        # the exchange qty on its next pass and must not see a stale size.
+        if kw.get("reduceOnly"):
+            for p in self._positions:
+                if p.get("symbol") == kw.get("symbol"):
+                    live = max(0.0, float(p.get("qty") or 0)
+                               - float(kw.get("qty") or 0))
+                    p["qty"] = str(live)
         return {"orderId": "O%d" % len(self.calls)}
+
+    async def place_tp_sl_order(self, symbol, position_id, **kw):
+        self.calls.append(("place_tp_sl_order",
+                           {"args": (symbol, position_id), **kw}))
+        FakeClient._tp_serial += 1
+        return {"orderId": "T%d" % FakeClient._tp_serial}
+
+    async def cancel_tp_sl_order(self, symbol, order_id):
+        self.calls.append(("cancel_tp_sl_order", {"symbol": symbol,
+                                                  "orderId": order_id}))
+        return {"ok": True}
 
     async def modify_position_tp_sl_order(self, *a, **kw):
         self.calls.append(("modify_position_tp_sl_order", {"args": a, **kw}))
@@ -558,3 +581,111 @@ def test_ladder_in_help_text():
     from jrock.agent import HELP
     assert "/ladder" in HELP
     assert "ladder set" in HELP
+
+
+# ------------------------------------------------- exchange TP TP backstop
+
+
+def test_backstop_replaced_after_each_rung_with_the_live_remainder(tmp_path):
+    """Run through all three rungs; the resting TP must track each step.
+
+    At the third rung the final target IS the mark, so no further backstop is
+    parked - the runner is handed to the trailing stop and the SL covers it.
+    """
+    eng = _engine(tmp_path, "1R:25,2R:25,3R:25")
+    _pos(eng)
+    st = eng.positions["P1"]
+    st.backstop_tp_order_id = "T0"
+    all_calls: list = []
+    places_seen: list[str] = []
+    for px in (0.0052, 0.0054, 0.0056):
+        _client(eng, px, qty=st.qty)
+        asyncio.run(eng.manage_positions())
+        all_calls.extend(eng.client.calls)
+        if px < 0.0056:
+            places = [c for c in eng.client.calls if c[0] == "place_tp_sl_order"]
+            assert len(places) == 1, f"one re-parked backstop at {px}"
+            places_seen.append(st.backstop_tp_order_id)
+    # each step re-placed a NEW order id: cancel-first, never both resting
+    assert len(set(places_seen)) == 2
+    cancels = [c for c in all_calls if c[0] == "cancel_tp_sl_order"]
+    assert [c[1]["orderId"] for c in cancels] == ["T0"] + places_seen
+    # the re-parked backstops covered the shrinking remainder...
+    places = [c for c in all_calls if c[0] == "place_tp_sl_order"]
+    assert [c[1]["tp_qty"] for c in places] == ["750", "500"]
+    # ...and at the final rung nothing rests anymore (trail owns the runner)
+    assert st.backstop_tp_order_id == ""
+    assert st.fired_levels == 3
+    assert st.qty == 250.0
+
+
+def test_backstop_id_persists_across_a_restart(tmp_path):
+    """A restart must not place a SECOND TP for the same remainder."""
+    eng = _engine(tmp_path, "1R:25,2R:25,3R:25")
+    _pos(eng, fired=1)                 # rung 1 already closed before the restart
+    eng.positions["P1"].backstop_tp_order_id = "T9"
+    eng.persist_positions()
+
+    eng2 = _engine(tmp_path, "1R:25,2R:25,3R:25")
+    eng2._restore_from_store()
+    st2 = eng2.positions["P1"]
+    assert st2.backstop_tp_order_id == "T9"
+    _client(eng2, 0.0052, qty=st2.qty)
+    # next level is 2R (0.0054) so nothing fires - the resting backstop must
+    # be left alone, not duplicated by a fresh place
+    asyncio.run(eng2.manage_positions())
+    places = [c for c in eng2.client.calls if c[0] == "place_tp_sl_order"]
+    assert places == []
+
+
+def test_manage_loop_trusts_the_exchange_qty(tmp_path):
+    """The exchange is the source of truth for SIZE.
+
+    If something outside the ladder shrank the position between passes (the
+    stop filling, the exchange backstop triggering, a manual close), managing
+    a stale qty would send a rung close bigger than the position and skip
+    dust handling. The engine reconciles size, never the fired-level history.
+    """
+    eng = _engine(tmp_path, "1R:25,2R:25,3R:25")
+    _pos(eng)
+    _client(eng, 0.0052, qty=500)     # exchange says 500, engine says 1000
+    actions = asyncio.run(eng.manage_positions())
+    st = eng.positions["P1"]
+    assert st.original_qty == 1000.0   # close_pct still measured vs THIS
+    ladder = [a for a in actions if a["action"] == "ladder_level"]
+    assert len(ladder) == 1
+    assert ladder[0]["qty"] == 250.0   # 25% OF THE ORIGINAL size
+    assert st.qty == 250.0             # 500 reconciled - 250 closed
+    # and the re-parked backstop quotes the reconciled remainder
+    places = [c for c in eng.client.calls if c[0] == "place_tp_sl_order"]
+    assert [c[1]["tp_qty"] for c in places] == ["250"]
+    assert not eng.state.errors
+
+
+def test_ladder_tp_command_toggles_and_persists(tmp_path):
+    eng = _engine(tmp_path, "1R:25,2R:25,3R:25")
+    assert eng.state.tp_ladder_tp_backstop is True
+
+    out = asyncio.run(eng.command("ladder tp off"))
+    assert "OFF" in out
+    assert eng.state.tp_ladder_tp_backstop is False
+
+    out = asyncio.run(eng.command("ladder tp on"))
+    assert "ON" in out
+    assert eng.state.tp_ladder_tp_backstop is True
+
+    out = asyncio.run(eng.command("ladder tp"))
+    assert "ON" in out
+    assert "Usage" in out
+
+    # and the toggle line shows in the report
+    out = asyncio.run(eng.command("ladder"))
+    assert "tp_backstop=ON" in out
+
+
+def test_ladder_report_shows_a_resting_backstop(tmp_path):
+    eng = _engine(tmp_path, "1R:25,2R:25,3R:25")
+    _pos(eng)
+    eng.positions["P1"].backstop_tp_order_id = "T9"
+    out = asyncio.run(eng.command("ladder"))
+    assert "backstop TP resting (order T9)" in out

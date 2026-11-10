@@ -937,6 +937,25 @@ TP_LADDER=1R:25,2R:25,3R:25
 | 3 | 3R | 25% of the **original** | 25% |
 | runner | — | — | 25%, trails |
 
+### The exchange TP backstop
+
+The rungs are closed by the bot, so without one extra piece the remainder had
+only the stop as an exchange-side exit. The backstop fixes that (default ON,
+`TP_LADDER_TP_BACKSTOP=0` or `ladder tp off` to switch off) and is the answer
+to "why did the entry only show an SL": it is a **standalone take-profit**
+(`/api/v1/futures/tpsl/place_order` with `tpQty` — the position TP/SL endpoint
+has no quantity field and would flatten the whole remainder at rung 1).
+
+- At entry it parks a TP for the full position at the **final rung target**.
+- After every fired rung it cancels the old one and re-parks the TP for the
+  *remaining* qty — so at any moment exactly ONE exchange TP covers whatever
+  is still open, even if the engine dies.
+- At the final rung it stops resting (the target is reached; the runner hands
+  to the trailing stop, the stop stays the exchange-side cover).
+
+Check the state anytime with `ladder` — it prints `tp_backstop=ON` and, when
+one is resting, its order id.
+
 ### The rule that is easy to get wrong
 
 `close_pct` is a share of the **ORIGINAL** position size, never of the remaining
@@ -953,6 +972,7 @@ leave 421.9 — a different trade. The arithmetic lives in one function
 | `TP_LADDER_BREAKEVEN_AFTER` | `1` | which level moves the stop to breakeven; `0` disables |
 | `TP_LADDER_RUNNER` | `trail` | `trail` hands the remainder to the trailing stop, `close` closes it |
 | `TP_LADDER_TRIGGER_BASIS` | `R` | `R` (initial risk), `ROI` (percent), `PRICE` (absolute) |
+| `TP_LADDER_TP_BACKSTOP` | `on` | exchange-side TP for the remainder at the final rung target; `0` = off |
 
 ### Rules enforced in code, not just documented
 

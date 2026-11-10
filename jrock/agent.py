@@ -81,7 +81,8 @@ AGENT COMMANDS
   /tpsl                     the 4 TP/SL methods: show/set, pending, history, cancel
   /ladder                   TP ladder: show levels, fired levels, remaining qty
                             (ladder set 1R:25,2R:25,3R:25 | ladder off |
-                             ladder breakeven 2 | ladder runner trail|close)
+                             ladder breakeven 2 | ladder runner trail|close |
+                             ladder tp on|off)
   /batch                    batch-order status (orderList max 5, symbol required)
   /leverage                 leverage and margin mode per symbol
   /margin                   margin mode (ISOLATION|CROSS) per symbol
@@ -122,7 +123,8 @@ TRADER ENGINE COMMANDS
   account tp pct 5                  account sl pct 3
   ladder set 1R:25,2R:25,3R:25      ladder off
   ladder breakeven 2                ladder runner trail|close
-  ladder basis R|ROI|PRICE          ladder
+  ladder basis R|ROI|PRICE          ladder tp on|off
+  ladder
   margin add BTCUSDT 100            margin reduce BTCUSDT 50
 
 ENV SETTINGS (in .env, read at startup)

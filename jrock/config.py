@@ -263,6 +263,12 @@ class Settings:
     #: How a level's trigger is read: R (multiple of the initial risk), ROI
     #: (percent) or PRICE (absolute).
     tp_ladder_trigger_basis: str = "R"
+    #: Exchange TP backstop. After every fired rung (and right at entry) a
+    #: standalone exchange TP (tpsl/place_order with tpQty) covers the
+    #: remaining qty at the FINAL rung target - if the engine dies, the
+    #: remainder still exits at a take-profit. TP_LADDER_TP_BACKSTOP=0 turns
+    #: it off.
+    tp_ladder_tp_backstop: bool = True
 
     @property
     def data_dir(self) -> Path:
@@ -328,6 +334,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         tp_ladder_breakeven_after=_i("TP_LADDER_BREAKEVEN_AFTER", 1),
         tp_ladder_runner=_tp_ladder_runner(),
         tp_ladder_trigger_basis=_tp_ladder_basis(),
+        tp_ladder_tp_backstop=_b("TP_LADDER_TP_BACKSTOP", True),
     )
 
 

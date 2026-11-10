@@ -173,6 +173,14 @@ class PositionState:
     #: moves to breakeven, |entry - sl| collapses to ~0 and every remaining R
     #: level would land on the entry price and fire immediately.
     initial_risk: float = 0.0
+    #: Exchange TP backstop: the `orderId` of the standalone take-profit
+    #: (POST /tpsl/place_order with tpQty) parked at the FINAL rung target for
+    #: whatever quantity remains open. The ladder's slices are closed by this
+    #: engine, so if the engine dies mid-way the remainder had only the stop
+    #: left - this backstop gives it an exchange-enforced exit too. Each fired
+    #: rung cancels and re-places it so tpQty always matches the live qty.
+    #: Empty string = no backstop resting order.
+    backstop_tp_order_id: str = ""
 
 
 def should_breakeven(state: PositionState, roi: float, breakeven_pct: float) -> bool:
