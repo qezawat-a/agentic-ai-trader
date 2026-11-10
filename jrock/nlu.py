@@ -278,6 +278,10 @@ def _b_margin_amount_read(t: str) -> Intent:
 
 
 def _b_autotrade_on(t: str) -> Intent:
+    # Destructive on the SENTENCE path: a sentence must never enable live
+    # trading without the user's explicit yes (tests/test_nlu.py pins that).
+    # The TYPED command ("autotrade on") never reaches this function - the
+    # engine's command layer runs it directly, with no prompt.
     return Intent("autotrade_on", "start trading", 0.95, destructive=True,
                   describe="turn autotrade ON - signals will be executed with real money")
 
@@ -288,6 +292,7 @@ def _b_autotrade_off(t: str) -> Intent:
 
 
 def _b_engine_on(t: str) -> Intent:
+    # Destructive on the sentence path - see _b_autotrade_on.
     return Intent("engine_on", "engine on", 0.9, destructive=True,
                   describe="start the engine loop (scanner + trader)")
 
@@ -796,6 +801,77 @@ RULES: list[tuple[str, re.Pattern, object]] = [
 # --------------------------------------------------------------------------
 
 
+#: Last-resort patterns: the phrasing is unusual, but the trading action is
+#: unmistakable. They run ONLY when no strict rule matched.
+#:
+#: A request that reaches the MODEL is a request the engine cannot execute,
+#: and the model cannot confirm it either - it asks, the user says yes, it
+#: asks again. Catching the action here keeps the whole money path in the
+#: deterministic layer, where one prompt and one "yes" finish the job.
+LOOSE_RULES: list[tuple[re.Pattern, Any]] = [
+    # close a position / everything
+    (re.compile(r"(ببند|ببندم|بستن|بسته|خروج|کلوز|بیرون\s*بیا)"
+               r".*(پوزیشن|پوزشن|معامله|position|trade)", re.I), _b_close_position),
+    (re.compile(r"(پوزیشن|پوزشن|معامله|position|trade)"
+               r".*(ببند|ببندم|بستن|خروج|کلوز)", re.I), _b_close_position),
+    (re.compile(r"\b(close|exit|flatten|get\s+out\s+of)\b"
+               r".*\b(position|trade|long|short|INITUSDT|[A-Z]{2,10}USDT)\b", re.I),
+     _b_close_position),
+    (re.compile(r"\b(close|exit|flatten)\b.*\b(all|every|everything)\b", re.I),
+     _b_close_all),
+    # set the leverage
+    (re.compile(r"(بذار|بگذار|بگذار|تنظیم|ست|کن|بکن|برسان|ببر)"
+               r".*(اهرم|لوریج|leverage)", re.I), _b_leverage_set),
+    (re.compile(r"(اهرم|لوریج|leverage).*(بذار|بگذار|تنظیم|ست|کن|بکن|برسان)", re.I),
+     _b_leverage_set),
+    (re.compile(r"\b(set|change|switch|move|put|use)\b.*\bleverage\b", re.I),
+     _b_leverage_set),
+    # set the risk
+    (re.compile(r"(بذار|بگذار|تنظیم|ست|کن|بکن|برسان|ببر|بالا|پایین)"
+               r".*(ریسک|risk)", re.I), _b_risk_set),
+    (re.compile(r"\b(set|change|raise|lower|increase|decrease|put)\b.*\brisk\b", re.I),
+     _b_risk_set),
+    # the engine / autotrade
+    (re.compile(r"\b(turn\s+on|switch\s+on|enable|start|resume)\b"
+               r".*\bautotrade\b", re.I), _b_autotrade_on),
+    (re.compile(r"\b(turn\s+off|switch\s+off|disable|stop|pause)\b"
+               r".*\bautotrade\b", re.I), _b_autotrade_off),
+    (re.compile(r"\b(turn\s+on|switch\s+on|enable|start)\b"
+               r".*\b(the\s+)?engine\b", re.I), _b_engine_on),
+    (re.compile(r"\b(turn\s+off|switch\s+off|disable|stop|kill)\b"
+               r".*\b(the\s+)?engine\b", re.I), _b_engine_off),
+    (re.compile(r"(روشن|رو\s*نگه\s*دار|فعال|استارت|شروع)\s*(کن)?\s*"
+               r"(ربات|موتور|انجین|engine)", re.I), _b_engine_on),
+    (re.compile(r"(خاموش|متوقف|قطع|استاپ|بزن\s*خاموش)\s*(کن)?\s*"
+               r"(ربات|موتور|انجین|engine)", re.I), _b_engine_off),
+    (re.compile(r"(روشن|فعال|شروع|استارت)\s*(کن)?\s*"
+               r"(اتوترید|معامله|ترید|autotrade)", re.I), _b_autotrade_on),
+    (re.compile(r"(خاموش|متوقف|قطع|بزن\s*متوقف)\s*(کن)?\s*"
+               r"(اتوترید|معامله|ترید|autotrade)", re.I), _b_autotrade_off),
+]
+
+
+def _loose_intent(text: str) -> Intent | None:
+    """Resolve an unusual phrasing of a trading action.
+
+    Returns None when the sentence is not a trading action - then the caller
+    falls through to the model exactly as before.
+    """
+    raw = (text or "").strip()
+    for rx, builder in LOOSE_RULES:
+        if not rx.search(raw):
+            continue
+        if builder is None:
+            continue
+        try:
+            intent = builder(raw)
+        except Exception:  # noqa: BLE001 - a bad rule must not break routing
+            continue
+        if intent is not None:
+            return intent
+    return None
+
+
 def parse(text: str) -> Intent | Clarification | None:
     """Resolve a sentence to an Intent, a Clarification, or None.
 
@@ -819,6 +895,15 @@ def parse(text: str) -> Intent | Clarification | None:
             except Exception:  # noqa: BLE001 - a bad rule must not break routing
                 continue
     if not matches:
+        # Last-resort tier: the sentence did not match any strict rule, but it
+        # clearly names a trading action. Without this the sentence reached
+        # the MODEL - which cannot trade and cannot confirm - so the model
+        # asked for a "yes" in prose, the user said yes, and the model asked
+        # again. The command layer owns confirmation; a trading request must
+        # never get past it.
+        loose = _loose_intent(raw)
+        if loose is not None:
+            return loose
         return None
 
     # Highest confidence wins; ties are ambiguous and must ask.
@@ -868,19 +953,94 @@ def _options_for(intent: Intent) -> list[str]:
 #: Words that confirm a pending destructive action.
 CONFIRM_WORDS = frozenset({"yes", "y", "yeah", "yep", "ok", "okay", "confirm",
                            "confirmed", "do it", "go ahead", "proceed", "sure",
-                           "yes please", "yep do it", "affirmative"})
+                           "yes please", "yep do it", "affirmative",
+                           # Persian
+                           "بله", "آره", "اره", "حتما", "حتماً", "باشه",
+                           "اوکی", "اوکیه", "تایید", "تأیید", "موافقم",
+                           "انجام بده", "انجامش بده", "بزن", "بزنید",
+                           "بریم", "هوم", "yes!", "ok!"})
 
 #: Words that cancel a pending destructive action.
 CANCEL_WORDS = frozenset({"no", "n", "nope", "cancel", "stop", "abort", "never mind",
-                          "nevermind", "forget it", "dont", "don't", "negative"})
+                          "nevermind", "forget it", "dont", "don't", "negative",
+                          # Persian
+                          "نه", "نخیر", "نخیر", "بیخیال", "بی خیال", "لغو",
+                          "کنسل", "متوقف", "بس کن", "دست نگه دار", "نگه دار",
+                          "کنسل کن", "بیخیال"})
+
+#: Filler that can sit in front of the real answer ("ok yes", "please do it").
+#: Stripped only when what follows is a confirmation/cancellation on its own.
+_LEAD_FILLER = frozenset({
+    "ok", "okay", "well", "hey", "so", "now", "then", "just", "please", "pls",
+    "yeah", "and", "but", "hmm", "oh", "right", "fine", "good",
+    "خوب", "خب", "لطفا", "لطفاً", "ممنون", "ممنونم", "پس", "حالا", "ای", "اوکی",
+})
+
+#: Punctuation and formatting that carry no meaning for a yes/no answer.
+#: Spaces are KEPT - "yes please" is two words, not one.
+_ANSWER_NOISE = str.maketrans("", "", "!.,؟?!،؛;:\u200c\u200f\t")
+
+
+def _answer_words(text: str) -> list[str]:
+    """The answer's words: lowercase, punctuation-free, ZWNJ-free."""
+    cleaned = (text or "").strip().lower().translate(_ANSWER_NOISE)
+    return [w for w in cleaned.split() if w]
+
+
+def _matches(words: list[str], vocabulary: frozenset[str]) -> bool:
+    """True when `words` is an answer of `vocabulary`.
+
+    Three shapes are accepted, because people do not answer with a token:
+
+    * the whole message is one of the exact phrases ("yes please");
+    * the FIRST word is one of the answers ("yes do it", "yes, do it now",
+      "بله انجام بده");
+    * filler sits in front of one of those ("ok yes", "please do it").
+
+    The old matcher required the whole message to be exactly one phrase, so
+    "yes do it" was not a confirmation - the agent answered "still waiting"
+    and the user said yes again, forever.
+    """
+    if not words:
+        return False
+    if " ".join(words) in vocabulary:
+        return True
+    if words[0] in vocabulary:
+        return True
+    # strip leading filler and try again
+    i = 0
+    while i < len(words) and words[i] in _LEAD_FILLER:
+        i += 1
+    if i and i < len(words):
+        rest = words[i:]
+        return " ".join(rest) in vocabulary or rest[0] in vocabulary
+    return False
 
 
 def is_confirm(text: str) -> bool:
-    return (text or "").strip().lower().rstrip("!.") in CONFIRM_WORDS
+    """True when the message means YES.
+
+    A cancel word in the first two words wins over a confirm word: "ok, no
+    thanks" is a refusal, not a confirmation.
+    """
+    words = _answer_words(text)
+    if not words:
+        return False
+    if len(words) > 1 and words[1] in CANCEL_WORDS:
+        return False
+    return _matches(words, CONFIRM_WORDS)
 
 
 def is_cancel(text: str) -> bool:
-    return (text or "").strip().lower().rstrip("!.") in CANCEL_WORDS
+    """True when the message means NO."""
+    words = _answer_words(text)
+    if not words:
+        return False
+    if words[0] in CANCEL_WORDS:
+        return True
+    if len(words) > 1 and words[1] in CANCEL_WORDS and words[0] in CONFIRM_WORDS:
+        return True
+    return _matches(words, CANCEL_WORDS)
 
 
 def confirmation_prompt(intent: Intent) -> str:

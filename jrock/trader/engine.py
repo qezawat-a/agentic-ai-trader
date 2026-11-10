@@ -82,6 +82,11 @@ class EngineState:
     margin_mode: str = "ISOLATION"
     position_mode: str = "ONE_WAY"
     max_open_positions: int = 3
+    #: Seconds the engine waits before re-entering a symbol it just closed.
+    #: Without it, a signal that keeps firing re-opens the position the
+    #: moment it closes: two market fills a minute apart, each paying the
+    #: taker fee twice, for a trade that never had time to work.
+    reentry_cooldown_sec: int = 60
     risk_pct: float = 1.0
     #: Share of the spendable balance one position may lock as margin (%).
     #: 0 disables the budget and sizes purely by risk_pct.
@@ -97,6 +102,10 @@ class EngineState:
     last_report_ts: float = 0.0
     scans: int = 0
     errors: list[str] = field(default_factory=list)
+    #: Sizing decisions that are NOT failures (leverage clamped, margin budget
+    #: clamped). Kept apart from `errors` so a report can show a normal
+    #: decision without hiding a real failure behind it.
+    notes: list[str] = field(default_factory=list)
     # --- the four documented TP/SL methods (see account_tpsl.py / tpsl.py)
     # POSITION and PARTIAL are the native exit shapes at entry; TRAILING
     # (breakeven + ratchet) and ACCOUNT (thresholds below) are always armed in
@@ -152,6 +161,8 @@ class TraderEngine:
         self.rules: dict[str, PairRules] = {}
         self.tiers: dict[str, list[Tier]] = {}
         self.positions: dict[str, PositionState] = {}
+        #: symbol -> when it was closed (epoch). Drives the re-entry cooldown.
+        self._closed_at: dict[str, float] = {}
         self.last_aggregates: dict[str, Aggregate] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
@@ -198,7 +209,7 @@ class TraderEngine:
         "reversal", "reversal_confidence", "mid_management",
         "symbols", "leverage", "margin_mode", "position_mode",
         "max_open_positions", "risk_pct", "margin_amount_pct", "breakeven_pct",
-        "trailing_trigger_roi_pct", "liq_sl_distance_pct",
+        "trailing_trigger_roi_pct", "liq_sl_distance_pct", "reentry_cooldown_sec",
         "min_agreeing", "timeframes", "min_confidence", "tf_min_confidence",
         "scans",
         "tpsl_method", "partial_tp_ladder",
@@ -792,20 +803,84 @@ class TraderEngine:
             await asyncio.sleep(max(5, self.state.scan_interval))
 
     # ================================================================ trading
-    async def open_positions(self) -> list[dict]:
+    async def live_positions(self) -> list[dict] | None:
+        """The exchange's open positions, or None when the read FAILED.
+
+        `open_positions` cannot tell "no positions" from "the read failed" -
+        it returns [] for both. That difference matters: reconciling the
+        engine's position state against an empty list because the API call
+        failed would throw away every live position's management state.
+        """
         try:
             data = await self.client.get_pending_positions()
-            return data or []
+            return list(data or [])
         except BitunixAPIError as e:
             self.state.errors.append(f"open_positions: {e}")
-            return []
+            return None
+
+    async def open_positions(self) -> list[dict]:
+        return await self.live_positions() or []
+
+    def reconcile_positions(self, live: list[dict]) -> list[str]:
+        """Drop the engine's positions the exchange no longer has.
+
+        The engine's `self.positions` was only ever ADDED to. A position that
+        was stopped out, closed by a rung, or closed by the operator stayed in
+        that dict forever: the report kept counting it, the state file kept
+        growing, and the manage loop kept trying to move a stop on a position
+        that no longer existed.
+
+        The exchange is the source of truth for what is open. Anything the
+        exchange does not report is gone, and the engine says so once.
+        """
+        live_ids = {str(p.get("positionId") or "") for p in live}
+        closed: list[str] = []
+        for pid in list(self.positions):
+            if pid in live_ids:
+                continue
+            st = self.positions.pop(pid)
+            closed.append(pid)
+            self._note_closed(st.symbol, "closed on the exchange")
+            self._log_trade({"event": "closed_on_exchange", "ts": time.time(),
+                              "symbol": st.symbol, "position_id": pid,
+                              "side": st.side, "entry": st.entry, "qty": st.qty,
+                              "reason": "not open on the exchange anymore"})
+        if closed:
+            self.persist_positions()
+        return closed
+
+    def _note_closed(self, symbol: str, why: str) -> None:
+        """Remember that a symbol was just closed (anti-churn cooldown)."""
+        if symbol:
+            self._closed_at[symbol] = time.time()
+
+    def _reentry_block(self, symbol: str) -> str:
+        """The reason this symbol may not be re-entered yet, or ""."""
+        wait = int(self.state.reentry_cooldown_sec or 0)
+        if wait <= 0:
+            return ""
+        ts = self._closed_at.get(symbol)
+        if not ts:
+            return ""
+        left = wait - (time.time() - ts)
+        if left <= 0:
+            return ""
+        return (f"{symbol} was closed {int(left)}s ago - re-entry waits "
+                f"{wait}s (reentry_cooldown_sec) so the same signal cannot "
+                f"open and close it again in a loop")
 
     async def try_enter(self, agg: Aggregate) -> dict:
         sym = agg.symbol
         if not agg.actionable:
             return {"ok": False, "reason": "not actionable"}
 
+        # anti-churn: a symbol closed a moment ago is not re-entered
+        cool = self._reentry_block(sym)
+        if cool:
+            return {"ok": False, "reason": cool}
+
         positions = await self.open_positions()
+        self.reconcile_positions(positions)
         if len(positions) >= self.state.max_open_positions:
             return {"ok": False, "reason": f"max open positions ({self.state.max_open_positions}) reached"}
         if any(p.get("symbol") == sym for p in positions):
@@ -1101,6 +1176,10 @@ class TraderEngine:
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
 
+        # A tier/leverage CLAMP is a safety decision, not a routine note: it
+        # stays in `errors` so it cannot be hidden. The routine margin-budget
+        # sizing note below goes to `notes` instead - it used to be reported
+        # as a failure, which buried the real errors behind noise.
         for note in lev_notes:
             self.state.errors.append(note)
 
@@ -1150,7 +1229,7 @@ class TraderEngine:
                            f"MARGIN_AMOUNT_PCT or add funds.")
                     self.state.errors.append(f"preflight {sym}: {msg}")
                     return {"ok": False, "reason": msg}
-                self.state.errors.append(
+                self.state.notes.append(
                     f"margin {sym}: qty {qty} would lock {margin_real:.4f} USDT, "
                     f"above the MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
                     f"budget of {budget:.4f} USDT; clamped to qty {clamped} "
@@ -1325,19 +1404,33 @@ class TraderEngine:
                 "qty": qty, "entry": price, "plan": plan.as_dict()}
 
     async def close_position(self, symbol: str | None = None,
-                             position_id: str | None = None) -> dict:
+                             position_id: str | None = None,
+                             reason: str = "user") -> dict:
+        """Close a position, and RECORD WHY.
+
+        The close log used to carry only the symbol and the result, so a log
+        could not tell a reversal close from an account-threshold close from
+        the operator's own command. "Why did it open and close several
+        positions in a minute?" was unanswerable from the evidence - the
+        reason is the one thing that separates them.
+        """
         try:
             if position_id:
                 res = await self.client.flash_close_position(position_id)
             else:
                 res = await self.client.close_all_position(symbol)
+            self._note_closed(symbol or "", reason)
             self._log_trade({"event": "close", "ts": time.time(),
-                             "symbol": symbol, "position_id": position_id, "result": res})
+                             "symbol": symbol, "position_id": position_id,
+                             "reason": reason, "result": res})
             if position_id:
                 st = self.positions.pop(str(position_id), None)
             self.persist_positions()
-            return {"ok": True, "result": res}
+            return {"ok": True, "reason": reason, "result": res}
         except BitunixAPIError as e:
+            self._log_trade({"event": "close_failed", "ts": time.time(),
+                             "symbol": symbol, "position_id": position_id,
+                             "reason": reason, "error": str(e)})
             return {"ok": False, "reason": str(e), "hint": e.hint}
 
     # ================================================================ management
@@ -1366,19 +1459,63 @@ class TraderEngine:
         placed = []
         skipped = []
         allocated = 0.0
-        carry_share = 0.0
 
+        # --- PLAN first, then place.
+        #
+        # A rung smaller than the exchange's minimum order volume cannot exist
+        # as its own order; it is merged into the next one. The old code merged
+        # as it went and DROPPED the remainder: with a 29-unit position and
+        # minTradeVolume 10, the rungs were 11 (40%), 10 (35%) and 7 (25%) -
+        # the last one was too small to place and there was no next rung to
+        # merge it into, so 8 units of the position were left with a stop and
+        # NO take-profit at all. The plan is computed first so a remainder can
+        # be folded into the last placeable rung instead of vanishing.
+        plan: list[tuple[LadderRung, float, float]] = []   # (rung, share, qty)
+        carry_share = 0.0
         for rung in rungs:
             share = rung.share + carry_share
+            carry_share = 0.0
             step_qty = round_step(qty * share / 100.0, rules.base_precision)
-            too_small = min_qty > 0 and step_qty < min_qty
-            if too_small or allocated + step_qty > qty:
+            if min_qty > 0 and step_qty < min_qty:
                 skipped.append({"share": share, "r": rung.r,
                                 "reason": "below minTradeVolume - merged into "
-                                          "the next rung" if too_small else
-                                          "would over-allocate the position"})
+                                          "the next rung"})
                 carry_share = share
                 continue
+            if allocated + step_qty > qty:
+                room = round_step(qty - allocated, rules.base_precision)
+                if min_qty > 0 and room < min_qty:
+                    skipped.append({"share": share, "r": rung.r,
+                                    "reason": "would over-allocate the position"})
+                    carry_share = share
+                    continue
+                step_qty = room
+            plan.append((rung, share, step_qty))
+            allocated += step_qty
+
+        if carry_share > 0:
+            # the last rung could not stand on its own: fold it into the last
+            # rung that CAN, so every unit of the position keeps a take-profit
+            if plan:
+                rung, share, step_qty = plan[-1]
+                extra = round_step(qty * carry_share / 100.0, rules.base_precision)
+                merged = round_step(step_qty + extra, rules.base_precision)
+                if merged > step_qty:
+                    skipped.append({"share": carry_share, "r": rung.r,
+                                    "reason": "below minTradeVolume - merged "
+                                              "into the previous rung"})
+                    plan[-1] = (rung, share + carry_share, min(merged, qty))
+                    allocated += min(merged, qty) - step_qty
+                else:
+                    skipped.append({"share": carry_share, "r": rung.r,
+                                    "reason": "below minTradeVolume - no rung "
+                                              "left to merge into"})
+            else:
+                skipped.append({"share": carry_share, "r": rungs[-1].r,
+                                "reason": "below minTradeVolume - the position "
+                                          "is too small to split"})
+
+        for rung, share, step_qty in plan:
             target = rung_target(side, entry, sl_dist, rung.r)
             try:
                 res = await self.client.place_tp_sl_order(
@@ -1386,14 +1523,11 @@ class TraderEngine:
                     tp_price=format_price(target, rules),
                     tp_qty=format_qty(step_qty, rules),
                     tp_order_type="MARKET", tp_stop_type=trigger_type)
-                allocated += step_qty
                 placed.append({"share": share, "r": rung.r, "qty": step_qty,
                                "price": target,
                                "order_id": str(order_row(res).get("orderId") or "")})
-                carry_share = 0.0
             except (BitunixAPIError, ValueError) as e:
                 skipped.append({"share": share, "r": rung.r, "reason": str(e)})
-                carry_share = share
             except Exception as e:  # noqa: BLE001
                 # A rung must NEVER take the scan loop down. The exchange
                 # answered the first rung and the engine still died on the
@@ -1404,7 +1538,6 @@ class TraderEngine:
                 # record.
                 skipped.append({"share": share, "r": rung.r,
                                 "reason": f"{type(e).__name__}: {e}"})
-                carry_share = share
 
         runner_qty = max(0.0, qty - allocated)
         self._log_tpsl({
@@ -1436,18 +1569,27 @@ class TraderEngine:
         except (BitunixAPIError, ValueError) as e:
             self.state.errors.append(f"partial fallback TP {sym}: {e}")
 
-    async def close_all_positions(self) -> dict:
+    async def close_all_positions(self, reason: str = "user") -> dict:
         """Close every open position - the ACCOUNT TP/SL action.
 
         Uses the documented `close_all_position` endpoint (market close of all
         positions). Falls back to per-position flash close if the bulk call
         fails, so a single API hiccup cannot leave the account half-flattened.
+
+        `reason` says WHY the close happened (account_tp / account_sl / user)
+        and is written to the trade log - the log is the only record of a
+        close, so the reason has to be in it.
         """
         try:
             await self.client.close_all_position()
+            for st in list(self.positions.values()):
+                self._note_closed(st.symbol, reason)
+                self._log_trade({"event": "close", "ts": time.time(),
+                                 "symbol": st.symbol, "position_id": st.position_id,
+                                 "reason": reason, "via": "close_all_position"})
             self.positions.clear()
             self.persist_positions()
-            return {"ok": True, "via": "close_all_position"}
+            return {"ok": True, "via": "close_all_position", "reason": reason}
         except BitunixAPIError as e:
             log.warning("close_all_position failed (%s) - falling back to "
                         "per-position close", e)
@@ -1459,12 +1601,16 @@ class TraderEngine:
             try:
                 await self.client.flash_close_position(pid)
                 closed += 1
+                self._note_closed(str(p.get("symbol") or ""), reason)
+                self._log_trade({"event": "close", "ts": time.time(),
+                                 "symbol": p.get("symbol"), "position_id": pid,
+                                 "reason": reason, "via": "flash_close_position"})
             except BitunixAPIError:
                 failed += 1
         self.positions.clear()
         self.persist_positions()
         return {"ok": failed == 0, "via": "flash_close_position",
-                "closed": closed, "failed": failed}
+                "reason": reason, "closed": closed, "failed": failed}
 
     def tpsl_method_report(self) -> str:
         """One honest line about the four documented TP/SL methods.
@@ -1558,7 +1704,8 @@ class TraderEngine:
                                              cfg=acct_cfg)
             if decision.should_close_all:
                 log.warning("ACCOUNT TP/SL: %s", decision.reason)
-                closed = await self.close_all_positions()
+                closed = await self.close_all_positions(
+                    reason=f"account_{decision.trigger}")
                 actions.append({"action": f"account_{decision.trigger}",
                                 "total_pnl": round(total_pnl, 2),
                                 "threshold": decision.threshold,
@@ -1691,7 +1838,8 @@ class TraderEngine:
                 st, roi, reversal and self.state.reversal, rev_conf,
                 self.state.reversal_confidence)
             if action == "close_reversal":
-                res = await self.close_position(symbol=sym, position_id=pid)
+                res = await self.close_position(symbol=sym, position_id=pid,
+                                                reason="reversal")
                 actions.append({"action": "close_reversal", "symbol": sym,
                                 "roi": round(roi, 2), "result": res})
         # Management state (breakeven_done / trailing_stop / peak_roi) must hit
@@ -1725,6 +1873,8 @@ class TraderEngine:
                    if agg else "no scan yet")
             lines.append(f"{sym}: price {price} | signal {sig}")
         positions = await self.open_positions()
+        self.reconcile_positions(positions)
+        live_ids = {str(p.get("positionId") or "") for p in positions}
         if positions:
             lines.append("-- open positions --")
             for p in positions:
@@ -1739,12 +1889,12 @@ class TraderEngine:
                     f"liq={p.get('liqPrice')}")
         else:
             lines.append("no open positions")
-        lines.extend(await self._report_tpsl())
+        lines.extend(await self._report_tpsl(live_ids))
         if self.state.errors:
             lines.append(f"errors: {len(self.state.errors)} (last: {self.state.errors[-1]})")
         return "\n".join(lines)
 
-    async def _report_tpsl(self) -> list[str]:
+    async def _report_tpsl(self, live_ids: set[str] | None = None) -> list[str]:
         """The TP/SL state of the account, in the report.
 
         The report used to stop at the signal and the position line, so an
@@ -1752,6 +1902,11 @@ class TraderEngine:
         method, the ladder, the stop, the target, the trailing state and the
         account thresholds were all invisible outside `/tpsl`. This is the
         same information, and it is what the Telegram report push carries.
+
+        `live_ids` are the position ids the exchange still reports. Anything
+        else is GONE: a rung parked for a closed position must not be
+        reported as if it were still working, or the report counts a dead
+        position forever.
         """
         m = (self.state.tpsl_method or "POSITION").upper()
         if m == "PARTIAL":
@@ -1767,6 +1922,8 @@ class TraderEngine:
 
         # one line per managed position: what is armed, and by which method
         for st in self.positions.values():
+            if live_ids is not None and st.position_id not in live_ids:
+                continue
             tp = f"{st.tp:g}" if st.tp else ("rungs" if m == "PARTIAL" else "none")
             lines.append(
                 f"  {st.symbol} {st.side} qty={st.qty:g} entry={st.entry:g} "
@@ -1776,18 +1933,45 @@ class TraderEngine:
                 + (f"@{st.trailing_stop:g}" if st.trailing_stop else "")
                 + (f" peak_roi={st.peak_roi:.2f}%" if st.peak_roi else ""))
 
-        # the rungs that are actually parked on the exchange, from the log
+        # the rungs that are actually parked on the exchange, from the log -
+        # but only for a position that is STILL open
         for rec in reversed(self.tpsl_history(20)):
             if rec.get("event") != "partial_rungs_placed":
                 continue
             placed = rec.get("placed") or []
             if not placed:
                 continue
+            pid = str(rec.get("position_id") or "")
+            if live_ids is not None and pid not in live_ids:
+                continue          # the position is gone - the rungs are history
             rungs = ", ".join(
                 f"{p.get('share')}%@{p.get('r')}R={p.get('price')}"
                 for p in placed)
             lines.append(f"  parked rungs ({rec.get('symbol')}): {rungs}")
             break
+        lines.extend(self._report_closes())
+        if self.state.notes:
+            lines.append(f"notes: {len(self.state.notes)} "
+                         f"(last: {self.state.notes[-1]})")
+        return lines
+
+    def _report_closes(self) -> list[str]:
+        """The last few closes, with the reason each one happened.
+
+        A position that opens and closes inside a minute is a fee burn, and
+        the operator cannot see why from a report that only shows what is open
+        NOW. Every close carries its reason in the trade log
+        (`reversal` / `account_tp` / `account_sl` / `user`), so the report
+        shows it instead of leaving the question to guesswork.
+        """
+        closes = [r for r in self.trades_history(50) if r.get("event") == "close"]
+        if not closes:
+            return []
+        lines = ["-- recent closes --"]
+        for rec in closes[-3:]:
+            ts = time.strftime("%H:%M:%S", time.localtime(rec.get("ts") or 0))
+            lines.append(f"  {ts} {rec.get('symbol') or '-'} "
+                         f"reason={rec.get('reason') or 'unknown'}")
         return lines
 
     async def pnl(self) -> dict:
@@ -2118,7 +2302,8 @@ class TraderEngine:
             return json.dumps(await self.positions_history(), indent=2)
         if low.startswith("close position"):
             sym = arg("close position").strip() or None
-            return json.dumps(await self.close_position(symbol=sym), indent=2)
+            return json.dumps(await self.close_position(symbol=sym, reason="user"),
+                              indent=2)
         if low.startswith("margin add") or low.startswith("margin reduce"):
             return await self._margin_adjust_command(raw)
         if low.startswith("margin amount"):

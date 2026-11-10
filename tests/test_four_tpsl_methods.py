@@ -545,3 +545,85 @@ def test_report_shows_the_tpsl_state():
     assert "sl=0.004" in out, out          # the stop is visible
     assert "breakeven" in out.lower(), out
     assert "account TP" in out, out       # the account thresholds are visible
+
+
+def test_the_last_rung_is_never_dropped():
+    """A remainder that no later rung can take must not vanish.
+
+    Real case: a 29-unit position, minTradeVolume 10, ladder 40@1,35@2,25@3.
+    The rungs were 11, 10 and 7 units - the last one was below the minimum,
+    and with no next rung to merge into it was DROPPED: 8 units of the
+    position were left with a stop and no take-profit. The remainder is now
+    folded into the last placeable rung, so every unit keeps an exit.
+    """
+    from jrock.trader.tpsl import parse_partial_ladder
+    rules = PairRules(
+        symbol="INITUSDT", min_trade_volume=10.0, max_market_order_volume=30000.0,
+        max_limit_order_volume=2000000.0, base_precision=0, quote_precision=5,
+        min_leverage=1, max_leverage=25, default_leverage=10,
+        price_protect_scope=0.05, symbol_status="OPEN", api_supported=True)
+    s = Settings()
+    s.tpsl_method = "PARTIAL"
+    s.partial_tp_ladder = "40@1,35@2,25@3"
+    e = TraderEngine(s)
+    sent: list[dict] = []
+
+    class C:
+        async def place_tp_sl_order(self, *a, **kw):
+            sent.append(kw)
+            return {"orderId": "T1"}
+
+    e.client = C()  # type: ignore[assignment]
+    rungs = parse_partial_ladder(s.partial_tp_ladder)
+    asyncio.run(e._place_partial_rungs(
+        "INITUSDT", "P1", "LONG", 0.27566, 29.0,
+        sl_dist=0.00255, rungs=rungs, rules=rules, trigger_type="MARK_PRICE"))
+    covered = sum(float(x["tp_qty"]) for x in sent)
+    assert covered >= 28.0, f"only {covered} of 29 units have a take-profit: {sent}"
+    assert all(float(x["tp_qty"]) >= 10.0 for x in sent), sent
+
+
+# ==================================================== a closed position is gone
+def test_a_closed_position_is_dropped_from_the_engine_state():
+    """The engine's position list was only ever ADDED to.
+
+    A position that was closed stayed in `self.positions` forever: the report
+    kept counting it and the state file kept growing. The exchange is the
+    source of truth - what it does not report is gone.
+    """
+    from jrock.trader.tpsl import PositionState
+    s = Settings()
+    e = TraderEngine(s)
+    e.positions["P1"] = PositionState(
+        position_id="P1", symbol="AKEUSDT", side="LONG", entry=0.005, qty=1000.0,
+        leverage=10, sl=0.004, tp=0.006, liq=0.003)
+
+    closed = e.reconcile_positions([])          # the exchange reports nothing
+    assert closed == ["P1"], closed
+    assert "P1" not in e.positions
+
+    # a position the exchange DOES report stays
+    e.positions["P2"] = PositionState(
+        position_id="P2", symbol="AKEUSDT", side="LONG", entry=0.005, qty=1000.0,
+        leverage=10, sl=0.004, tp=0.006, liq=0.003)
+    e.reconcile_positions([{"positionId": "P2", "symbol": "AKEUSDT"}])
+    assert "P2" in e.positions
+
+
+def test_a_closed_symbol_is_not_re_entered_immediately():
+    """The churn: a signal that keeps firing re-opened the position the
+    moment it closed - two market fills a minute apart, each paying the
+    taker fee twice, for a trade that never had time to work."""
+    from jrock.trader.tpsl import PositionState
+    s = Settings()
+    s.reentry_cooldown_sec = 60
+    e = TraderEngine(s)
+    e.positions["P1"] = PositionState(
+        position_id="P1", symbol="AKEUSDT", side="LONG", entry=0.005, qty=1000.0,
+        leverage=10, sl=0.004, tp=0.006, liq=0.003)
+    e.reconcile_positions([])                   # it closed
+    assert "re-entry waits" in e._reentry_block("AKEUSDT")
+    assert e._reentry_block("BTCUSDT") == ""
+
+    e.state.reentry_cooldown_sec = 0               # disabled
+    assert e._reentry_block("AKEUSDT") == ""

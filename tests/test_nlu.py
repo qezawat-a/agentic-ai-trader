@@ -385,3 +385,75 @@ def test_cancel_words(word):
 def test_confirm_and_cancel_are_disjoint():
     for w in nlu.CONFIRM_WORDS:
         assert not nlu.is_cancel(w), f"{w!r} is both confirm and cancel"
+
+
+# ==========================================================================
+# 9. "yes" must be understood as yes - and "yes" must not ask again
+# ==========================================================================
+
+def test_confirm_accepts_the_way_people_actually_answer():
+    """The old matcher required the WHOLE message to be one exact phrase.
+
+    "yes do it", "yes, do it now" and every Persian "بله" fell through to
+    "still waiting on ..." - so the user said yes again, and again.
+    """
+    from jrock.nlu import is_confirm
+    for text in ("yes", "Yes!", "yes please", "yes do it", "yes, do it now",
+                 "ok do it", "okay go ahead", "sure, go ahead", "y",
+                 "بله", "آره", "اره", "بله انجام بده", "حتما", "تایید",
+                 "موافقم", "ok", "okay", "confirm", "do it", "go ahead"):
+        assert is_confirm(text), text
+
+
+def test_cancel_accepts_the_way_people_actually_say_no():
+    from jrock.nlu import is_cancel
+    for text in ("no", "No!", "no thanks", "nope", "cancel", "don't", "stop",
+                 "نه", "نخیر", "بیخیال", "لغو", "کنسل", "متوقف", "بزن متوقف"):
+        assert is_cancel(text), text
+
+
+def test_a_refusal_is_not_a_confirmation():
+    from jrock.nlu import is_cancel, is_confirm
+    assert not is_confirm("no")
+    assert not is_confirm("نه")
+    assert not is_confirm("ok, no thanks")
+    assert is_cancel("ok, no thanks")
+    assert not is_confirm("")
+
+
+def test_autotrade_and_engine_switches_do_not_ask_for_confirmation():
+    """The TYPED command never asks; the SENTENCE still does.
+
+    "autotrade on" is an engine command and runs directly. "turn on
+    autotrade" is a sentence, and a sentence must not enable real-money
+    trading without an explicit yes - that safety property is pinned
+    elsewhere in this file.
+    """
+    from jrock.nlu import parse
+    for text, name in (("turn on autotrade", "autotrade_on"),
+                       ("turn off autotrade", "autotrade_off"),
+                       ("turn on the engine", "engine_on"),
+                       ("turn off the engine", "engine_off")):
+        got = parse(text)
+        assert isinstance(got, nlu.Intent), (text, got)
+        assert got.name == name, (text, got.name)
+
+
+def test_a_trading_request_never_reaches_the_model():
+    """An unusual phrasing must still land in the command layer.
+
+    The model cannot trade and cannot confirm: it asked for a "yes" in prose,
+    the user said yes, and it asked again. A sentence the strict rules miss
+    must still resolve to an intent (or ask which symbol) - never fall
+    through to the model.
+    """
+    from jrock.nlu import parse
+    for text in ("پوزیشنم رو ببند لطفا", "please close my open trade"):
+        got = parse(text)
+        assert isinstance(got, (nlu.Intent, nlu.Clarification)), (text, got)
+        if isinstance(got, nlu.Intent):
+            assert got.name == "close_position", (text, got.name)
+
+    got = parse("set the leverage to 5")
+    assert isinstance(got, nlu.Intent), got
+    assert got.name == "leverage_set", got.name

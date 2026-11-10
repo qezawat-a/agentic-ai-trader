@@ -509,11 +509,17 @@ class JRockAgent:
             return ""
         low = raw.lower()
 
-        if low.startswith("auto accept edit"):
+        # Permission toggles are LOCAL and reversible: they never move money,
+        # so they never ask for a confirmation. "auto accept on" (without
+        # "edit") used to fall through to the model, which answered with a
+        # question of its own and then asked again for the "yes" - a loop
+        # with no way out for a one-word toggle.
+        if low.startswith("auto accept"):
             val = low.split()[-1]
-            self.perms.auto_accept_edit = val in ("on", "true", "1", "yes")
-            self.perms.audit.write("toggle_auto_accept", value=self.perms.auto_accept_edit)
-            return f"auto accept edit = {self.perms.auto_accept_edit}"
+            on = val in ("on", "true", "1", "yes")
+            self.perms.auto_accept_edit = on
+            self.perms.audit.write("toggle_auto_accept", value=on)
+            return f"auto accept edit = {on}"
         if low.startswith("device access"):
             val = low.split()[-1]
             self.perms.full_device_access = val in ("on", "true", "1", "yes")
@@ -928,9 +934,20 @@ class JRockAgent:
             "table of commands.\n"
             "- If the request is ambiguous, ask ONE short clarifying question "
             "with the concrete options. Never guess about money.\n"
-            "- Before anything that opens or closes a position, or changes "
-            "leverage, risk, margin, autotrade or the engine, say what you are "
-            "about to do and wait for an explicit yes.\n"
+            "- The command layer asks the user to confirm anything that opens "
+            "or closes a position, or changes leverage, risk, margin, "
+            "autotrade or the engine; the action then must wait for an explicit "
+            "yes. YOU must never ask for that confirmation yourself. If you "
+            "ask in your own words, the next 'yes' reaches you as ordinary "
+            "text and you will ask again - an endless loop the user cannot "
+            "escape. So: if a message asks you to trade, name the exact "
+            "command from the handbook below and say the engine will run it "
+            "after the user's confirmation. Never say 'done', 'I closed it', "
+            "'I set it' for an action the engine has not confirmed back.\n"
+            "- You cannot change the engine's settings yourself. If the user "
+            "asks you to enable breakeven, trailing, the engine, autotrade or "
+            "any other switch, tell them the command to type. Do not agree "
+            "that it is already on - read the engine's own answer instead.\n"
             "- You have a real Bitunix futures engine. When a question is about "
             "the account, positions, orders, prices or settings, the engine's "
             "own answer is the truth - never invent a number. If you do not "

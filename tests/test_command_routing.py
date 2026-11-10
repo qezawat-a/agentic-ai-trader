@@ -223,3 +223,44 @@ def test_real_command_still_routes_to_the_engine(tmp_path):
     a = _agent(tmp_path)
     out = _run(a.handle("leverage 10"))
     assert "unknown engine command" not in out.lower()
+
+
+# ==========================================================================
+# The switches the operator types must not ask for a confirmation
+# ==========================================================================
+
+def test_typed_switches_run_without_a_confirmation_prompt(tmp_path):
+    """"auto accept on" and "autotrade on" are switches, not orders.
+
+    "auto accept on" (without the word "edit") used to fall through to the
+    MODEL, which answered with a question of its own and then asked again for
+    the "yes" - an endless loop for a one-word toggle.
+    """
+    a = _agent(tmp_path)
+    out = _run(a.handle("auto accept on"))
+    assert "auto accept edit = True" in out, out
+    assert a.perms.auto_accept_edit is True
+
+    out = _run(a.handle("autotrade on"))
+    assert "Autotrade ON" in out, out
+    assert a.engine.state.autotrade is True
+    assert a._pending_action is None, "no confirmation may be pending"
+
+    out = _run(a.handle("auto accept off"))
+    assert "auto accept edit = False" in out, out
+
+
+def test_a_yes_after_the_prompt_runs_the_action(tmp_path):
+    """The confirm loop was the complaint: "yes" must resolve the prompt.
+
+    The typed command runs directly; the SENTENCE asks once, and the answer
+    "yes do it" must resolve it. Before, only an exact "yes" worked, so the
+    agent answered "still waiting" and the user said yes again, forever.
+    """
+    a = _agent(tmp_path)
+    out = _run(a.handle("close my BTCUSDT position"))
+    assert "About to:" in out, out
+    assert a._pending_action is not None
+    out = _run(a.handle("yes do it"))
+    assert "Still waiting" not in out, out
+    assert a._pending_action is None
