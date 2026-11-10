@@ -863,6 +863,8 @@ def _loose_intent(text: str) -> Intent | None:
             continue
         if builder is None:
             continue
+        if is_negated(raw):
+            return None      # "don't close ..." is not a close request
         try:
             intent = builder(raw)
         except Exception:  # noqa: BLE001 - a bad rule must not break routing
@@ -870,6 +872,36 @@ def _loose_intent(text: str) -> Intent | None:
         if intent is not None:
             return intent
     return None
+
+
+#: Words that mean "do NOT do that". A sentence with one of these must never
+#: turn into a destructive intent: "don't close my position" is not a close
+#: request, and the loose tier made that mistake easy.
+_NEGATION_MARKERS = (
+    "don't", "dont", "do not", "doesn't", "never", "no need to", "no need",
+    "not close", "not to close", "keep open", "keep it open", "keep the",
+    "leave it open", "leave open", "without closing", "instead of closing",
+    "rather than closing", "cancel my",
+    # Persian
+    "نبند", "نباید ببند", "نکن", "نکنید", "بسته نشو", "باز نگه", "باز نگه دار",
+    "نگه دار", "بدون بستن", "لازم نیست",
+)
+
+#: The verbs a negation applies to. The negation only cancels the action it
+#: is attached to - "don't close BTC, close ETH" still closes ETH.
+_NEGATED_ACTIONS = (
+    "close", "closing", "exit", "flatten", "kill", "open", "buy", "sell",
+    "بستن", "ببند", "نبند", "نکن", "نکنید", "خروج", "باز کن", "بازکن",
+    "خرید", "فروش",
+)
+
+
+def is_negated(text: str) -> bool:
+    """True when the sentence says NOT to do the thing it mentions."""
+    low = (text or "").lower()
+    if not any(m in low for m in _NEGATION_MARKERS):
+        return False
+    return any(a in low for a in _NEGATED_ACTIONS)
 
 
 def parse(text: str) -> Intent | Clarification | None:
@@ -888,12 +920,18 @@ def parse(text: str) -> Intent | Clarification | None:
         return None
 
     matches: list[Intent] = []
+    negated = is_negated(raw)
     for _name, rx, builder in RULES:
         if rx.search(raw):
             try:
                 matches.append(builder(raw))
             except Exception:  # noqa: BLE001 - a bad rule must not break routing
                 continue
+    if negated:
+        # "don't close my position" is not a close request. A destructive
+        # intent that the sentence explicitly negates is dropped, so the
+        # sentence falls through to a conversation instead of arming a close.
+        matches = [m for m in matches if not m.destructive]
     if not matches:
         # Last-resort tier: the sentence did not match any strict rule, but it
         # clearly names a trading action. Without this the sentence reached

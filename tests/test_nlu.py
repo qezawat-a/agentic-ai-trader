@@ -457,3 +457,20 @@ def test_a_trading_request_never_reaches_the_model():
     got = parse("set the leverage to 5")
     assert isinstance(got, nlu.Intent), got
     assert got.name == "leverage_set", got.name
+
+
+def test_a_negated_close_is_not_a_close_request():
+    """A sentence that says NOT to close must never arm a close.
+
+    The close rules match "close ... position", so "don't close my position"
+    used to resolve to a destructive intent: one "yes" later, the position was
+    closed. The loose tier made that easier to hit, so the negation is now
+    checked before any destructive intent is armed.
+    """
+    from jrock.nlu import is_negated, parse
+    for text in ("don't close my position", "do not close the BTCUSDT trade",
+                 "keep it open", "don't close my BTCUSDT position please",
+                 "نبند پوزیشنم رو", "پوزیشنم رو نبند"):
+        assert is_negated(text), text
+        got = parse(text)
+        assert not (isinstance(got, nlu.Intent) and got.destructive), (text, got)

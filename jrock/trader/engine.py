@@ -821,7 +821,7 @@ class TraderEngine:
     async def open_positions(self) -> list[dict]:
         return await self.live_positions() or []
 
-    def reconcile_positions(self, live: list[dict]) -> list[str]:
+    def reconcile_positions(self, live: list[dict] | None) -> list[str]:
         """Drop the engine's positions the exchange no longer has.
 
         The engine's `self.positions` was only ever ADDED to. A position that
@@ -832,7 +832,13 @@ class TraderEngine:
 
         The exchange is the source of truth for what is open. Anything the
         exchange does not report is gone, and the engine says so once.
+
+        `live` is None when the exchange could not be read. That is NOT the
+        same as "no positions": reconciling against a failed read would
+        throw away every live position's management state.
         """
+        if live is None:
+            return []
         live_ids = {str(p.get("positionId") or "") for p in live}
         closed: list[str] = []
         for pid in list(self.positions):
@@ -879,8 +885,9 @@ class TraderEngine:
         if cool:
             return {"ok": False, "reason": cool}
 
-        positions = await self.open_positions()
-        self.reconcile_positions(positions)
+        live = await self.live_positions()
+        positions = live or []
+        self.reconcile_positions(live)
         if len(positions) >= self.state.max_open_positions:
             return {"ok": False, "reason": f"max open positions ({self.state.max_open_positions}) reached"}
         if any(p.get("symbol") == sym for p in positions):
@@ -1872,8 +1879,9 @@ class TraderEngine:
             sig = (f"{agg.direction} {agg.confidence:.1f}% ({agg.agreeing} agree)"
                    if agg else "no scan yet")
             lines.append(f"{sym}: price {price} | signal {sig}")
-        positions = await self.open_positions()
-        self.reconcile_positions(positions)
+        live = await self.live_positions()
+        positions = live or []
+        self.reconcile_positions(live)
         live_ids = {str(p.get("positionId") or "") for p in positions}
         if positions:
             lines.append("-- open positions --")
