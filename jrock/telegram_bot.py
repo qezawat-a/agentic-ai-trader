@@ -44,7 +44,13 @@ MAX_MESSAGE = 4000
 #: behind the Menu button in the BOTTOM-LEFT corner of the chat, so the operator
 #: sees what the bot can do without typing ``/help`` first. Order matters: it is
 #: the order Telegram displays them in.
+#:
+#: The list carries EVERY command the bot routes - the trading engine first
+#: (that is what the operator uses every minute), then the agent itself. A
+#: command that is not in the Menu sheet is a command the operator has to
+#: remember, which is the thing a Menu is for.
 COMMANDS: list[tuple[str, str]] = [
+    # --- the trading engine
     ("status", "engine + account + positions"),
     ("positions", "open positions"),
     ("orders", "pending orders"),
@@ -54,23 +60,45 @@ COMMANDS: list[tuple[str, str]] = [
     ("balance", "balance and margin use"),
     ("price", "last / mark price for the symbols"),
     ("engine", "engine flags"),
+    ("leverage", "leverage and margin mode per symbol"),
+    ("margin", "margin mode (ISOLATION|CROSS) per symbol"),
+    ("settings", "account trading settings"),
+    ("symbols", "tradable symbols"),
+    ("funding", "current funding rate"),
+    ("ws", "WebSocket state, market data source, live test"),
     ("help", "this message"),
+    # --- the agent itself
+    ("models", "list the models on BASE_URL"),
+    ("set_model", "pin the active model (/set_model <id>)"),
+    ("connect_provider", "point J-Rock at a provider"),
+    ("think", "one-shot reasoning (no tools)"),
+    ("memory", "long-term memory (/memory add|list|search|clear)"),
+    ("add_soul", "append to the soul"),
+    ("soul", "show the soul"),
+    ("add_skill", "teach a skill"),
+    ("skill", "load / list skills"),
+    ("add_mcp", "register an MCP server"),
+    ("mcp", "use MCP tools"),
+    ("team_spawn", "Architect+Engineer+Reviewer mini-team"),
+    ("check_ai", "LLM health probe"),
+    ("check_system", "deep system + engine diagnostics"),
+    ("code_review", "review its own code"),
+    ("bug_fix", "propose and apply a fix"),
+    ("verify", "run the tests and the import check"),
+    ("simplify", "simplify a source file"),
+    ("selfheal", "the self-repair loop (pytest -> review -> fix)"),
+    ("diagnose", "full diagnostic bundle"),
+    ("reset", "clear the conversation memory"),
 ]
 
-#: A persistent reply keyboard, also bottom-left. ``setMyCommands`` only shows
-#: the commands in the Menu sheet; this puts the most-used ones one tap away,
-#: permanently, without the operator opening anything.
-REPLY_KEYBOARD: dict[str, Any] = {
-    "keyboard": [
-        [{"text": "/status"}, {"text": "/positions"}],
-        [{"text": "/orders"}, {"text": "/pnl"}],
-        [{"text": "/report"}, {"text": "/price"}],
-        [{"text": "/tpsl"}, {"text": "/help"}],
-    ],
-    "resize_keyboard": True,
-    "is_persistent": True,
-    "input_field_placeholder": "J+Rock - tap a command or type",
-}
+#: The reply keyboard is GONE. The operator asked for the six buttons under
+#: the input field to be removed: the Menu sheet (every command, published
+#: above) is the one surface, and a second set of buttons under the typing
+#: field only crowded the chat.
+#:
+#: Telegram keeps a keyboard until it is replaced, so the bot removes it once
+#: at startup with `remove_keyboard: True`.
+REMOVE_KEYBOARD: dict[str, Any] = {"remove_keyboard": True}
 
 
 class TelegramError(RuntimeError):
@@ -128,16 +156,22 @@ class TelegramBot:
 
     async def send(self, chat_id: int | str, text: str,
                    *, markdown: bool = False, keyboard: bool = True) -> Any:
-        for i, chunk in enumerate(_split(text, MAX_MESSAGE)):
+        """Send a message.
+
+        The reply keyboard is GONE. Every message carries
+        `remove_keyboard: true`, which is what actually takes the old six
+        buttons off the input field - Telegram keeps a keyboard until it is
+        replaced, and this replaces it with nothing. The Menu sheet
+        (every command, see COMMANDS) is the one command surface.
+        """
+        for chunk in _split(text, MAX_MESSAGE):
             params: dict[str, Any] = {
                 "chat_id": chat_id, "text": chunk,
                 "parse_mode": "HTML" if markdown else None,
                 "disable_web_page_preview": True,
             }
-            # The reply keyboard rides on the LAST chunk only, so a long report
-            # does not stack one keyboard per message.
-            if keyboard and i == len(_split(text, MAX_MESSAGE)) - 1:
-                params["reply_markup"] = REPLY_KEYBOARD
+            if keyboard:
+                params["reply_markup"] = REMOVE_KEYBOARD
             await self.call("sendMessage", **params)
         return True
 
@@ -497,7 +531,7 @@ class JRockTelegramApp:
             log.info("published %d commands to the Menu", len(COMMANDS))
         except TelegramError as e:
             # A failed menu publish must not stop the bot: the commands still
-            # work when typed, and the reply keyboard still appears.
+            # work when typed.
             log.warning("setMyCommands failed (menu will be empty): %s", e)
         print(f"Telegram bot @{me.get('username')} is listening "
               f"(chat id is shown per message; Ctrl+C to stop)", flush=True)

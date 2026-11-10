@@ -529,6 +529,14 @@ class JRockAgent:
         # The agent's own surface: who it is, what it knows, what it can check.
         if cmd in ("/help", "/?"):
             return HELP
+        if cmd == "/reset":
+            # The conversation memory - the turns the model is given as
+            # context. The long-term memory (/memory) is a different thing and
+            # is NOT touched here.
+            n = len(self._history)
+            self._history.clear()
+            return (f"conversation memory cleared ({n} turns). The long-term "
+                    f"memory is untouched (/memory).")
         if cmd == "/models":
             return await self.cmd_models(rest)
         if cmd == "/set_model":

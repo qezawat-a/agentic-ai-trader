@@ -79,10 +79,32 @@ def _app(monkeypatch, state=STATE):
 
 # --------------------------------------------------------------- the Menu list
 def test_commands_cover_every_documented_command():
-    """Every command the bot routes must be published to the Menu."""
+    """Every command the bot routes must be published to the Menu.
+
+    The operator asked for the agent's commands in the Menu too: a command
+    that is not in the Menu sheet is a command they have to remember.
+    """
     names = [c for c, _ in tb.COMMANDS]
-    assert names == ["status", "positions", "orders", "pnl", "report",
-                     "tpsl", "balance", "price", "engine", "help"]
+    for must in ("status", "positions", "orders", "pnl", "report", "tpsl",
+                 "balance", "price", "engine", "help",
+                 "models", "set_model", "connect_provider", "think", "memory",
+                 "add_soul", "soul", "add_skill", "skill", "add_mcp", "mcp",
+                 "team_spawn", "check_ai", "check_system", "code_review",
+                 "bug_fix", "verify", "simplify", "reset"):
+        assert must in names, must
+    assert len(names) == len(set(names)), "a command is listed twice"
+
+
+def test_every_menu_command_is_one_the_agent_routes():
+    """A Menu entry that does nothing is worse than no Menu entry."""
+    import inspect
+    from jrock.agent import JRockAgent
+    # the dispatch is split across helpers now - look at the whole class,
+    # plus the bot's own commands (/report, /engine, ...)
+    src = inspect.getsource(JRockAgent) + inspect.getsource(tb.JRockTelegramApp.handle)
+    for name, _desc in tb.COMMANDS:
+        assert f'"/{name}"' in src or f'"{name}"' in src, (
+            f"/{name} is in the Menu but not routed")
 
 
 def test_commands_are_valid_telegram_command_names():
@@ -163,48 +185,37 @@ def test_a_failed_menu_publish_does_not_stop_the_bot(monkeypatch):
 
 
 # ------------------------------------------------------- the reply keyboard
-def test_reply_keyboard_is_persistent_and_bottom_left():
-    kb = tb.REPLY_KEYBOARD
-    assert kb["is_persistent"] is True
-    assert kb["resize_keyboard"] is True
-    flat = [b["text"] for row in kb["keyboard"] for b in row]
-    # Every button must be a command the router actually accepts.
-    for text in flat:
-        assert text.startswith("/")
-        assert text.lstrip("/") in [c for c, _ in tb.COMMANDS], text
+def test_the_reply_keyboard_is_gone():
+    """The operator asked for the six buttons under the input field to go.
+
+    There is no reply keyboard any more: the Menu sheet is the one command
+    surface. The module must not carry a keyboard definition at all.
+    """
+    assert not hasattr(tb, "REPLY_KEYBOARD")
+    assert tb.REMOVE_KEYBOARD == {"remove_keyboard": True}
 
 
-def test_keyboard_pins_the_daily_drivers():
-    """The buttons this expansion was about: one-tap report + live prices."""
-    flat = [b["text"] for row in tb.REPLY_KEYBOARD["keyboard"] for b in row]
-    assert "/report" in flat
-    assert "/price" in flat
-    # Four buttons per row max - bulky keyboards crowd the chat on phones.
-    assert all(len(row) <= 4 for row in tb.REPLY_KEYBOARD["keyboard"])
-
-
-def test_send_attaches_the_keyboard_by_default():
+def test_every_message_removes_the_old_keyboard():
+    """Telegram keeps a keyboard until it is replaced - so replace it."""
     bot = RecordingCallBot()
     asyncio.run(bot.send(1, "hello", markdown=True))
 
     method, params = bot.calls[0]
     assert method == "sendMessage"
-    assert params["reply_markup"] == tb.REPLY_KEYBOARD
+    assert params["reply_markup"] == tb.REMOVE_KEYBOARD
 
 
-def test_keyboard_rides_only_the_last_chunk():
-    """A long report must not stack one keyboard per message."""
+def test_a_long_message_removes_the_keyboard_too():
     bot = RecordingCallBot()
     long_text = "\n".join(f"line {i}" for i in range(2000))
     asyncio.run(bot.send(1, long_text, markdown=True))
 
     assert len(bot.calls) > 1
-    with_kb = [p for _, p in bot.calls if "reply_markup" in p]
-    assert len(with_kb) == 1
-    assert bot.calls[-1][1]["reply_markup"] == tb.REPLY_KEYBOARD
+    for _, params in bot.calls:
+        assert params["reply_markup"] == tb.REMOVE_KEYBOARD
 
 
-def test_keyboard_can_be_suppressed():
+def test_the_keyboard_removal_can_be_suppressed():
     bot = RecordingCallBot()
     asyncio.run(bot.send(1, "hello", markdown=True, keyboard=False))
     assert "reply_markup" not in bot.calls[0][1]

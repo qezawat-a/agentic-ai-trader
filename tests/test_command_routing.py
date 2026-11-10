@@ -264,3 +264,18 @@ def test_a_yes_after_the_prompt_runs_the_action(tmp_path):
     out = _run(a.handle("yes do it"))
     assert "Still waiting" not in out, out
     assert a._pending_action is None
+
+
+def test_reset_clears_the_conversation_memory_only(tmp_path):
+    """/reset is in the Menu, so it must do something.
+
+    The conversation memory (the turns the model is given as context) is
+    cleared; the long-term memory (/memory) is a different store and is NOT
+    touched.
+    """
+    a = _agent(tmp_path)
+    a._history.append(("user", "hello"))
+    a._history.append(("assistant", "hi"))
+    out = _run(a.handle("/reset"))
+    assert "conversation memory cleared" in out, out
+    assert a._history == []
