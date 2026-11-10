@@ -61,10 +61,12 @@ class CountingClient:
         return await self._real.get_tickers(symbols)
 
 
-def make_engine(source="ws", max_age_mult=2.0):
+def make_engine(source="ws", max_age_mult: float | None = None):
     s = Settings(symbols=[SYM], timeframes=["1m", "5m"],
-                 market_data_source=source, kline_max_age_mult=max_age_mult)
+                 market_data_source=source)
     eng = TraderEngine(s)
+    if max_age_mult is not None:
+        eng.kline_cache.max_age_mult = max_age_mult
     eng.client = CountingClient(eng.client)
     return eng
 

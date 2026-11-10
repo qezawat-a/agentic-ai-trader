@@ -60,7 +60,7 @@ shows a **last updated** stamp, so a stale page is visible rather than silent.
 | Open positions | symbol, side, qty, entry, mark, liquidation price, leverage, ROI, unrealized PnL |
 | Open orders | symbol, side, type, qty, price, status |
 | Strategies & permissions | registered strategy count by category, and the agent's permission flags |
-| Readouts | the read/query commands, verbatim: `status`, `settings trade`, bare `margin amount`, `ladder`, `tpsl`, `pnl`, `trades_history`, `tpsl_history` |
+| Readouts | the read/query commands, verbatim: `status`, `settings trade`, bare `margin amount`, `tpsl`, `pnl`, `trades_history`, `tpsl_history` |
 | Settings | every engine setting, editable in place (see below) |
 | Output | the result of the last command or question |
 
@@ -91,7 +91,6 @@ clamping and persistence are the engine's own.
 · `tf min confidence` · `scans interval sec` · `report interval sec`
 · `reversal_confidence` · `account tp/sl usdt` · `account tp/sl pct`
 · `margin mode` · `position mode` · `tpsl method` · `symbols` · `timeframes`
-· `ladder set` · `ladder breakeven` · `ladder runner` · `ladder basis`
 
 ### Autotrade from the dashboard
 
@@ -141,9 +140,11 @@ never resumed automatically after a restart.
 | `/status` | engine + API + account summary |
 | `/symbols [SEARCH]` | tradable symbols with precision and min volume |
 | `/memory [query]` | memory stats, or search memory |
-| `/code_review [path]` | AST + regex review: syntax, long functions, bare except, eval, TODOs |
+| `/movers [MODE] [n]` | rank the universe from live tickers: `MOVERS` (biggest 24h move either way), `GAINERS`, `LOSERS`, `VOLUME` (deepest turnover). Ends with a paste-ready `symbols ...` line |
+| `/code_review [path]` | AST + regex review: syntax, long functions, bare except, eval, TODOs, plus an LLM pass over the flagged sources (read-only, never auto-applied) |
 | `/bug_fix [path]` | review + apply safe fixes (permission-gated) |
 | `/verify` | compileall + import check + pytest |
+| `/autofix` | self-fix loop: engine errors + pytest tail → one LLM patch pass through the permission gate → retest → commit + push only if tests pass |
 | `/simplify [path]` | over-complex functions, oversized files |
 | `/team_spawn <n> <task>` | spawn n scoped sub-agents |
 | `/check_ai` | end-to-end LLM key/model health |
@@ -413,7 +414,7 @@ sentence means.
 | `set leverage to 5x` | `leverage 5` |
 | `set risk to 2%` | `risk 2.0` |
 | `why did the last order fail` | engine error log + the code's hint |
-| `what does TP_SL_MIN_STOP_TICKS do` | answered from `jrock/config.py` |
+| `what does TAKER_FEE_RATE do` | answered from `jrock/config.py` |
 
 **Safety.** Anything that moves money - opening or closing a position, changing
 leverage, risk, margin mode, position mode, autotrade, or the engine - is
@@ -430,10 +431,10 @@ be a guess with real money.
 **Free text still reaches the model.** A sentence the intent layer does not
 recognise falls through unchanged, so nothing that used to work stops working.
 
-**The engine answers about its own settings.** `TP_SL_MIN_STOP_TICKS`,
-`TAKER_FEE_RATE` and `MARGIN_SAFETY_PCT` are defined in `jrock/config.py`; a
-question about them is answered from the repo, with the live value. The engine
-never claims it cannot see its own code.
+**The engine answers about its own settings.** `TAKER_FEE_RATE` and
+`MARGIN_SAFETY_PCT` are defined in `jrock/config.py`; a question about them is
+answered from the repo, with the live value. The engine never claims it cannot
+see its own code.
 
 ## Empty model responses
 
@@ -527,7 +528,7 @@ through one accessor, `TraderEngine.get_price(symbol)`, which consults a
 
 | Situation | What happens |
 |---|---|
-| cached quote younger than `PRICE_MAX_AGE_SEC` (default 5s) | returned, `source=ws`, **no REST call** |
+| cached quote younger than the staleness limit (fixed at 5s) | returned, `source=ws`, **no REST call** |
 | no cached quote | REST fallback, counted as a `miss` |
 | cached quote older than the limit | **refused**, warning logged, REST fallback, counted as a `stale_rejection` |
 | WS disconnected | REST fallback; the engine keeps running, never blocks on the socket |
@@ -584,12 +585,12 @@ series by one every 500ms and corrupt every indicator.
 **Staleness is a multiple of the interval, not flat seconds.** A 1m candle is
 legitimately 60s old; a 1d candle is legitimately 24h old. A candle set is
 stale when the newest candle's open time is older than
-`KLINE_MAX_AGE_SEC * interval` (default 2x).
+`2 x interval` (fixed).
 
 | Situation | What happens |
 |---|---|
 | fresh, long-enough, WS-fed series | returned, `source=ws`, **no REST call** |
-| newest candle older than `KLINE_MAX_AGE_SEC * interval` | **refused**, warning, REST fallback, `stale_rejection` |
+| newest candle older than `2 x interval` | **refused**, warning, REST fallback, `stale_rejection` |
 | fewer candles than the caller needs | **refused**, REST fallback, `short_series` - a short series produces a wrong signal, which is worse than a slow one |
 | cache holds REST-seeded candles only | REST fallback (we cannot claim it is live) |
 | WS disconnected | REST fallback; the engine keeps running |
@@ -778,7 +779,6 @@ Configurable bounds (all default `0` = disabled, so behaviour is unchanged):
 | `MIN_MARGIN_USDT` | refuse orders whose margin is below this |
 | `MAX_MARGIN_USDT` | refuse orders whose margin is above this |
 | `MAX_NOTIONAL_USDT` | refuse orders whose notional is above this |
-| `TP_SL_MIN_STOP_TICKS` | minimum stop distance from mark/entry, in ticks |
 | `TP_SL_TRIGGER_TYPE` | `MARK_PRICE` (default) or `LAST_PRICE` |
 | `ORDER_UNIT` | `QUANTITY` (default), `NOTIONAL` or `COST` |
 
@@ -915,112 +915,6 @@ account tp usdt 100          # ACCOUNT: close all at +100 USDT total
 account sl usdt 50           # ACCOUNT: close all at -50 USDT total
 account tp pct 5             # ACCOUNT: ...or at +5% of available equity
 ```
-
----
-
-## The TP ladder — multi-level partial take-profit
-
-`PARTIAL` closes one fixed percentage at one threshold. The **ladder** replaces
-that with an ordered list of rungs, each closing a slice as the trade runs in
-its favour. It is a superset of `PARTIAL`: when a ladder is configured it owns
-the staged exits and the single-level partial is skipped, so the two can never
-both fire on the same pass.
-
-```
-TP_LADDER=1R:25,2R:25,3R:25
-```
-
-| Rung | Trigger | Closes | Remaining |
-|---|---|---|---|
-| 1 | 1R | 25% of the **original** | 75% |
-| 2 | 2R | 25% of the **original** | 50% |
-| 3 | 3R | 25% of the **original** | 25% |
-| runner | — | — | 25%, trails |
-
-### The exchange TP backstop
-
-The rungs are closed by the bot, so without one extra piece the remainder had
-only the stop as an exchange-side exit. The backstop fixes that (default ON,
-`TP_LADDER_TP_BACKSTOP=0` or `ladder tp off` to switch off) and is the answer
-to "why did the entry only show an SL": it is a **standalone take-profit**
-(`/api/v1/futures/tpsl/place_order` with `tpQty` — the position TP/SL endpoint
-has no quantity field and would flatten the whole remainder at rung 1).
-
-- At entry it parks a TP for the full position at the **final rung target**.
-- After every fired rung it cancels the old one and re-parks the TP for the
-  *remaining* qty — so at any moment exactly ONE exchange TP covers whatever
-  is still open, even if the engine dies.
-- At the final rung it stops resting (the target is reached; the runner hands
-  to the trailing stop, the stop stays the exchange-side cover).
-
-Check the state anytime with `ladder` — it prints `tp_backstop=ON` and, when
-one is resting, its order id.
-
-### The rule that is easy to get wrong
-
-`close_pct` is a share of the **ORIGINAL** position size, never of the remaining
-size. For a 1000-unit position the rungs close 250 / 250 / 250 and leave 250.
-Compounding against the shrinking remainder would close 250 / 187.5 / 140.6 and
-leave 421.9 — a different trade. The arithmetic lives in one function
-(`ladder.level_qtys`) and is asserted directly by the tests.
-
-### Config
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `TP_LADDER` | *(empty)* | the spec; empty disables and falls back to `PARTIAL` |
-| `TP_LADDER_BREAKEVEN_AFTER` | `1` | which level moves the stop to breakeven; `0` disables |
-| `TP_LADDER_RUNNER` | `trail` | `trail` hands the remainder to the trailing stop, `close` closes it |
-| `TP_LADDER_TRIGGER_BASIS` | `R` | `R` (initial risk), `ROI` (percent), `PRICE` (absolute) |
-| `TP_LADDER_TP_BACKSTOP` | `on` | exchange-side TP for the remainder at the final rung target; `0` = off |
-
-### Rules enforced in code, not just documented
-
-- **Sum ≤ 100.** A spec whose `close_pct` values exceed 100 is rejected with the
-  total named. Nothing is silently rescaled.
-- **Increasing triggers.** Out-of-order rungs are refused rather than sorted —
-  silently reordering a spec hides a typo.
-- **Each level fires exactly once.** `fired_levels` is persisted per position, so
-  a restart cannot re-fire a level that has already closed its slice.
-- **R uses the INITIAL risk.** Once the stop moves to breakeven, `|entry - sl|`
-  collapses to ~0; measuring R against the live stop would put every remaining
-  level on the entry price and fire them all at once. `initial_risk` is captured
-  at entry and persisted.
-- **Dust is closed, not orphaned.** If the remainder after a level would fall
-  below the symbol's `minTradeVolume` (read from the trading-pairs endpoint), the
-  remainder is closed with that level instead of leaving a position the exchange
-  will refuse to flatten later.
-- **One level per pass**, in order, so a fast move cannot skip a rung.
-
-### Commands
-
-```
-/ladder                          # the spec, fired levels per position, remaining qty
-ladder set 1R:25,2R:25,3R:25     # set it (validated; a bad spec changes nothing)
-ladder off                       # disable, fall back to single-level PARTIAL
-ladder breakeven 2               # move the stop after level 2
-ladder runner close              # close the remainder instead of trailing it
-ladder basis ROI                 # read triggers as ROI percent
-```
-
-### What each level sends
-
-Two documented calls per level:
-
-1. a reduce-only `MARKET` order for the level's slice —
-   `POST /api/v1/futures/trade/place_order` with `reduceOnly: true`, and
-2. `POST /api/v1/futures/tpsl/position/modify_order` for the **remaining**
-   quantity, so the stop left on the exchange matches what is still open.
-
-The level is only marked fired once the close has been accepted, so a rejected
-order is retried on the next pass rather than skipped.
-
-**Caveat, stated plainly:** the ladder is software. It only fires while the
-manage loop is running — the exchange knows nothing about the rungs. If the
-engine is down when a level's price is reached, that level fires on the next
-pass at the then-current price, not at the trigger.
-
-Verify: `python scripts/verify_tp_ladder.py`
 
 ---
 

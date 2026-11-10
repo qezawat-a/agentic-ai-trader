@@ -50,7 +50,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("orders", "pending orders"),
     ("pnl", "account and PnL"),
     ("engine", "engine flags"),
-    ("ladder", "TP ladder state"),
+    ("tpsl", "the 4 TP/SL methods: show/set"),
     ("help", "this message"),
 ]
 
@@ -61,7 +61,7 @@ REPLY_KEYBOARD: dict[str, Any] = {
     "keyboard": [
         [{"text": "/status"}, {"text": "/positions"}],
         [{"text": "/orders"}, {"text": "/pnl"}],
-        [{"text": "/ladder"}, {"text": "/help"}],
+        [{"text": "/tpsl"}, {"text": "/help"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -228,8 +228,6 @@ def render_engine(state: dict) -> str:
         f"scan {on(e.get('scan_on'))}\n"
         f"symbols {_e(', '.join(e.get('symbols') or []))}\n"
         f"leverage {_e(e.get('leverage'))}x  tpsl {_e(e.get('tpsl_method'))}\n"
-        f"ladder runner {_e(e.get('tp_ladder_runner'))} "
-        f"basis {_e(e.get('tp_ladder_trigger_basis'))}\n"
         f"scans {_e(e.get('scans'))}  errors {_e(e.get('errors'))}\n"
         + (f"<code>{_e(e.get('last_error'))}</code>" if e.get("last_error") else "")
     )
@@ -253,7 +251,6 @@ HELP_TOPICS: dict[str, str] = {
     "positions": "open positions",
     "orders": "pending orders",
     "pnl": "account and PnL",
-    "ladder": "TP ladder state",
 }
 
 
@@ -377,7 +374,7 @@ class JRockTelegramApp:
             elif cmd == "engine":
                 await self.bot.send(chat_id, render_engine(await self.state()),
                                     markdown=True)
-            elif cmd in ("ladder", "tpsl"):
+            elif cmd == "tpsl":
                 out = await self.agent.handle(cmd)
                 await self.bot.send(chat_id, _as_html(out), markdown=True)
             else:

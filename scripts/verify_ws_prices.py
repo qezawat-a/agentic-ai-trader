@@ -34,8 +34,7 @@ class CountingClient:
 
 
 async def main() -> int:
-    s = Settings(symbols=["BTCUSDT", "ETHUSDT"], market_data_source="ws",
-                 price_max_age_sec=5.0)
+    s = Settings(symbols=["BTCUSDT", "ETHUSDT"], market_data_source="ws")
     eng = TraderEngine(s, data_dir=Path("/tmp/jrock_ws_verify"))
     eng.client = CountingClient(eng.client)
 

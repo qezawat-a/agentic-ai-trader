@@ -35,7 +35,6 @@ STATE = {
     "engine": {
         "engine_on": True, "autotrade": False, "scan_on": True,
         "symbols": ["BTCUSDT"], "leverage": 20, "tpsl_method": "POSITION",
-        "tp_ladder_runner": "trail", "tp_ladder_trigger_basis": "R",
         "scans": 12, "errors": 0, "last_error": "",
     },
     "account": {

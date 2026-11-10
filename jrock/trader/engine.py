@@ -29,15 +29,12 @@ from .client import BitunixClient, BitunixConfig
 from .errors import BitunixAPIError
 from .indicators import atr, to_candles
 from .kline_cache import REST_KLINE_MAX, KlineCache
-from .ladder import (Ladder, LadderError, decide as ladder_decide,
-                     ladder_from_settings, level_qtys, parse_ladder,
-                     remaining_after, trigger_price_for)
 from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
-from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
-                   fee_for_notional, format_price, format_qty, margin_budget,
-                   margin_required,
+from .risk import (MIN_STOP_TICKS, PairRules, Tier, TpSlSideError, clamp_sl,
+                   clamp_tp, fee_for_notional, format_price, format_qty,
+                   margin_budget, margin_required,
                    max_leverage_for_stop, max_notional_for_balance,
                    max_notional_for_margin,
                    pick_tier,
@@ -94,16 +91,6 @@ class EngineState:
     account_sl_usdt: float = 0.0
     account_tp_pct: float = 0.0
     account_sl_pct: float = 0.0
-    # --- TP ladder (multi-level partial take-profit)
-    tp_ladder: str = ""
-    tp_ladder_breakeven_after: int = 1
-    tp_ladder_runner: str = "trail"
-    tp_ladder_trigger_basis: str = "R"
-    #: Exchange TP backstop: after each fired rung (and right at entry), a
-    #: standalone exchange TP (POST /tpsl/place_order with tpQty) covers the
-    #: remaining qty at the FINAL rung target - so a dead engine no longer
-    #: leaves the remainder running to the stop alone.
-    tp_ladder_tp_backstop: bool = True
 
 
 class TraderEngine:
@@ -136,11 +123,6 @@ class TraderEngine:
             account_sl_usdt=settings.account_sl_usdt,
             account_tp_pct=settings.account_tp_pct,
             account_sl_pct=settings.account_sl_pct,
-            tp_ladder=settings.tp_ladder,
-            tp_ladder_breakeven_after=settings.tp_ladder_breakeven_after,
-            tp_ladder_runner=settings.tp_ladder_runner,
-            tp_ladder_trigger_basis=settings.tp_ladder_trigger_basis,
-            tp_ladder_tp_backstop=settings.tp_ladder_tp_backstop,
         )
         self.client = BitunixClient(BitunixConfig(
             api_key=settings.bitunix_api_key,
@@ -157,16 +139,12 @@ class TraderEngine:
         self.rules: dict[str, PairRules] = {}
         self.tiers: dict[str, list[Tier]] = {}
         self.positions: dict[str, PositionState] = {}
-        #: one-shot: "ladder off"/"ladder tp off" must sweep any exchange-side
-        #: backstop TP the next manage pass, or an unmanaged TP stays resting
-        self._pending_backstop_cancel = False
         self.last_aggregates: dict[str, Aggregate] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
         # --- market data: one cache, one optional WS feed, one REST counter
-        self.price_cache = PriceCache(max_age=settings.price_max_age_sec)
-        self.kline_cache = KlineCache(max_age_mult=settings.kline_max_age_mult,
-                                      max_candles=settings.kline_cache_max)
+        self.price_cache = PriceCache()
+        self.kline_cache = KlineCache()
         self.feed: MarketDataFeed | None = None
         self.feed_error: str = ""
         self.feed_started_at: float = 0.0
@@ -210,8 +188,6 @@ class TraderEngine:
         "scans",
         "tpsl_method", "partial_close_pct", "partial_at_roi_pct",
         "account_tp_usdt", "account_sl_usdt", "account_tp_pct", "account_sl_pct",
-        "tp_ladder", "tp_ladder_breakeven_after", "tp_ladder_runner",
-        "tp_ladder_trigger_basis", "tp_ladder_tp_backstop",
     )
 
     def _state_snapshot(self) -> dict[str, Any]:
@@ -250,8 +226,12 @@ class TraderEngine:
         raw_pos = self.store.section("positions")
         for pid, body in raw_pos.items():
             try:
-                self.positions[pid] = PositionState(**body)
-            except TypeError:
+                # Older stores may carry ladder-era fields the trimmed
+                # PositionState no longer declares - ignore unknown keys.
+                fields = {f for f in PositionState.__dataclass_fields__}
+                self.positions[pid] = PositionState(
+                    **{k: v for k, v in body.items() if k in fields})
+            except (TypeError, ValueError):
                 continue
 
         # counters
@@ -588,19 +568,6 @@ class TraderEngine:
                 "trailing_stop": st.trailing_stop,
                 "partial_done": st.partial_done,
                 "opened_ts": st.opened_ts, "peak_roi": st.peak_roi,
-                # Ladder state. `fired_levels` MUST persist: without it a
-                # restart re-fires a level that has already closed its slice,
-                # silently doubling the exit. `original_qty` must persist too,
-                # because close_pct is measured against it - restoring only the
-                # live qty would shrink every remaining level.
-                "fired_levels": st.fired_levels,
-                "original_qty": st.original_qty,
-                "initial_risk": st.initial_risk,
-                # The resting backstop id must persist too: after a restart the
-                # engine must know there is already an exchange-side TP for the
-                # remainder, else it places a SECOND one and the remainder can
-                # exit twice.
-                "backstop_tp_order_id": st.backstop_tp_order_id,
             }
         if body == self.store.section("positions"):
             return
@@ -911,7 +878,7 @@ class TraderEngine:
         max_lev_for_stop = max_leverage_for_stop(
             entry=worst_entry, mark=mark, side=side,
             maintenance_margin_rate=lev_tier.maintenance_margin_rate,
-            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+            rules=rules, min_ticks=MIN_STOP_TICKS)
 
         if max_lev_for_stop <= 0:
             msg = (f"{sym}: no stop-loss can fit at any leverage - the mark "
@@ -998,7 +965,7 @@ class TraderEngine:
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
                 breakeven_pct=self.state.breakeven_pct,
                 trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                mark=mark, min_stop_ticks=self.s.tpsl_min_stop_ticks,
+                mark=mark, min_stop_ticks=MIN_STOP_TICKS,
             )
         except TpSlSideError as e:
             self.state.errors.append(f"tpsl {sym}: {e}")
@@ -1106,7 +1073,7 @@ class TraderEngine:
                     liq_sl_distance_pct=self.state.liq_sl_distance_pct,
                     breakeven_pct=self.state.breakeven_pct,
                     trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                    mark=mark, min_stop_ticks=self.s.tpsl_min_stop_ticks,
+                    mark=mark, min_stop_ticks=MIN_STOP_TICKS,
                 )
             except TpSlSideError as e:
                 self.state.errors.append(f"tpsl {sym}: {e}")
@@ -1205,7 +1172,7 @@ class TraderEngine:
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
                 breakeven_pct=self.state.breakeven_pct,
                 trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                mark=mark, min_stop_ticks=self.s.tpsl_min_stop_ticks,
+                mark=mark, min_stop_ticks=MIN_STOP_TICKS,
             )
         except TpSlSideError as e:
             self.state.errors.append(f"tpsl {sym}: {e}")
@@ -1241,29 +1208,19 @@ class TraderEngine:
         if mark_now > 0:
             mark = mark_now
         plan.sl = clamp_sl(side=side, sl=plan.sl, entry=price, mark=mark,
-                           rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
+                           rules=rules, min_ticks=MIN_STOP_TICKS,
                            liq=plan.liq)
         plan.tp = clamp_tp(side=side, tp=plan.tp, entry=price, mark=mark,
-                           rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+                           rules=rules, min_ticks=MIN_STOP_TICKS)
 
-        # --- the ladder owns every take-profit exit.
-        #
-        # `plan_tpsl` knows nothing about the ladder: it picks a single TP at
-        # ~1.8R from the signal strength. Attaching that to the entry order
-        # creates a WHOLE-POSITION native TP (the position endpoint has no
-        # quantity field), which sits just above the first rung and flattens
-        # the entire remainder the moment it is touched - so rungs 2 and 3
-        # never fire and the ladder degenerates into one staged exit.
-        #
-        # With a ladder active the entry order therefore carries the STOP only.
-        # Each rung is closed by the manage loop's reduce-only market order,
-        # which is the only mechanism that can close a *slice*.
-        ladder_at_entry = self._ladder_or_none()
-        tp_for_order = None if ladder_at_entry is not None else plan.tp
-        if ladder_at_entry is not None:
-            plan.notes = (plan.notes + "; " if plan.notes else "") + (
-                "TP ladder active: no whole-position TP attached at entry "
-                f"({len(ladder_at_entry.levels)} rungs own the exits)")
+        # With the PARTIAL method the position carries NO whole-position TP:
+        # the position TP/SL endpoint has no quantity field and would close
+        # 100% at the trigger, flattening the remainder when only the partial
+        # slice should exit. The engine manages st.tp in memory and the manage
+        # loop places the partial TP on the standalone /tpsl/place_order
+        # endpoint (tpQty), where a quantity is actually possible.
+        tp_for_order = plan.tp \
+            if (self.state.tpsl_method or "").upper() != "PARTIAL" else None
 
         if not self._tpsl_side_ok(sym, side, price, mark, plan.sl, tp_for_order, rules):
             return {"ok": False,
@@ -1278,7 +1235,7 @@ class TraderEngine:
                 slPrice=plan.sl, slStopType=trigger_type, slOrderType="MARKET",
                 rules=rules, known_symbols=set(self.rules) or None,
                 mark_price=mark, entry_price=price,
-                min_stop_ticks=self.s.tpsl_min_stop_ticks,
+                min_stop_ticks=MIN_STOP_TICKS,
                 **await self._trade_side_fields("OPEN"),
             )
         except OrderValidationError as e:
@@ -1312,33 +1269,13 @@ class TraderEngine:
                     entry=float(p.get("avgOpenPrice") or price),
                     qty=float(p.get("qty") or qty),
                     leverage=int(p.get("leverage") or self.state.leverage),
-                    # With a ladder active the position carries NO take-profit:
-                    # every rung is a reduce-only slice closed by the manage
-                    # loop. Storing plan.tp here would let the next breakeven /
-                    # trailing `modify_position_tp_sl_order` re-attach a
-                    # whole-position TP and flatten the remainder again.
-                    sl=plan.sl, tp=(0.0 if ladder_at_entry is not None else plan.tp),
+                    # PARTIAL method: st.tp stays a plan-level number (the
+                    # partial SL/TP endpoint reads it from here) - no
+                    # whole-position TP is re-attached by the manage loop.
+                    sl=plan.sl, tp=plan.tp,
                     liq=float(p.get("liqPrice") or plan.liq),
                     opened_ts=time.time(),
-                    # The ladder measures every close_pct against THIS number.
-                    # Captured once at entry: measuring against the live
-                    # (shrinking) qty would compound the exits.
-                    original_qty=float(p.get("qty") or qty),
-                    fired_levels=0,
-                    # The R basis is measured against the INITIAL risk. Once
-                    # the stop moves to breakeven, |entry - sl| collapses and
-                    # every remaining R level would fire at the entry price.
-                    initial_risk=abs(price - plan.sl),
                 )
-                # The remainder's exchange-enforced TP backstop, parked from
-                # the second the position exists: each fired rung then shrinks
-                # its tpQty (cancel + re-place at the final rung target).
-                # st.tp stays 0 - the backstop must never leak into the
-                # whole-position TP that the modify calls would re-attach.
-                if ladder_at_entry is not None:
-                    await self._ladder_backstop(
-                        sym, pid, self.positions[pid], rules, trigger_type,
-                        mark=mark)
                 break
         self.persist_positions()
 
@@ -1355,11 +1292,7 @@ class TraderEngine:
             self._log_trade({"event": "close", "ts": time.time(),
                              "symbol": symbol, "position_id": position_id, "result": res})
             if position_id:
-                st = self.positions.pop(str(position_id), None)
-                if st is not None:
-                    # the position is flat - the resting backstop TP must go
-                    # too, so it cannot outlive the trade
-                    await self._ladder_backstop_cancel(st.symbol, st)
+                self.positions.pop(str(position_id), None)
             self.persist_positions()
             return {"ok": True, "result": res}
         except BitunixAPIError as e:
@@ -1396,294 +1329,6 @@ class TraderEngine:
                 f"partial TP/SL for {sym}: no valid tp/sl price to attach")
         return await self.client.place_tp_sl_order(**body)
 
-    # ================================================================ TP ladder
-    def ladder(self) -> Ladder:
-        """The active ladder, parsed from the persisted spec.
-
-        Parsed on every read rather than cached: the spec is a single string in
-        the store, and a stale cached parse is one more thing that can disagree
-        with what `/ladder` shows.
-        """
-        return parse_ladder(
-            self.state.tp_ladder or "",
-            basis=self.state.tp_ladder_trigger_basis or "R",
-            breakeven_after=int(self.state.tp_ladder_breakeven_after or 0),
-            runner=self.state.tp_ladder_runner or "trail",
-        )
-
-    def _ladder_or_none(self) -> Ladder | None:
-        """The active ladder, or None when it is disabled or the spec is bad.
-
-        A bad spec must not stop the manage loop: it is recorded once and the
-        engine falls back to the single-level PARTIAL method.
-        """
-        try:
-            lad = self.ladder()
-        except LadderError as e:
-            msg = f"ladder: invalid spec: {e}"
-            if msg not in self.state.errors:
-                self.state.errors.append(msg)
-            return None
-        return lad if lad.levels else None
-
-    def ladder_report(self) -> str:
-        """`/ladder` - the spec, the fired levels per position, the remainder."""
-        try:
-            lad = self.ladder()
-        except LadderError as e:
-            return (f"TP ladder: INVALID - {e}\n"
-                    f"spec={self.state.tp_ladder!r} basis="
-                    f"{self.state.tp_ladder_trigger_basis}\n"
-                    f"The ladder is disabled until the spec is fixed; the "
-                    f"single-level PARTIAL method applies.")
-        lines = ["=== TP ladder ===", lad.describe()]
-        if not lad.levels:
-            lines.append("")
-            lines.append("Set one with:  ladder set 1R:25,2R:25,3R:25")
-            lines.append("Sub-settings:  ladder breakeven 2 | ladder runner close |"
-                         " ladder tp on|off")
-            lines.append("Disable:       ladder off")
-            return "\n".join(lines)
-
-        backstop = "ON" if self.state.tp_ladder_tp_backstop else "OFF"
-        lines.append(f"spec={lad.raw!r} basis={lad.basis} "
-                     f"breakeven_after={lad.breakeven_after} "
-                     f"runner={lad.runner} tp_backstop={backstop}")
-        lines.append("")
-        lines.append("levels:")
-        for i, lv in enumerate(lad.levels, start=1):
-            lines.append(f"  {i}. trigger {lv.trigger:g} ({lad.basis}) "
-                         f"-> close {lv.close_pct:g}% of the ORIGINAL size")
-        lines.append(f"  total {lad.total_pct:g}% closed, "
-                     f"{lad.runner_pct:g}% left for the runner ({lad.runner})")
-        if self.state.tp_ladder_tp_backstop:
-            lines.append(f"  exchange TP backstop: the remainder rests at the "
-                         f"FINAL rung target ({lad.levels[-1].trigger:g} "
-                         f"{lad.basis}) via tpsl/place_order - survives an "
-                         f"engine outage.")
-
-        if not self.positions:
-            lines.append("")
-            lines.append("no tracked positions - fired levels appear here once "
-                         "a position is open")
-            return "\n".join(lines)
-
-        lines.append("")
-        lines.append("open positions:")
-        for pid, st in self.positions.items():
-            rules = self.rules.get(st.symbol)
-            prec = rules.base_precision if rules else 0
-            orig = st.original_qty or st.qty
-            qtys = level_qtys(orig, lad, prec)
-            fired = max(0, min(st.fired_levels, len(lad.levels)))
-            rem = remaining_after(orig, lad, fired, prec)
-            lines.append(f"  {st.symbol} {st.side} id={pid} "
-                         f"original={orig:g} fired={fired}/{len(lad.levels)} "
-                         f"remaining={rem:g}")
-            if st.backstop_tp_order_id:
-                lines.append(f"    backstop TP resting (order "
-                             f"{st.backstop_tp_order_id})")
-            for i, lv in enumerate(lad.levels):
-                mark = "x" if i < fired else " "
-                q = qtys[i] if i < len(qtys) else 0.0
-                trig = trigger_price_for(st.side, lv, basis=lad.basis,
-                                         entry=st.entry, sl=st.sl,
-                                         leverage=st.leverage,
-                                         initial_risk=st.initial_risk)
-                lines.append(f"    [{mark}] level {i + 1}: close {q:g} at "
-                             f"{trig:.{rules.quote_precision if rules else 6}f}")
-        return "\n".join(lines)
-
-    async def _ladder_fire(self, sym: str, pid: str, st: PositionState,
-                           rules: PairRules, decision, mark: float,
-                           trigger_type: str) -> dict | None:
-        """Close one ladder level and re-place the remainder's TP/SL.
-
-        Two documented calls per level:
-          1. a reduce-only MARKET order for the level's slice (the close), and
-          2. `modify_position_tp_sl_order` for the REMAINING quantity, so the
-             stop that is left on the exchange matches what is still open.
-
-        The level is only marked fired once the close has been accepted, so a
-        rejected order is retried on the next pass instead of being skipped.
-        """
-        qty = decision.fire_qty
-        if qty <= 0:
-            return None
-        close_side = "SELL" if st.side.upper() in ("LONG", "BUY") else "BUY"
-        try:
-            body = build_order_body(
-                symbol=sym, qty=qty, side=close_side,
-                orderType="MARKET", reduceOnly=True,
-                rules=rules, known_symbols=set(self.rules) or None,
-                **await self._trade_side_fields("CLOSE", position_id=pid),
-            )
-            await self.client.place_order(**body)
-        except (BitunixAPIError, OrderValidationError, ValueError) as e:
-            self.state.errors.append(f"ladder {sym} level "
-                                     f"{decision.fire_index + 1}: {e}")
-            return None
-
-        st.fired_levels = decision.fire_index + 1
-        st.qty = max(0.0, round(st.qty - qty, 12))
-        self._log_trade({"event": "ladder_level", "ts": time.time(),
-                         "symbol": sym, "position_id": pid,
-                         "level": decision.fire_index + 1, "qty": qty,
-                         "remaining": st.qty, "price": mark})
-
-        # --- re-place the remainder's TP/SL with the REMAINING qty. The
-        # position TP/SL endpoint has no quantity field, so the remainder is
-        # expressed by the position itself; the standalone endpoint is used
-        # when a quantity must be stated explicitly.
-        remaining = st.qty
-        if remaining > 0 and rules.min_trade_volume > 0 \
-                and remaining < rules.min_trade_volume:
-            # Dust: the exchange would reject any attempt to close this later.
-            try:
-                await self.client.flash_close_position(pid)
-                st.qty = 0.0
-                self._log_trade({"event": "ladder_dust_close", "ts": time.time(),
-                                 "symbol": sym, "position_id": pid,
-                                 "qty": remaining})
-            except BitunixAPIError as e:
-                self.state.errors.append(f"ladder dust close {sym}: {e}")
-        elif remaining > 0:
-            try:
-                await self.client.modify_position_tp_sl_order(
-                    sym, pid,
-                    tp_price=format_price(st.tp, rules) if st.tp else None,
-                    sl_price=format_price(st.sl, rules) if st.sl else None,
-                    tp_stop_type=trigger_type, sl_stop_type=trigger_type)
-            except BitunixAPIError as e:
-                self.state.errors.append(f"ladder re-place {sym}: {e}")
-
-            # Exchange TP backstop for the remainder. The slices are bot-driven;
-            # if the engine dies the remainder had only the stop left. The
-            # backstop re-parks a standalone TP (tpQty = the live remainder) at
-            # the FINAL rung target after every fired rung. Best-effort: any
-            # failure is logged and the slice close above is never undone.
-            if self.state.tp_ladder_tp_backstop:
-                await self._ladder_backstop(sym, pid, st, rules, trigger_type,
-                                            mark=mark)
-
-        # Flat after this pass (runner close, or `decide` merged a dust
-        # remainder into the level's own slice)? Then nothing remains to cover.
-        if st.qty <= 0:
-            await self._ladder_backstop_cancel(sym, st)
-
-        return {"action": "ladder_level", "symbol": sym,
-                "level": decision.fire_index + 1, "qty": qty,
-                "remaining": st.qty, "reason": decision.reason}
-
-    async def _ladder_backstop_cancel(self, sym: str, st: PositionState) -> None:
-        """Drop the resting backstop TP. Best-effort, idempotent.
-
-        The id is cleared BEFORE the call: a cancel that fails because the
-        order already triggered (or was already canceled) must not be retried
-        forever. A triggered backstop means the remainder is closing on the
-        exchange right now - there is nothing left to repair.
-        """
-        oid = (st.backstop_tp_order_id or "").strip()
-        if not oid:
-            return
-        st.backstop_tp_order_id = ""
-        try:
-            await self.client.cancel_tp_sl_order(sym, oid)
-        except Exception as e:  # noqa: BLE001 - a stale backstop is not fatal
-            self.state.errors.append(f"ladder backstop cancel {sym}: {e}")
-            return
-        self._log_tpsl({"event": "backstop_cancelled", "ts": time.time(),
-                        "symbol": sym, "position_id": st.position_id,
-                        "order_id": oid})
-
-    async def _cancel_all_backstops(self) -> None:
-        """Cancel every tracked position's backstop TP.
-
-        A single place for the sweeps: `ladder off`, `ladder tp off` and the
-        close_all fallback all must not leave an exchange-enforced TP the
-        engine no longer manages, because its tpQty and price would go stale
-        exactly when nobody is watching.
-        """
-        for st in list(self.positions.values()):
-            await self._ladder_backstop_cancel(st.symbol, st)
-
-    async def _ladder_backstop(self, sym: str, pid: str, st: PositionState,
-                               rules: PairRules, trigger_type: str,
-                               mark: float = 0.0) -> None:
-        """Keep ONE exchange-enforced take-profit alive for the remainder.
-
-        Uses the standalone `/tpsl/place_order` endpoint - the position TP/SL
-        endpoint has no quantity field and would close 100% at the first
-        touch, which is exactly the bug the ladder exists to avoid. The
-        backstop price is the FINAL rung's trigger, so the exchange exit and
-        the ladder's last staged exit agree on where the remainder should be
-        done.
-
-        Official request shape (bitunix api docs, tpsl/place_order):
-        `symbol` + `positionId` required; a TP-only order is tpPrice +
-        tpQty (+ tpStopType/tpOrderType); MARKET means the trigger fires a
-        market order - no tpOrderPrice needed.
-        """
-        if not self.state.tp_ladder_tp_backstop:
-            await self._ladder_backstop_cancel(sym, st)
-            return
-        if st.qty <= 0:
-            # flat (runner closed or dust-collected): no remainder to cover
-            await self._ladder_backstop_cancel(sym, st)
-            return
-        lad = self._ladder_or_none()
-        if lad is None or not lad.levels:
-            return
-        try:
-            target = trigger_price_for(
-                st.side, lad.levels[-1],
-                basis=self.state.tp_ladder_trigger_basis or "R",
-                entry=st.entry, sl=st.sl, leverage=st.leverage,
-                initial_risk=st.initial_risk)
-        except Exception as e:  # noqa: BLE001 - never block the slice close
-            self.state.errors.append(f"ladder backstop target {sym}: {e}")
-            return
-
-        # exactly ONE resting backstop for the remainder at a time. This runs
-        # BEFORE the placing decision: if the new one is skipped (target
-        # behind the mark), the old one must still go, else it triggers on
-        # its old tpQty.
-        await self._ladder_backstop_cancel(sym, st)
-
-        # A trigger must sit ahead of the mark on the exit side. Placing one
-        # at/behind the mark would either insta-fire (closing the remainder
-        # before the runner handoff decided it) or be rejected outright.
-        # Skipping there keeps the SL as the exchange-side cover for the rungs
-        # that ran into the target.
-        tick = 10 ** (-max(0, int(rules.quote_precision)))
-        ahead = (target > mark + tick) if st.side.upper() in ("LONG", "BUY") \
-            else (target < mark - tick)
-        if mark > 0 and not ahead:
-            self._log_tpsl({"event": "backstop_skipped", "ts": time.time(),
-                            "symbol": sym, "position_id": pid,
-                            "reason": "final rung target already reached",
-                            "target": target, "mark": mark})
-            return
-
-        order_id = ""
-        try:
-            res = await self.client.place_tp_sl_order(
-                sym, pid,
-                tp_price=format_price(target, rules),
-                tp_qty=format_qty(st.qty, rules),
-                tp_order_type="MARKET", tp_stop_type=trigger_type)
-            order_id = str((res or {}).get("orderId") or "")
-        except Exception as e:  # noqa: BLE001 - additive backstop, never fatal
-            self.state.errors.append(f"ladder backstop place {sym}: {e}")
-            return
-        st.backstop_tp_order_id = order_id
-        self._log_tpsl({"event": "backstop_placed", "ts": time.time(),
-                        "symbol": sym, "position_id": pid,
-                        "order_id": order_id,
-                        "tp": format_price(target, rules),
-                        "qty": format_qty(st.qty, rules),
-                        "remaining": st.qty})
-
     async def close_all_positions(self) -> dict:
         """Close every open position - the ACCOUNT TP/SL action.
 
@@ -1693,7 +1338,6 @@ class TraderEngine:
         """
         try:
             await self.client.close_all_position()
-            await self._cancel_all_backstops()
             self.positions.clear()
             self.persist_positions()
             return {"ok": True, "via": "close_all_position"}
@@ -1766,12 +1410,26 @@ class TraderEngine:
         """
         violations = validate_tpsl_side(
             symbol=sym, side=side, entry=entry, mark=mark, sl=sl, tp=tp,
-            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+            rules=rules, min_ticks=MIN_STOP_TICKS)
         if violations:
             self.state.errors.append(
                 "manage TP/SL refused locally: " + "; ".join(violations))
             return False
         return True
+
+    def _modify_tp_price(self, st: PositionState, rules: PairRules) -> float | None:
+        """The TP price a `modify_position_tp_sl_order` may carry.
+
+        The modify endpoint is the POSITION endpoint: it has no quantity
+        field, so any TP sent there closes the WHOLE position at the trigger.
+        Under the PARTIAL method the partial slice exits via the standalone
+        /tpsl/place_order endpoint instead - re-sending st.tp here would
+        flatten the remainder before that ever fires. PARTIAL therefore
+        modifies the STOP only.
+        """
+        if (self.state.tpsl_method or "").upper() == "PARTIAL":
+            return None
+        return format_price(st.tp, rules) if st.tp else None
 
     async def manage_positions(self) -> list[dict]:
         actions: list[dict] = []
@@ -1780,20 +1438,9 @@ class TraderEngine:
 
         for pid in list(self.positions):
             if pid not in live_ids:
-                st = self.positions.pop(pid, None)
-                if st is not None:
-                    # The position vanished (stop filled, manual close, ...).
-                    # Drop its resting backstop too: if the exchange already
-                    # voided or triggered it, the cancel fails, is logged
-                    # once, and the id is already cleared - no retries.
-                    await self._ladder_backstop_cancel(st.symbol, st)
-
-        # A one-shot sweep queued by `ladder off` / `ladder tp off`: resting
-        # exchange TPs must not survive the engine's control being switched
-        # off for them.
-        if self._pending_backstop_cancel:
-            self._pending_backstop_cancel = False
-            await self._cancel_all_backstops()
+                # The position vanished (stop filled, manual close, ...):
+                # stop tracking it. The exchange already owns the cleanup.
+                self.positions.pop(pid, None)
 
         # --- ACCOUNT TP/SL (method 4 of 4). The whole futures account is the
         # control unit: when TOTAL unrealized PnL crosses the configured
@@ -1849,18 +1496,8 @@ class TraderEngine:
                     qty=float(p.get("qty") or 0), leverage=lev,
                     sl=0.0, tp=0.0, liq=float(p.get("liqPrice") or 0),
                     opened_ts=time.time(),
-                    original_qty=float(p.get("qty") or 0),
                 )
                 self.positions[pid] = st
-            # Backfill the ladder's reference values for a position that was
-            # restored from an older store (or first seen here) without them.
-            # Without this, initial_risk stays 0, the R basis falls back to
-            # |entry - sl|, and once the stop is at breakeven every remaining
-            # level fires at the entry price.
-            if st.original_qty <= 0:
-                st.original_qty = st.qty
-            if st.initial_risk <= 0 and st.sl > 0:
-                st.initial_risk = abs(entry - st.sl)
             st.peak_roi = max(st.peak_roi, roi)
 
             # The exchange validates every TP/SL trigger against the MARK price
@@ -1885,11 +1522,10 @@ class TraderEngine:
 
             # Reconcile the size with the exchange before acting on it.
             # Something outside this list can shrink a position between two
-            # passes: the stop filling, the exchange backstop TP triggering,
-            # a manual close. Acting on a stale qty would send a rung close
-            # bigger than the position (rejected) or keep managing dust that
-            # is already gone. The exchange is the source of truth for SIZE;
-            # the engine stays the source of truth for which rungs have fired.
+            # passes: the stop filling, a manual close. Acting on a stale qty
+            # would send a close bigger than the position (rejected) or keep
+            # managing dust that is already gone. The exchange is the source
+            # of truth for SIZE.
             live_qty = abs(float(p.get("qty") or 0))
             if live_qty > 0 and st.qty > 0:
                 man_prec = max(0, int(rules.base_precision))
@@ -1900,26 +1536,16 @@ class TraderEngine:
                                     "engine_qty": st.qty,
                                     "exchange_qty": live_qty})
                     st.qty = live_qty
-                    if st.original_qty and st.qty > st.original_qty:
-                        # the position grew (top-up on another surface): the
-                        # ladder's close_pct must measure the new, larger size
-                        st.original_qty = st.qty
 
             # 1) breakeven
-            #
-            # Skipped while a ladder is active: the ladder owns the breakeven
-            # move (TP_LADDER_BREAKEVEN_AFTER), and running both would send two
-            # identical modify calls on the same pass.
-            ladder_cfg = self._ladder_or_none()
-            ladder_owns_exits = bool(ladder_cfg and ladder_cfg.levels)
-            if not ladder_owns_exits and should_breakeven(st, roi, self.state.breakeven_pct):
+            if should_breakeven(st, roi, self.state.breakeven_pct):
                 sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
-                              rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
+                              rules=rules, min_ticks=MIN_STOP_TICKS,
                               liq=st.liq or None)
                 if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
                     try:
                         await self.client.modify_position_tp_sl_order(
-                            sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
+                            sym, pid, tp_price=self._modify_tp_price(st, rules),
                             sl_price=format_price(sl, rules),
                             tp_stop_type=trigger_type, sl_stop_type=trigger_type)
                         st.breakeven_done = True
@@ -1942,12 +1568,12 @@ class TraderEngine:
                 new_stop = next_trailing_stop(st, price, atr_val)
                 if new_stop is not None:
                     sl = clamp_sl(side=side, sl=new_stop, entry=entry, mark=mark,
-                                  rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
+                                  rules=rules, min_ticks=MIN_STOP_TICKS,
                                   liq=st.liq or None)
                     if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
                         try:
                             await self.client.modify_position_tp_sl_order(
-                                sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
+                                sym, pid, tp_price=self._modify_tp_price(st, rules),
                                 sl_price=format_price(sl, rules),
                                 tp_stop_type=trigger_type, sl_stop_type=trigger_type)
                             st.trailing_stop = sl
@@ -1961,77 +1587,6 @@ class TraderEngine:
                         except BitunixAPIError as e:
                             self.state.errors.append(f"trail {sym}: {e}")
 
-            # 2b) TP LADDER - multi-level partial take-profit.
-            #
-            # Runs BEFORE mid-management so a ladder level and the single-level
-            # partial can never both fire on the same pass (that would close
-            # two slices for one trigger). When a ladder is configured it OWNS
-            # the staged exits and the partial_close branch below is skipped.
-            ladder_active = False
-            lad = self._ladder_or_none()
-            if lad is not None:
-                ladder_active = True
-                orig = st.original_qty or st.qty
-                decision = ladder_decide(
-                    ladder=lad, side=side, entry=entry, sl=st.sl,
-                    leverage=st.leverage, price=price, original_qty=orig,
-                    fired=st.fired_levels, base_precision=rules.base_precision,
-                    min_trade_volume=rules.min_trade_volume,
-                    breakeven_done=st.breakeven_done,
-                    initial_risk=st.initial_risk)
-                if decision.fire_index is not None:
-                    res = await self._ladder_fire(sym, pid, st, rules, decision,
-                                                  mark, trigger_type)
-                    if res is not None:
-                        actions.append(res)
-                        self._log_tpsl({"event": "ladder_level", "ts": time.time(),
-                                        "symbol": sym, "position_id": pid,
-                                        "level": decision.fire_index + 1,
-                                        "qty": decision.fire_qty,
-                                        "remaining": st.qty,
-                                        "reason": decision.reason})
-                # breakeven after the configured level
-                if decision.move_breakeven and not st.breakeven_done:
-                    sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
-                                  rules=rules,
-                                  min_ticks=self.s.tpsl_min_stop_ticks,
-                                  liq=st.liq or None)
-                    # The trailing branch above may already have moved the stop
-                    # to this exact price on this pass. Sending the same modify
-                    # twice is a wasted round-trip and a second chance to be
-                    # rejected, so skip it and just record the state.
-                    if abs(sl - st.sl) <= (tick_size(rules) if rules else 0) / 2:
-                        st.breakeven_done = True
-                        st.sl = sl
-                    elif self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
-                        try:
-                            await self.client.modify_position_tp_sl_order(
-                                sym, pid,
-                                tp_price=format_price(st.tp, rules) if st.tp else None,
-                                sl_price=format_price(sl, rules),
-                                tp_stop_type=trigger_type,
-                                sl_stop_type=trigger_type)
-                            st.breakeven_done = True
-                            st.sl = sl
-                            actions.append({"action": "ladder_breakeven",
-                                            "symbol": sym, "sl": sl,
-                                            "after_level": decision.fire_index + 1})
-                            self._log_tpsl({"event": "ladder_breakeven",
-                                            "ts": time.time(), "symbol": sym,
-                                            "position_id": pid, "sl": sl})
-                        except BitunixAPIError as e:
-                            self.state.errors.append(f"ladder breakeven {sym}: {e}")
-                # runner handling once the ladder is exhausted
-                if decision.runner_close and st.qty > 0:
-                    res = await self.close_position(symbol=sym, position_id=pid)
-                    actions.append({"action": "ladder_runner_close", "symbol": sym,
-                                    "result": res})
-                elif decision.runner_trail:
-                    # Hand the remainder to the trailing stop. `trailing_active`
-                    # is what the trailing branch above keys off, so arming it
-                    # here is enough - the next pass ratchets the stop.
-                    st.trailing_active = True
-
             # 3) mid-management
             agg = self.last_aggregates.get(sym)
             reversal = bool(agg and agg.actionable and agg.direction != side)
@@ -2044,7 +1599,7 @@ class TraderEngine:
                 res = await self.close_position(symbol=sym, position_id=pid)
                 actions.append({"action": "close_reversal", "symbol": sym,
                                 "roi": round(roi, 2), "result": res})
-            elif action == "partial_close" and not st.partial_done and not ladder_active:
+            elif action == "partial_close" and not st.partial_done:
                 # PARTIAL TP/SL (method 2 of 4): close a DEFINED % of the
                 # position, leaving the rest open. When the engine is set to the
                 # PARTIAL method this goes through the native standalone TP/SL
@@ -2212,9 +1767,6 @@ class TraderEngine:
             f"min_conf={s.min_confidence} tf_min_conf={s.tf_min_confidence}",
             f"scan_interval={s.scan_interval}s report_interval={s.report_interval}s "
             f"reversal={s.reversal} reversal_conf={s.reversal_confidence}",
-            f"tpsl_min_stop_ticks={self.s.tpsl_min_stop_ticks} "
-            f"({self.s.tpsl_min_stop_ticks} x tick = "
-            f"{self.s.tpsl_min_stop_ticks * 10.0 ** -6:.6f} on a 6-dp symbol) "
             f"taker_fee={self.s.taker_fee_rate * 100:g}% "
             f"margin_safety={self.s.margin_safety_pct:g}%",
             f"scans={s.scans} errors={len(s.errors)}",
@@ -2236,8 +1788,6 @@ class TraderEngine:
         # the four documented TP/SL methods
         "tpsl method", "partial close pct", "partial at roi",
         "account tp usdt", "account sl usdt", "account tp pct", "account sl pct",
-        # the TP ladder
-        "ladder",
     )
 
     def looks_like_command(self, line: str) -> bool:
@@ -2259,8 +1809,7 @@ class TraderEngine:
         if low in ("status", "pnl", "p&l", "trades_history", "tpsl_history",
                    "trades history", "tpsl history", "engine on", "engine off",
                    "start trading", "stop trading", "scan on", "scan off",
-                   "report on", "report off", "settings", "settings trade",
-                   "ladder"):
+                   "report on", "report off", "settings", "settings trade"):
             return True
         for p in self.COMMAND_PREFIXES:
             if not low.startswith(p):
@@ -2290,7 +1839,7 @@ class TraderEngine:
         p = prefix.strip()
         if not rest:
             # Bare prefixes that are complete commands on their own.
-            return p in ("status", "pnl", "p&l", "settings", "ladder",
+            return p in ("status", "pnl", "p&l", "settings",
                          "margin amount",
                          "trades_history", "tpsl_history", "trades history",
                          "tpsl history", "symbols", "positions history",
@@ -2319,10 +1868,6 @@ class TraderEngine:
             # "margin add BTCUSDT 100" - a symbol AND an amount are required.
             return bool(re.search(r"[A-Za-z]{2,10}USDT", rest, re.I)
                         and re.search(r"-?\d+(?:\.\d+)?", rest))
-        if p == "ladder":
-            return rest.split()[0].lower() in ("set", "off", "none", "disable",
-                                               "clear", "breakeven", "runner",
-                                               "basis")
         if p == "reversal":
             return rest.strip("= ").lower() in ("true", "false", "1", "0",
                                                 "on", "off", "yes", "no")
@@ -2570,9 +2115,6 @@ class TraderEngine:
                 return f"Account SL = -{s.account_sl_pct:g}% of equity (0 disables)."
             except (ValueError, IndexError):
                 return "Usage: account sl pct 3"
-        # ------------------------------------------------------- the TP ladder
-        if low == "ladder" or low.startswith("ladder "):
-            return self._ladder_command(raw)
         if low.startswith("risk"):
             try:
                 s.risk_pct = float(arg("risk").split()[-1])
@@ -2637,101 +2179,6 @@ class TraderEngine:
         verb = "Reduced" if reduce_ else "Added"
         return (f"{verb} {amt:g} USDT {'from' if reduce_ else 'to'} the {sym} "
                 f"{side or ''} position (isolated margin).").replace("  ", " ")
-
-    def _ladder_command(self, raw: str) -> str:
-        """`ladder ...` - show, set, disable, and the two sub-settings.
-
-        Every setter validates BEFORE writing, so a bad spec leaves the previous
-        ladder in place rather than disabling staged exits by accident.
-        """
-        s = self.state
-        rest = raw.strip()[len("ladder"):].strip()
-        low = rest.lower()
-
-        if not rest:
-            return self.ladder_report()
-
-        if low in ("off", "none", "disable", "clear"):
-            s.tp_ladder = ""
-            self._pending_backstop_cancel = True
-            return ("TP ladder OFF - the single-level PARTIAL method applies.\n"
-                    "Resting backstop TPs are cancelled on the next manage "
-                    "pass.\n"
-                    + self.ladder_report())
-
-        if low.startswith("breakeven"):
-            val = rest[len("breakeven"):].strip()
-            if not val:
-                return (f"Breakeven after level = {s.tp_ladder_breakeven_after} "
-                        f"(0 disables).\nUsage: ladder breakeven 2")
-            try:
-                n = int(val.split()[-1])
-            except (ValueError, IndexError):
-                return "Usage: ladder breakeven 2"
-            if n < 0:
-                return "Breakeven level must be >= 0 (0 disables the move)."
-            try:
-                lad = self.ladder()
-            except LadderError as e:
-                return f"Cannot set breakeven: the current ladder is invalid ({e})"
-            if lad.levels and n > len(lad.levels):
-                return (f"Breakeven level {n} is outside 0..{len(lad.levels)} "
-                        f"(the ladder has {len(lad.levels)} levels).")
-            s.tp_ladder_breakeven_after = n
-            return (f"Breakeven after level {n}."
-                    if n else "Breakeven move disabled.")
-
-        if low.startswith("runner"):
-            val = rest[len("runner"):].strip().lower()
-            if val not in ("trail", "close"):
-                return "Usage: ladder runner trail|close"
-            s.tp_ladder_runner = val
-            return (f"Runner = {val} "
-                    f"({'the remainder trails' if val == 'trail' else 'the remainder closes with the last level'}).")
-
-        if low.startswith("basis"):
-            val = rest[len("basis"):].strip().upper()
-            if val not in ("R", "ROI", "PRICE"):
-                return "Usage: ladder basis R|ROI|PRICE"
-            s.tp_ladder_trigger_basis = val
-            return f"Ladder trigger basis = {val}."
-
-        if low.startswith("tp"):
-            val = rest[len("tp"):].strip().lower()
-            if val in ("on", "true", "1", "yes"):
-                s.tp_ladder_tp_backstop = True
-                return ("Ladder TP backstop ON - an exchange-enforced TP "
-                        "covers the remainder at the final rung target.\n"
-                        + self.ladder_report())
-            if val in ("off", "false", "0", "no"):
-                s.tp_ladder_tp_backstop = False
-                self._pending_backstop_cancel = True
-                return ("Ladder TP backstop OFF - the remainder is covered by "
-                        "the stop and the bot's rungs only.\n"
-                        "Resting backstop TPs are cancelled on the next manage "
-                        "pass.\n"
-                        + self.ladder_report())
-            return f"Ladder TP backstop = {'ON' if s.tp_ladder_tp_backstop else 'OFF'}\n" \
-                   "Usage: ladder tp on|off"
-
-        if low.startswith("set"):
-            spec = rest[len("set"):].strip()
-            if not spec:
-                return "Usage: ladder set 1R:25,2R:25,3R:25"
-            try:
-                lad = parse_ladder(
-                    spec, basis=s.tp_ladder_trigger_basis or "R",
-                    breakeven_after=int(s.tp_ladder_breakeven_after or 0),
-                    runner=s.tp_ladder_runner or "trail")
-            except LadderError as e:
-                # Nothing is written: the previous ladder stays active.
-                return f"Invalid ladder: {e}\nNothing changed."
-            s.tp_ladder = spec
-            return "TP ladder set.\n" + self.ladder_report()
-
-        return ("Usage: ladder | ladder set 1R:25,2R:25,3R:25 | ladder off | "
-                "ladder breakeven 2 | ladder runner trail|close | "
-                "ladder basis R|ROI|PRICE | ladder tp on|off")
 
     async def status(self) -> str:
         s = self.state

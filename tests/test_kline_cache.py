@@ -84,8 +84,9 @@ class FakeClient:
 
 def make_engine(tmp_path, source="ws", max_age_mult=2.0, n_candles=200):
     s = Settings(symbols=[SYM], timeframes=["1m", "5m"],
-                 market_data_source=source, kline_max_age_mult=max_age_mult)
+                 market_data_source=source)
     eng = TraderEngine(s, data_dir=tmp_path)
+    eng.kline_cache.max_age_mult = max_age_mult
     eng.client = FakeClient(n_candles)
     return eng
 

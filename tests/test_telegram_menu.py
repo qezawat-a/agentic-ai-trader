@@ -54,7 +54,6 @@ STATE = {
     "engine": {
         "engine_on": False, "autotrade": False, "scan_on": True,
         "symbols": ["INIUSDT"], "leverage": 25, "tpsl_method": "POSITION",
-        "tp_ladder_runner": "trail", "tp_ladder_trigger_basis": "R",
         "scans": 0, "errors": 0, "last_error": "",
     },
     "account": {
@@ -82,7 +81,7 @@ def test_commands_cover_every_documented_command():
     """Every command the bot routes must be published to the Menu."""
     names = [c for c, _ in tb.COMMANDS]
     assert names == ["status", "positions", "orders", "pnl", "engine",
-                     "ladder", "help"]
+                     "tpsl", "help"]
 
 
 def test_commands_are_valid_telegram_command_names():

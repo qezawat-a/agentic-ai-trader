@@ -129,11 +129,13 @@ def test_exchange_max_market_order_volume_is_enforced():
 
 def test_config_exposes_the_margin_bounds():
     from jrock.config import Settings
+    from jrock.trader.risk import MIN_STOP_TICKS
     s = Settings()
     assert s.min_margin_usdt == 0.0
     assert s.max_margin_usdt == 0.0
     assert s.max_notional_usdt == 0.0
-    assert s.tpsl_min_stop_ticks == 3
+    # the stop gap is a fixed plumbing constant, not a knob
+    assert MIN_STOP_TICKS == 3
 
 
 # --- tier leverage cap (a second, real 20003 cause) --------------------------

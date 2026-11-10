@@ -16,6 +16,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
+#: Minimum distance a TP/SL must keep from the mark/entry price, in ticks
+#: (1 tick = 10^-quotePrecision). Fixed - not a user knob - because the only
+#: thing this guards against is rounding collapsing a stop onto the reference
+#: price, which the exchange rejects with 30029/30031. 3 ticks clears it with
+#: room while keeping the stop tight.
+MIN_STOP_TICKS = 3
+
 
 @dataclass
 class PairRules:
@@ -345,7 +352,7 @@ def liquidation_price(entry: float, leverage: int, side: str,
 
 def max_leverage_for_stop(*, entry: float, mark: float, side: str,
                           maintenance_margin_rate: float,
-                          rules: "PairRules", min_ticks: int = 3) -> int:
+                          rules: "PairRules", min_ticks: int = MIN_STOP_TICKS) -> int:
     """Highest leverage at which a valid stop-loss can still fit.
 
     A stop must sit strictly between the liquidation price and the mark-side
@@ -545,18 +552,17 @@ def tick_size(rules: "PairRules") -> float:
     return 10.0 ** (-max(0, int(rules.quote_precision)))
 
 
-def min_stop_distance(rules: "PairRules", min_ticks: int = 3) -> float:
+def min_stop_distance(rules: "PairRules", min_ticks: int = MIN_STOP_TICKS) -> float:
     """Minimum distance a TP/SL must keep from the reference price.
 
     Without this, a high-leverage stop can round onto (or past) the mark price
-    and the exchange rejects it with 30029/30031. `min_ticks` is configurable
-    via TP_SL_MIN_STOP_TICKS.
+    and the exchange rejects it with 30029/30031.
     """
     return tick_size(rules) * max(1, int(min_ticks))
 
 
 def tpsl_bounds(*, side: str, entry: float, mark: float,
-                rules: "PairRules", min_ticks: int = 3) -> tuple[float, float]:
+                rules: "PairRules", min_ticks: int = MIN_STOP_TICKS) -> tuple[float, float]:
     """(lowest allowed SL, highest allowed SL) for the direction.
 
     The exchange compares the trigger against BOTH the mark price and the
@@ -572,7 +578,7 @@ def tpsl_bounds(*, side: str, entry: float, mark: float,
 
 
 def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
-             rules: "PairRules", min_ticks: int = 3,
+             rules: "PairRules", min_ticks: int = MIN_STOP_TICKS,
              liq: float | None = None) -> float:
     """Force a stop-loss onto the correct side of BOTH entry and mark.
 
@@ -620,7 +626,7 @@ def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
 
 
 def clamp_tp(*, side: str, tp: float, entry: float, mark: float,
-             rules: "PairRules", min_ticks: int = 3) -> float:
+             rules: "PairRules", min_ticks: int = MIN_STOP_TICKS) -> float:
     """Force a take-profit onto the correct side of BOTH entry and mark.
 
     Mirror of `clamp_sl`: a LONG TP is ceiled and a SHORT TP is floored, so
@@ -644,7 +650,7 @@ def clamp_tp(*, side: str, tp: float, entry: float, mark: float,
 
 def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
                        sl: float | None, tp: float | None,
-                       rules: "PairRules", min_ticks: int = 3,
+                       rules: "PairRules", min_ticks: int = MIN_STOP_TICKS,
                        liq: float | None = None) -> list[str]:
     """Return a list of human-readable violations (empty == valid).
 

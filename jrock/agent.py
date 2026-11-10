@@ -3,7 +3,7 @@
 Commands:
   /help /models /set_model /connect_provider /add_mcp /mcp /add_skill /skill
   /add_soul /soul /think /memory /code_review /bug_fix /verify /simplify
-  /team_spawn /check_ai /check_system /autopsy /diagnose
+  /autofix /team_spawn /check_ai /check_system /autopsy /diagnose /movers
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ NATURAL LANGUAGE (no commands needed)
     "turn off autotrade"              "stop the engine"
     "close my AKEUSDT position"       "set leverage to 5x"
     "set risk to 2%"                  "why did the last order fail"
-    "what does TP_SL_MIN_STOP_TICKS do"
+    "explain TAKER_FEE_RATE"
   Anything that moves money (orders, leverage, risk, autotrade, engine) asks
   for a 'yes' before it runs. An ambiguous sentence asks a question instead of
   guessing. A sentence that is not understood still goes to the model.
@@ -79,10 +79,7 @@ AGENT COMMANDS
   /price [SYMBOL]           last / mark price for your symbols
   /funding [SYMBOL]         current funding rate (or: /funding history SYMBOL)
   /tpsl                     the 4 TP/SL methods: show/set, pending, history, cancel
-  /ladder                   TP ladder: show levels, fired levels, remaining qty
-                            (ladder set 1R:25,2R:25,3R:25 | ladder off |
-                             ladder breakeven 2 | ladder runner trail|close |
-                             ladder tp on|off)
+  /movers                   biggest 24h gainers/losers by volume (universe pick)
   /batch                    batch-order status (orderList max 5, symbol required)
   /leverage                 leverage and margin mode per symbol
   /margin                   margin mode (ISOLATION|CROSS) per symbol
@@ -93,9 +90,11 @@ AGENT COMMANDS
   /status                   engine + API + account summary
   /symbols                  tradable symbols (or search: /symbols BTC)
   /memory [query]           memory stats, or search memory
-  /code_review [path]       static review: syntax, smells, risky patterns
+  /code_review [path]       static review + LLM pass: syntax, smells, risks
   /bug_fix [path]           find + propose fixes (permission-gated)
   /verify                   run tests + import check + compile check
+  /autofix                  self-fix: errors -> LLM patches -> tests -> commit+push
+  /movers [mode] [n]        rank the universe: MOVERS|GAINERS|LOSERS|VOLUME
   /simplify [path]          report over-complex functions / duplication
   /team_spawn <n> <task>    spawn n parallel sub-agents on a task
   /check_ai                 verify LLM key/model health end-to-end
@@ -121,19 +120,9 @@ TRADER ENGINE COMMANDS
   partial close pct 50              partial at roi 50
   account tp usdt 100               account sl usdt 50
   account tp pct 5                  account sl pct 3
-  ladder set 1R:25,2R:25,3R:25      ladder off
-  ladder breakeven 2                ladder runner trail|close
-  ladder basis R|ROI|PRICE          ladder tp on|off
-  ladder
   margin add BTCUSDT 100            margin reduce BTCUSDT 50
 
 ENV SETTINGS (in .env, read at startup)
-  TP_SL_MIN_STOP_TICKS=3    minimum gap, in price ticks, that a TP/SL must keep
-                            from the mark/entry price. 1 tick = 10^-quotePrecision
-                            (AKEUSDT has quotePrecision 6, so 1 tick = 0.000001).
-                            Enforced in plan_tpsl() and clamp_sl()/clamp_tp().
-                            Higher = safer against 30029/30031 but a wider stop;
-                            lower = tighter stop, more likely to be rejected.
   TAKER_FEE_RATE=0.0006     taker fee (0.06%) reserved on top of margin when
                             sizing, so an order never asks for more than the
                             balance can pay for (20003 Insufficient balance).
@@ -171,6 +160,7 @@ AGENT_BARE: dict[str, str] = {
     "mcp": "/mcp", "skill": "/skill", "skills": "/skill",
     "check_ai": "/check_ai", "check_system": "/check_system",
     "code_review": "/code_review", "bug_fix": "/bug_fix", "simplify": "/simplify",
+    "autofix": "/autofix", "self_fix": "/autofix", "selffix": "/autofix",
     # account / market queries - first-class, never sent to the model
     "balance": "/balance", "bal": "/balance", "wallet": "/balance",
     "equity": "/balance", "funds": "/balance",
@@ -179,7 +169,7 @@ AGENT_BARE: dict[str, str] = {
     "price": "/price", "prices": "/price", "quote": "/price",
     "funding": "/funding", "funding_rate": "/funding",
     "tpsl": "/tpsl", "tp_sl": "/tpsl", "tpsl_method": "/tpsl",
-    "ladder": "/ladder", "tp_ladder": "/ladder",
+    "movers": "/movers", "gainers": "/movers", "losers": "/movers",
     "batch": "/batch", "batch_order": "/batch",
     "leverage": "/leverage", "lev": "/leverage",
     "margin": "/margin", "margin_mode": "/margin",
@@ -200,8 +190,112 @@ FREE_TEXT_WORDS: tuple[str, ...] = (
 # engine syntax ("leverage 20"); bare they are a read ("leverage").
 QUERY_COMMANDS: frozenset[str] = frozenset({
     "/leverage", "/margin", "/symbols", "/price", "/funding", "/status", "/pnl",
-    "/tpsl", "/batch", "/ladder",
+    "/tpsl", "/batch", "/movers",
 })
+
+# ---------------------------------------------------------------------- /movers
+#: Ranking modes for /movers, mirroring the reference scanner's universe rank.
+MOVERS_MODES: tuple[str, ...] = ("MOVERS", "GAINERS", "LOSERS", "VOLUME")
+MOVERS_DEFAULT_MODE = "MOVERS"
+MOVERS_DEFAULT_ROWS = 10
+MOVERS_MAX_ROWS = 50
+
+
+def rank_movers(rows: list[dict], mode: str = "MOVERS") -> list[dict]:
+    """Rank raw ticker rows for /movers.
+
+    Each row must carry Bitunix ticker fields (all strings):
+        symbol, lastPrice, open, quoteVol
+
+    The 24h change is computed from the ticket's own open - the same basis the
+    exchange's page uses - NOT from a delta of two polls, which would depend
+    on when this process happened to run.
+
+    Modes:
+      MOVERS  biggest |chg| first (either direction)
+      GAINERS only chg > 0, biggest rise first
+      LOSERS  only chg < 0, biggest fall first
+      VOLUME  deepest 24h quote turnover first
+    """
+    m = (mode or "MOVERS").upper()
+    if m not in MOVERS_MODES:
+        m = "MOVERS"
+    out = []
+    for t in rows or []:
+        try:
+            last = float(t.get("lastPrice") or t.get("last") or 0)
+            op = float(t.get("open") or 0)
+            qv = float(t.get("quoteVol") or 0)
+        except (TypeError, ValueError):
+            continue
+        if last <= 0:
+            continue
+        chg = ((last - op) / op * 100.0) if op > 0 else 0.0
+        out.append({"symbol": str(t.get("symbol") or ""), "last": last,
+                    "chg": chg, "quote_vol": qv})
+    out = [x for x in out if x["symbol"]]
+    if m == "GAINERS":
+        return [x for x in out if x["chg"] > 0]
+    if m == "LOSERS":
+        return [x for x in out if x["chg"] < 0]
+    if m == "VOLUME":
+        return sorted(out, key=lambda x: x["quote_vol"], reverse=True)
+    return sorted(out, key=lambda x: abs(x["chg"]), reverse=True)
+
+
+# -------------------------------------------------------------------- /autofix
+#: Evidence caps, so one poisoned pytest run cannot blow the prompt budget.
+ENGINE_ERROR_EVIDENCE_MAX = 15
+PYTEST_EVIDENCE_CHARS = 4000
+FILE_LIST_MAX = 40
+LLM_REVIEW_MAX_FINDINGS = 25
+LLM_REVIEW_MAX_FILE_CHARS = 6000
+LLM_REVIEW_SOURCE_CHARS = 12000
+
+AUTOFIX_SYSTEM = (
+    "You are the self-fix component of a trading bot (a Bitunix futures "
+    "engine in Python). You receive real evidence: live engine errors and a "
+    "pytest failure tail, plus the repo's file list.\n"
+    "Rules:\n"
+    "- Propose the MINIMAL patch set that plausibly fixes the failures. No "
+    "refactors, no renames, no style churn.\n"
+    "- Touch only files in the given list. Keep everything inside the repo.\n"
+    "- Every patch is an EXACT anchor replacement. Output ONLY blocks of the "
+    "strict form:\n\n"
+    "### CHANGE\n"
+    "FILE: <relative/path.py>\n"
+    "OLD: <<<OLD\n"
+    "<the exact source lines to replace, verbatim, occurring exactly once>\n"
+    ">>>OLD\n"
+    "NEW: <<<NEW\n"
+    "<the corrected source lines>\n"
+    ">>>NEW\n\n"
+    "- If a change also needs a test, propose the smallest test update in its "
+    "own ### CHANGE block (under tests/).\n"
+    "- If the evidence does not point to a clear cause, say 'UNCLEAR:' and "
+    "name what extra evidence is needed - propose nothing. A wrong patch is "
+    "far worse than no patch."
+)
+
+AUTOFIX_USER_TEMPLATE = """Repo (source files to consider):
+{file_list}
+
+Evidence:
+{evidence}
+
+Reply with ### CHANGE blocks only. If nothing is safely fixable from the
+evidence above, reply with exactly one line starting 'UNCLEAR:'."""
+
+LLM_REVIEW_SYSTEM = (
+    "You are doing a focused code review of a Python trading bot. You get "
+    "static-analysis findings plus the source of the flagged files. Name only "
+    "CONCRETE, defensible defects connected to the given sources: logic bugs, "
+    "race/ordering mistakes, wrong API usage, silent error swallowing, "
+    "unit/precision mistakes in money math, missing state transitions. One "
+    "line per finding as 'file:line (approx): issue - why it matters'. Max "
+    "10 findings. If you find nothing new, reply exactly 'no further "
+    "findings'. Never invent file paths not given to you."
+)
 
 # Natural-language intents we handle deterministically instead of guessing.
 FREE_MODEL_INTENT = re.compile(
@@ -326,8 +420,7 @@ class JRockAgent:
         self.tools = Tools(self.perms)
         self.store = Store(data_dir=self.s.data_dir)
         self._register_secrets()
-        self.memory = MemoryStore(self.s.data_dir / "memory.jsonl",
-                                  max_items=getattr(self.s, "max_memory_items", 5000))
+        self.memory = MemoryStore(self.s.data_dir / "memory.jsonl")
         # Precedence: persisted store > .env > built-in default. Applied before
         # the engine is built so every consumer sees the effective value.
         self._apply_stored_settings()
@@ -590,8 +683,8 @@ class JRockAgent:
             return await self.cmd_funding(rest)
         if cmd == "/tpsl":
             return await self.cmd_tpsl(rest)
-        if cmd == "/ladder":
-            return self.engine.ladder_report() if not rest else await self.engine.command(f"ladder {rest}")
+        if cmd == "/movers":
+            return await self.cmd_movers(rest)
         if cmd == "/batch":
             return await self.cmd_batch(rest)
         if cmd == "/leverage":
@@ -609,11 +702,13 @@ class JRockAgent:
         if cmd == "/memory":
             return self.cmd_memory(rest)
         if cmd == "/code_review":
-            return self.cmd_code_review(rest)
+            return await self.cmd_code_review(rest)
         if cmd == "/bug_fix":
             return self.cmd_bug_fix(rest)
         if cmd == "/verify":
             return self.cmd_verify()
+        if cmd == "/autofix":
+            return await self.cmd_autofix(rest)
         if cmd == "/simplify":
             return self.cmd_simplify(rest)
         if cmd == "/team_spawn":
@@ -784,26 +879,9 @@ class JRockAgent:
         return hint_for(int(m.group(1)))
 
     def _explain_setting(self, name: str) -> str:
-        """Explain a setting defined in THIS repo, from the repo itself.
-
-        The engine once answered "I have no access to the engine" for
-        TP_SL_MIN_STOP_TICKS, which is defined in jrock/config.py. That is
-        wrong: the value is right here.
-        """
+        """Explain a setting defined in THIS repo, from the repo itself."""
         name = name.upper()
         s = self.s
-        if name == "TP_SL_MIN_STOP_TICKS":
-            ticks = s.tpsl_min_stop_ticks
-            return (
-                f"TP_SL_MIN_STOP_TICKS = {ticks}\n"
-                f"  Defined in jrock/config.py, enforced in tpsl.plan_tpsl() and\n"
-                f"  risk.clamp_sl()/clamp_tp().\n"
-                f"  It is the minimum gap, in PRICE TICKS, that a TP/SL must keep\n"
-                f"  from the reference (mark/entry) price. 1 tick = 10^-quotePrecision.\n"
-                f"  AKEUSDT has quotePrecision 6, so 1 tick = 0.000001.\n"
-                f"  Higher = safer against 30029/30031 but a wider stop.\n"
-                f"  Lower = tighter stop, more likely to be rejected by the exchange.\n"
-                f"  Set it in .env, e.g. TP_SL_MIN_STOP_TICKS=3")
         if name == "TAKER_FEE_RATE":
             return (
                 f"TAKER_FEE_RATE = {s.taker_fee_rate}\n"
@@ -1909,7 +1987,7 @@ class JRockAgent:
         return [p for p in base.rglob("*.py")
                 if "__pycache__" not in str(p) and ".git" not in str(p)]
 
-    def cmd_code_review(self, path: str) -> str:
+    async def cmd_code_review(self, path: str) -> str:
         files = self._py_files(path)
         issues: list[str] = []
         for f in files:
@@ -1953,8 +2031,47 @@ class JRockAgent:
                         continue
                     issues.append(f"{rel}:{ln}: {msg}")
         if not issues:
-            return f"code review: {len(files)} files, no issues found"
-        return f"code review: {len(files)} files, {len(issues)} findings\n" + "\n".join(issues[:120])
+            header = f"code review: {len(files)} files, no issues found"
+        else:
+            header = (f"code review: {len(files)} files, "
+                      f"{len(issues)} findings\n" + "\n".join(issues[:120]))
+        llm = await self._llm_code_review(files, issues)
+        if llm:
+            return f"{header}\n\nLLM review:\n{llm}"
+        return header
+
+    async def _llm_code_review(self, files: list[Path], issues: list[str]) -> str:
+        """A second pair of eyes: the model reviews the SOURCES that the
+        static scan flagged. Capped and read-only - findings are text for a
+        human, never auto-applied (patches come from /autofix's gated loop)."""
+        if not issues:
+            return ""
+        flag_rel = sorted({ln.split(":", 1)[0] for ln in issues[:LLM_REVIEW_MAX_FINDINGS]
+                           if ":" in ln})
+        snippets: list[str] = []
+        used = 0
+        for rel in flag_rel:
+            f = ROOT / rel
+            if not f.is_file():
+                continue
+            try:
+                src = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            src = src[:LLM_REVIEW_MAX_FILE_CHARS]
+            if used + len(src) > LLM_REVIEW_SOURCE_CHARS:
+                break
+            used += len(src)
+            snippets.append(f"=== {rel} ===\n{src}")
+        if not snippets:
+            return ""
+        out = await self._complete_raw(
+            LLM_REVIEW_SYSTEM,
+            "Static findings:\n" + "\n".join(issues[:LLM_REVIEW_MAX_FINDINGS])
+            + "\n\nSources under review:\n" + "\n".join(snippets))
+        if not out or out.lower().strip() == "no further findings":
+            return ""
+        return out
 
     def cmd_bug_fix(self, path: str) -> str:
         review = self.cmd_code_review(path)
@@ -1985,6 +2102,271 @@ class JRockAgent:
         r = self.tools.internal(f"{sys.executable} -m pytest -q tests", timeout=300)
         out.append(f"pytest: {'PASS' if r.ok else 'FAIL'}\n{r.output[-3000:]}")
         return "\n\n".join(out)
+
+    # ============================================================== movers
+    async def cmd_movers(self, rest: str = "") -> str:
+        """.movers RANK THE UNIVERSE from the live tickers endpoint.
+
+        `/movers [MOVERS|GAINERS|LOSERS|VOLUME] [n]`
+
+        The 24h change is computed from the ticker's own `open` field - the
+        same basis the exchange's market page uses:
+            chg% = (lastPrice - open) / open * 100
+
+        Rankings (mirrors the reference scanner):
+          MOVERS  biggest move in EITHER direction (default)
+          GAINERS only chg > 0, biggest rise first
+          LOSERS  only chg < 0, biggest fall first  (the short side of the idea)
+          VOLUME  deepest 24h quote turnover first
+
+        The last line is a ready `symbols ...` command so the ranking can
+        become the scan universe in one paste. Public data - no API keys.
+        """
+        from .trader.errors import BitunixAPIError
+        mode, n = MOVERS_DEFAULT_MODE, MOVERS_DEFAULT_ROWS
+        for tok in rest.replace(",", " ").split():
+            t = tok.upper()
+            if t in MOVERS_MODES:
+                mode = t
+            elif t.isdigit() and int(t) > 0:
+                n = min(int(t), MOVERS_MAX_ROWS)
+        try:
+            data = await self.engine.client.get_tickers()
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"movers request failed: {type(e).__name__}: {e}"
+        rows = data if isinstance(data, list) else [data] if data else []
+        if not rows:
+            return "no ticker data"
+        ranked = rank_movers(rows, mode)
+        if not ranked:
+            return (f"{mode}: no qualifying pair (gainers need a pair that is "
+                    f"up, losers need one that is down).")
+        lines = [f"=== movers ({mode}, 24h) ==="]
+        for r_ in ranked[:n]:
+            vol = r_["quote_vol"]
+            vol_str = f"{vol:,.0f}" if vol >= 1000 else f"{vol:g}"
+            lines.append(f"{r_['symbol']:<14} {r_['last']:>14.8g} "
+                         f"chg={r_['chg']:+.2f}%  vol24h={vol_str}")
+        syms = ",".join(r_["symbol"] for r_ in ranked[:n])
+        lines.append(f"")
+
+        lines.append(f"universe ({mode} top {min(n, len(ranked))}): "
+                     f"symbols {syms}")
+        return "\n".join(lines)
+
+    # ============================================================== self-fix
+    async def _complete_raw(self, system: str, user: str) -> str:
+        """One-shot model call, OUTSIDE the chat history.
+
+        The /autofix and LLM-review prompts are diagnostic payloads (test
+        tails, findings lists). They must not pollute the conversation the
+        trader is having, so they are posted directly with the configured
+        provider. Returns "" on any failure after a single retry at a smaller
+        budget - a self-fix must degrade to "asked the model, no answer",
+        never to a hallucinated patch.
+        """
+        if not self.s.api_key:
+            return ""
+        model = self.model or self.s.model
+        if not model:
+            return ""
+        payload = {
+            "model": model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "max_tokens": self.BASE_MAX_TOKENS,
+            "temperature": 0.1,
+        }
+        url = f"{self.s.base_url.rstrip('/')}/chat/completions"
+        status, body, parsed = await self._post_chat(url, payload)
+        if status != 200:
+            log.warning("self-fix model call failed: HTTP %s %s", status, body[:200])
+            return ""
+        verdict = diagnose_empty(parsed, status)
+        if verdict.is_empty:
+            log.warning("self-fix model call produced an empty response (%s)",
+                        verdict.cause)
+            return ""
+        return str(parsed["choices"][0]["message"]["content"] or "").strip()
+
+    def _collect_bug_evidence(self) -> str:
+        """Everything a patch author needs: engine errors + the pytest tail.
+
+        Both sources are real observations, not guesses: the engine already
+        recorded these errors live, and pytest just failed on the current
+        tree. Capped so one poisoned run cannot blow the prompt budget.
+        """
+        lines: list[str] = []
+        errors = list(self.engine.state.errors)
+        if errors:
+            lines.append("## live engine errors (state.errors, most recent last)")
+            for e in errors[-ENGINE_ERROR_EVIDENCE_MAX:]:
+                lines.append(f"- {e}")
+        r = self.tools.internal(f"{sys.executable} -m pytest -q tests", timeout=900)
+        tail = r.output[-PYTEST_EVIDENCE_CHARS:]
+        status = "PASS" if r.ok else "FAIL"
+        lines.append(f"## pytest tests -q  ({status})")
+        lines.append("```")
+        lines.append(tail)
+        lines.append("```")
+        return "\n".join(lines)
+
+    def _apply_change_blocks(self, text: str) -> list[dict]:
+        """Apply LLM-proposed `### CHANGE` patches through the permission gate.
+
+        Format (exact anchors, no line numbers - they slide):
+
+            ### CHANGE
+            FILE: <relative path>
+            OLD: <<<OLD
+            <exact source to replace - must occur exactly once>
+            >>>OLD
+            NEW: <<<NEW
+            <replacement source>
+            >>>NEW
+
+        Every patch goes through tools.patch, which diffs, audits, and honours
+        AUTO_ACCEPT_EDIT: edits are either applied, queued for approval, or
+        dropped - never silent.
+
+        Scope guard: a FILE: path that resolves outside ROOT is rejected
+        before any content is read, so a prompt-injected model cannot point a
+        patch outside the project (and relative paths like `../..` cannot
+        walk out).
+        """
+        applied: list[dict] = []
+        for chunk in re.split(r"(?m)^### CHANGE\s*$", text):
+            if not chunk.strip():
+                continue
+            fmatch = re.search(r"(?m)^FILE:\s*(\S+)\s*$", chunk)
+            if not fmatch:
+                continue
+            path = fmatch.group(1).replace("\\", "/")
+            target = Path(path) if Path(path).is_absolute() else ROOT / path
+            try:
+                target.resolve().relative_to(ROOT.resolve())
+            except ValueError:
+                applied.append({"file": path, "status": "rejected: outside repo"})
+                continue
+            except OSError as e:
+                # resolve() can fail on exotic filesystems; say so instead of
+                # looking like a scope rejection that never happened.
+                applied.append({"file": path, "status": f"rejected: fs error ({e})"})
+                continue
+            old_m = re.search(r"OLD:\s*<<<OLD\n(.*?)\n>>>OLD", chunk, re.S)
+            new_m = re.search(r"NEW:\s*<<<NEW\n(.*?)\n>>>NEW", chunk, re.S)
+            if not old_m or not new_m:
+                applied.append({"file": path, "status": "malformed"})
+                continue
+            r = self.tools.patch(path, old_m.group(1), new_m.group(1),
+                                 reason="autofix: LLM-proposed patch")
+            if r.ok:
+                applied.append({"file": path, "status": "applied"})
+            elif r.meta and r.meta.get("pending"):
+                applied.append({"file": path, "status": "PENDING_APPROVAL"})
+            else:
+                applied.append({"file": path, "status": f"failed: {r.output[:120]}"})
+        return applied
+
+    async def cmd_autofix(self, rest: str = "") -> str:
+        """/autofix - collect bugs, ask the model for patches, test, push.
+
+        The loop, and the two STOP points that keep it honest:
+          1. evidence  - engine errors + `pytest -q` tail (real output)
+          2. propose   - one LLM pass, patches in strict ### CHANGE format
+          3. apply     - permission-gated string replacement (audited)
+          4. test      - if pytest still FAILs: NOTHING is committed
+          5. on PASS   - commit + push once, with the failing test named
+
+        Scope guard: every FILE: path is forced under the repo root, so a
+        prompt-injected model cannot point a patch outside the project.
+        """
+        path = rest.split()[0] if rest.split() else "jrock"
+        report = [f"=== autofix (scope: {path}) ==="]
+
+        evidence = self._collect_bug_evidence()
+        pytest_passed = "pytest tests -q  (PASS)" in evidence
+        if pytest_passed and "live engine errors" not in evidence:
+            report.append("pytest: PASS and no engine errors - nothing to fix.")
+            return "\n".join(report)
+
+        report.append("evidence collected (engine errors + pytest tail)")
+        src_files = [str(f.relative_to(ROOT)) for f in self._py_files(path)]
+
+        proposal = await self._complete_raw(
+            AUTOFIX_SYSTEM,
+            AUTOFIX_USER_TEMPLATE.format(
+                file_list=", ".join(src_files[:FILE_LIST_MAX]),
+                evidence=evidence))
+        if not proposal:
+            report.append(
+                "model patch step unavailable (no API key / model set, or the "
+                "call failed). Collected evidence only - run without a model "
+                "to see it, or fix API_KEY/BASE_URL/MODEL in .env and retry.")
+            return "\n".join(report)
+
+        applied = self._apply_change_blocks(proposal)
+        if not applied:
+            report.append("the model proposed no parsable ### CHANGE blocks - "
+                          "nothing was modified")
+            return "\n".join(report)
+
+        statuses = []
+        for a in applied:
+            statuses.append(f"  patch {a['file']}: {a['status']}")
+        if not any(a["status"] == "applied" for a in applied):
+            report.append("no patch was applied (statuses below) - nothing "
+                          "was modified, nothing to test")
+            report.extend(statuses)
+            return "\n".join(report)
+
+        report.append("applied proposed patches through the permission gate")
+        report.extend(statuses)
+
+        ok_now = self.tools.internal(f"{sys.executable} -m pytest -q tests", timeout=900)
+        report.append(f"retest: {'PASS' if ok_now.ok else 'FAIL'}")
+        if not ok_now.ok:
+            report.append(f"tail:\n{ok_now.output[-PYTEST_EVIDENCE_CHARS:]}")
+            report.append("tests still FAIL: NOTHING was committed. The new "
+                          "failures are fresh evidence: run /autofix again, or "
+                          "revert with: git checkout -- .")
+            self._remember_autofix_outcome(applied, ok=False, pytest_tail="")
+            return "\n".join(report)
+
+        self._remember_autofix_outcome(applied, ok=True, pytest_tail="")
+        message = "autofix: self-fix pipeline patches"
+        for a in applied:
+            if a["status"] == "applied":
+                message += f"; {a['file']}"
+        cr = self.tools.internal("git add -A", timeout=60)
+        if not cr.ok:
+            report.append(f"git add failed: {cr.output[:200]} - not committed")
+            return "\n".join(report)
+        cr = self.tools.internal(f'git commit -m {json.dumps(message)}', timeout=60)
+        if not cr.ok:
+            report.append(f"git commit failed: {cr.output[:200]}")
+            return "\n".join(report)
+        cr = self.tools.internal("git push origin HEAD", timeout=180)
+        if not cr.ok:
+            report.append("PUSH FAILED (commit kept locally): "
+                          f"{cr.output[:300]}")
+        else:
+            branch = self.tools.internal("git rev-parse --abbrev-ref HEAD",
+                                         timeout=15)
+            report.append(f"tests PASS -> committed and pushed "
+                          f"({branch.output.strip() or 'HEAD'}).")
+        return "\n".join(report)
+
+    def _remember_autofix_outcome(self, applied: list[dict], ok: bool,
+                                  pytest_tail: str = "") -> None:
+        """One memory episode per run, so the loop is inspectable in /memory."""
+        self.memory.episode(
+            "autofix",
+            ", ".join(a["file"] for a in applied)[:120],
+            ("pass" if ok else "fail") + (f" tail: {pytest_tail[:120]}" if pytest_tail else ""),
+            ok=ok)
 
     def cmd_simplify(self, path: str) -> str:
         files = self._py_files(path)
@@ -2109,11 +2491,11 @@ class JRockAgent:
             (r"30024|30025|liq price", "SL is on the wrong side of the liquidation price: "
                                        "recompute with sl_from_liq_distance()."),
             (r"30029|30031|SL price must be (less|greater) than mark",
-             "SL is on the wrong side of the MARK price. Every TP/SL path now "
+             "SL is on the wrong side of the MARK price. Every TP/SL path "
              "fetches the mark price fresh and clamps the stop through "
-             "risk.clamp_sl() to clear it by TP_SL_MIN_STOP_TICKS ticks. If you "
-             "still see this, the mark moved between the last read and the "
-             "request landing - retry, or raise TP_SL_MIN_STOP_TICKS."),
+             "risk.clamp_sl() to clear it by a few ticks. If you still see "
+             "this, the mark moved between the last read and the request "
+             "landing - retry, or widen the stop distance."),
             (r"30020|30021|30027|30033|TP price must be",
              "TP is on the wrong side of the mark price: widen the TP distance."),
             (r"30005|trigger price", "TP/SL trigger too close to price: widen the distance."),

@@ -160,27 +160,6 @@ class PositionState:
     partial_done: bool = False
     opened_ts: float = 0.0
     peak_roi: float = 0.0
-    #: TP-ladder rungs already filled for this position. Persisted, so a
-    #: restart cannot re-fire a level that has already closed its slice - the
-    #: single most damaging ladder bug, because it silently doubles the exit.
-    fired_levels: int = 0
-    #: The position size the ladder percentages are measured against. Captured
-    #: at entry and never recomputed: close_pct is a share of the ORIGINAL size,
-    #: so measuring against the live (shrinking) qty would compound the exits.
-    original_qty: float = 0.0
-    #: The INITIAL risk per unit, |entry - initial stop|, captured at entry.
-    #: The ladder's R basis must use this, not the live `sl`: once the stop
-    #: moves to breakeven, |entry - sl| collapses to ~0 and every remaining R
-    #: level would land on the entry price and fire immediately.
-    initial_risk: float = 0.0
-    #: Exchange TP backstop: the `orderId` of the standalone take-profit
-    #: (POST /tpsl/place_order with tpQty) parked at the FINAL rung target for
-    #: whatever quantity remains open. The ladder's slices are closed by this
-    #: engine, so if the engine dies mid-way the remainder had only the stop
-    #: left - this backstop gives it an exchange-enforced exit too. Each fired
-    #: rung cancels and re-places it so tpQty always matches the live qty.
-    #: Empty string = no backstop resting order.
-    backstop_tp_order_id: str = ""
 
 
 def should_breakeven(state: PositionState, roi: float, breakeven_pct: float) -> bool:

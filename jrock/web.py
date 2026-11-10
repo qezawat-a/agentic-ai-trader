@@ -92,10 +92,6 @@ SETTING_COMMANDS: dict[str, str] = {
     "tpsl_method": "tpsl method {v}",
     "symbols": "symbols {v}",
     "timeframes": "timeframes {v}",
-    "tp_ladder": "ladder set {v}",
-    "tp_ladder_breakeven_after": "ladder breakeven {v}",
-    "tp_ladder_runner": "ladder runner {v}",
-    "tp_ladder_trigger_basis": "ladder basis {v}",
 }
 
 #: Commands that need a symbol as well as a value, so the dashboard can offer
@@ -112,7 +108,6 @@ READOUT_COMMANDS: dict[str, str] = {
     "status": "status",
     "settings": "settings trade",
     "margin_amount": "margin amount",
-    "ladder": "ladder",
     "tpsl": "tpsl",
     "pnl": "pnl",
     "trades_history": "trades_history",
@@ -357,15 +352,7 @@ function render(s) {
     "<div class='row'><label>position mode</label><select id='set_position_mode'>" +
     ["ONE_WAY", "HEDGE"].map(m =>
       "<option" + (m === e.position_mode ? " selected" : "") + ">" + m + "</option>").join("") +
-    "</select><button data-set='position_mode'>set</button></div>" +
-    "<div class='row'><label>ladder runner</label><select id='set_tp_ladder_runner'>" +
-    ["trail", "close"].map(m =>
-      "<option" + (m === e.tp_ladder_runner ? " selected" : "") + ">" + m + "</option>").join("") +
-    "</select><button data-set='tp_ladder_runner'>set</button></div>" +
-    "<div class='row'><label>ladder basis</label><select id='set_tp_ladder_trigger_basis'>" +
-    ["R", "ROI", "PRICE"].map(m =>
-      "<option" + (m === e.tp_ladder_trigger_basis ? " selected" : "") + ">" + m + "</option>").join("") +
-    "</select><button data-set='tp_ladder_trigger_basis'>set</button></div>";
+    "</select><button data-set='position_mode'>set</button></div>";
 
   st.querySelectorAll("button[data-set]").forEach(b => {
     b.addEventListener("click", () => {
@@ -616,8 +603,6 @@ def _setting_fields(agent: JRockAgent) -> list[dict]:
         ("account_sl_pct", "account SL (% equity)", s.account_sl_pct),
         ("symbols", "symbols", ",".join(s.symbols)),
         ("timeframes", "timeframes", ",".join(s.timeframes)),
-        ("tp_ladder", "TP ladder spec", s.tp_ladder),
-        ("tp_ladder_breakeven_after", "ladder breakeven after", s.tp_ladder_breakeven_after),
     ]
     return [{"key": k, "label": lab, "value": v} for k, lab, v in fields]
 
@@ -746,8 +731,6 @@ async def build_state(agent: JRockAgent) -> dict:
             "margin_mode": s.margin_mode,
             "position_mode": s.position_mode,
             "tpsl_method": s.tpsl_method,
-            "tp_ladder_runner": s.tp_ladder_runner,
-            "tp_ladder_trigger_basis": s.tp_ladder_trigger_basis,
             "scans": s.scans,
             "last_scan": (time.strftime("%H:%M:%S", time.localtime(s.last_scan_ts))
                           if s.last_scan_ts else ""),

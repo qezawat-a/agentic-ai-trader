@@ -38,7 +38,6 @@ STATE = {
     "engine": {
         "engine_on": False, "autotrade": False, "scan_on": True,
         "symbols": ["INIUSDT"], "leverage": 25, "tpsl_method": "POSITION",
-        "tp_ladder_runner": "trail", "tp_ladder_trigger_basis": "R",
         "scans": 0, "errors": 0, "last_error": "",
     },
     "account": {

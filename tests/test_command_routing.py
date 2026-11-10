@@ -65,7 +65,6 @@ NOT_COMMANDS = [
     "min confidence is too low",
     "trailing trigger is too tight",
     "breakeven threshold seems high",
-    "ladder is not what I expected",
     "close position please",          # a request, not the `close position X` cmd
     "symbols please",
     "leverage please",
@@ -84,7 +83,6 @@ REAL_COMMANDS = [
     "pnl",
     "settings",
     "settings trade",
-    "ladder",
     "leverage 10",
     "leverage to 20",
     "risk 1.5",
@@ -157,7 +155,6 @@ UNDERSTOOD = [
     ("whats the price of btc", "price"),
     ("what do you think about ETHUSDT", "price"),
     ("whats the funding on BTCUSDT", "funding"),
-    ("show me the ladder", "ladder_read"),
     ("what is my leverage", "leverage_read"),
     ("show me my risk setting", "settings"),
     ("explain taker fee rate", "explain_setting"),

@@ -45,9 +45,9 @@ class FakeClient:
 
 
 def make_engine(tmp_path, source="ws", max_age=5.0, price=100.0):
-    s = Settings(symbols=["BTCUSDT"], market_data_source=source,
-                 price_max_age_sec=max_age)
+    s = Settings(symbols=["BTCUSDT"], market_data_source=source)
     eng = TraderEngine(s, data_dir=tmp_path)
+    eng.price_cache.max_age = max_age
     eng.client = FakeClient(price)
     return eng
 

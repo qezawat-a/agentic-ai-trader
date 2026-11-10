@@ -141,18 +141,6 @@ class Settings:
     # private (position/order/balance) login handshake has never been verified
     # against the real server, so we do not silently switch the engine onto it.
     market_data_source: str = "rest"
-    #: A cached WS price older than this is never used for a trading decision.
-    price_max_age_sec: float = 5.0
-    #: A candle set is stale when the newest candle's open time is older than
-    #: `kline_max_age_mult * interval`. A 1m candle is legitimately 60s old, so
-    #: the price rule (flat seconds) does not apply to candles.
-    kline_max_age_mult: float = 2.0
-    #: Hard cap on candles held per (symbol, interval). Bounded, never unbounded.
-    kline_cache_max: int = 500
-    #: Minimum distance a TP/SL must keep from the mark/entry price, in ticks
-    #: (1 tick = 10^-quotePrecision). Prevents rounding from collapsing a stop
-    #: onto the mark price, which the exchange rejects with 30029/30031.
-    tpsl_min_stop_ticks: int = 3
     #: When the configured leverage leaves no room for a stop-loss between the
     #: liquidation price and the mark price, clamp the leverage for that order
     #: to the highest value that still fits instead of refusing the trade.
@@ -215,9 +203,6 @@ class Settings:
     #: Extra headroom reserved when sizing, as a percent of available balance.
     #: Covers the price move between sizing and the request landing. 0 disables.
     margin_safety_pct: float = 2.0
-    #: Hard cap on learned-memory entries. The store evicts by weight once the
-    #: cap is reached, so the file cannot grow without bound.
-    max_memory_items: int = 5000
 
     # ---------------------------------------------------------------- TP/SL methods
     #: Which of the four documented Bitunix TP/SL methods the engine uses.
@@ -243,32 +228,6 @@ class Settings:
     #: 0 disables. Useful when the account size changes.
     account_tp_pct: float = 0.0
     account_sl_pct: float = 0.0
-
-    # ---------------------------------------------------------------- TP ladder
-    #: Multi-level partial take-profit. An ordered list of rungs, each closing a
-    #: slice of the ORIGINAL position as the trade runs in its favour.
-    #:   "1R:25,2R:25,3R:25"  - close 25% at 1R, 25% at 2R, 25% at 3R
-    #:   "50:25,100:25"       - ROI percent (with TP_LADDER_TRIGGER_BASIS=ROI)
-    #:   "0.0055:25"          - an absolute price
-    #: Empty = disabled, which falls back to the single-level PARTIAL method.
-    #: close_pct is always a share of the ORIGINAL size, never of the remainder.
-    tp_ladder: str = ""
-    #: Which level moves the stop to breakeven. 1 = after the first level fills.
-    #: 0 disables the breakeven move.
-    tp_ladder_breakeven_after: int = 1
-    #: What to do with whatever is left after the last level:
-    #:   trail - hand it to the trailing stop (default)
-    #:   close - close it with the last level
-    tp_ladder_runner: str = "trail"
-    #: How a level's trigger is read: R (multiple of the initial risk), ROI
-    #: (percent) or PRICE (absolute).
-    tp_ladder_trigger_basis: str = "R"
-    #: Exchange TP backstop. After every fired rung (and right at entry) a
-    #: standalone exchange TP (tpsl/place_order with tpQty) covers the
-    #: remaining qty at the FINAL rung target - if the engine dies, the
-    #: remainder still exits at a take-profit. TP_LADDER_TP_BACKSTOP=0 turns
-    #: it off.
-    tp_ladder_tp_backstop: bool = True
 
     @property
     def data_dir(self) -> Path:
@@ -316,10 +275,6 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         report_interval=_i("TRADE_REPORT_INTERVAL", 30),
         thinking_level=level_from_env(),
         market_data_source=_market_data_source(),
-        price_max_age_sec=_f("PRICE_MAX_AGE_SEC", 5.0),
-        kline_max_age_mult=_f("KLINE_MAX_AGE_SEC", 2.0),
-        kline_cache_max=_i("KLINE_CACHE_MAX", 500),
-        tpsl_min_stop_ticks=_i("TP_SL_MIN_STOP_TICKS", 3),
         leverage_auto_reduce=_b("LEVERAGE_AUTO_REDUCE", True),
         tp_sl_trigger_type=_tp_sl_trigger_type(),
         order_unit=_order_unit(),
@@ -329,29 +284,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         margin_amount_pct=_f("MARGIN_AMOUNT_PCT", 10.0),
         taker_fee_rate=_f("TAKER_FEE_RATE", 0.0006),
         margin_safety_pct=_f("MARGIN_SAFETY_PCT", 2.0),
-        max_memory_items=_i("MAX_MEMORY_ITEMS", 5000),
-        tp_ladder=os.getenv("TP_LADDER", "").strip(),
-        tp_ladder_breakeven_after=_i("TP_LADDER_BREAKEVEN_AFTER", 1),
-        tp_ladder_runner=_tp_ladder_runner(),
-        tp_ladder_trigger_basis=_tp_ladder_basis(),
-        tp_ladder_tp_backstop=_b("TP_LADDER_TP_BACKSTOP", True),
     )
-
-
-def _tp_ladder_basis() -> str:
-    """TP_LADDER_TRIGGER_BASIS=R|ROI|PRICE, default R.
-
-    R is the basis the documented example spec uses ("1R:25,2R:25"), so an
-    unset or unrecognised value keeps it.
-    """
-    v = (os.getenv("TP_LADDER_TRIGGER_BASIS") or "R").strip().upper()
-    return v if v in ("R", "ROI", "PRICE") else "R"
-
-
-def _tp_ladder_runner() -> str:
-    """TP_LADDER_RUNNER=trail|close, default trail."""
-    v = (os.getenv("TP_LADDER_RUNNER") or "trail").strip().lower()
-    return v if v in ("trail", "close") else "trail"
 
 
 def _tp_sl_trigger_type() -> str:

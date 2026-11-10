@@ -348,10 +348,6 @@ def _b_tpsl_read(t: str) -> Intent:
     return Intent("tpsl_read", "tpsl", 0.9, describe="show the TP/SL methods and state")
 
 
-def _b_ladder_read(t: str) -> Intent:
-    return Intent("ladder_read", "ladder", 0.9, describe="show the TP ladder")
-
-
 def _b_margin_mode(t: str) -> Intent:
     if _has(t, "cross"):
         return Intent("margin_mode", "margin mode CROSS", 0.9, destructive=True,
@@ -385,8 +381,6 @@ def _b_why_failed(t: str) -> Intent:
 #: the canonical name. A question about a known setting is answered from the
 #: repo, never by the model.
 _SETTING_ALIASES: dict[str, tuple[str, ...]] = {
-    "TP_SL_MIN_STOP_TICKS": ("tp_sl_min_stop_ticks", "min stop ticks",
-                             "stop ticks", "min stop distance"),
     "TAKER_FEE_RATE": ("taker_fee_rate", "taker fee rate", "taker fee",
                        "fee rate", "trading fee"),
     "MARGIN_SAFETY_PCT": ("margin_safety_pct", "margin safety pct",
@@ -399,9 +393,8 @@ _SETTING_ALIASES: dict[str, tuple[str, ...]] = {
 def _b_what_is(t: str) -> Intent:
     """A question about a setting defined in THIS repo.
 
-    The engine once answered "I have no access to the engine" for
-    TP_SL_MIN_STOP_TICKS, which is defined in jrock/config.py. A question about
-    a known setting is answered from the repo, never by the model.
+    A question about a known setting is answered from the repo, never by the
+    model.
     """
     low = t.lower()
     for canonical, aliases in _SETTING_ALIASES.items():
@@ -461,10 +454,10 @@ def _b_analysis(t: str) -> Intent:
 RULES: list[tuple[str, re.Pattern, object]] = [
     # --- questions about this repo's own settings (must beat everything)
     ("explain_setting", re.compile(
-        r"\b(what|whats|what's|explain|how)\b.*\b(tp_sl_min_stop_ticks|taker_fee_rate|"
+        r"\b(what|whats|what's|explain|how)\b.*\b(taker_fee_rate|"
         r"margin_safety_pct)\b", re.I), _b_what_is),
     ("explain_setting", re.compile(
-        r"\b(tp_sl_min_stop_ticks|taker_fee_rate|margin_safety_pct)\b.*"
+        r"\b(taker_fee_rate|margin_safety_pct)\b.*"
         r"\b(do|does|mean|means|work|works|for)\b", re.I), _b_what_is),
 
     # --- why did it fail
@@ -616,11 +609,9 @@ RULES: list[tuple[str, re.Pattern, object]] = [
     ("position_mode", re.compile(r"\b(set|change|switch)\b.*\bposition mode\b", re.I),
      _b_position_mode),
 
-    # --- tpsl / ladder
+    # --- tpsl
     ("tpsl_read", re.compile(r"\b(show|what|whats|what's|my|the)\b.*\b(tp/?sl|take profit|"
                              r"stop loss)\b", re.I), _b_tpsl_read),
-    ("ladder_read", re.compile(r"\b(show|what|whats|what's|my|the)\b.*\bladder\b", re.I),
-     _b_ladder_read),
 
     # --- price / funding / symbols
     ("price", re.compile(r"\b(price|quote|how much is|whats the price of|"
@@ -718,8 +709,8 @@ RULES: list[tuple[str, re.Pattern, object]] = [
     # --- explain a setting, phrased as a question
     ("explain_setting", re.compile(
         r"\b(explain|what is|what'?s|how does|tell me about|what does)\b.*"
-        r"\b(taker fee|fee rate|trading fee|margin safety|safety pct|"
-        r"min stop ticks|stop ticks|min stop distance)\b", re.I), _b_what_is),
+        r"\b(taker fee|fee rate|trading fee|margin safety|safety pct)\b", re.I),
+     _b_what_is),
 
     # --- Persian (Farsi) conversational forms.
     #

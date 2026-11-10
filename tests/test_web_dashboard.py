@@ -491,39 +491,6 @@ def test_settings_endpoint_sets_the_tpsl_method(tmp_path):
         return await r.json()
     _run(_with_client(tmp_path, go))
 
-
-def test_settings_endpoint_sets_the_tp_ladder(tmp_path):
-    async def go(client, agent):
-        r = await client.post("/api/settings",
-                              json={"key": "tp_ladder", "value": "1R:25,2R:25,3R:25"},
-                              headers={"X-Auth-Token": TOKEN})
-        assert r.status == 200
-        assert agent.engine.state.tp_ladder == "1R:25,2R:25,3R:25"
-        # The engine's own parser must accept it, not just the string be stored.
-        lad = agent.engine.ladder()
-        assert len(lad.levels) == 3
-        return await r.json()
-    _run(_with_client(tmp_path, go))
-
-
-def test_settings_endpoint_rejects_an_invalid_ladder(tmp_path):
-    """A bad ladder must leave the previous one in place (engine behaviour)."""
-    async def go(client, agent):
-        await client.post("/api/settings",
-                          json={"key": "tp_ladder", "value": "1R:25,2R:25"},
-                          headers={"X-Auth-Token": TOKEN})
-        before = agent.engine.state.tp_ladder
-        r = await client.post("/api/settings",
-                              json={"key": "tp_ladder", "value": "not-a-ladder"},
-                              headers={"X-Auth-Token": TOKEN})
-        assert r.status == 200
-        body = await r.json()
-        assert "Invalid ladder" in body["output"]
-        assert agent.engine.state.tp_ladder == before
-        return body
-    _run(_with_client(tmp_path, go))
-
-
 def test_settings_endpoint_rejects_an_unknown_key(tmp_path):
     async def go(client, agent):
         r = await client.post("/api/settings", json={"key": "nope", "value": 1},
@@ -569,8 +536,7 @@ def test_settings_snapshot_lists_every_writable_setting(tmp_path):
         keys = {f["key"] for f in body["settings"]}
         # Every numeric/string setting the dashboard can write is offered...
         for key in ("margin_amount_pct", "leverage", "partial_at_roi_pct",
-                    "risk_pct", "max_open_positions", "tp_ladder",
-                    "tp_ladder_breakeven_after", "symbols", "timeframes"):
+                    "risk_pct", "max_open_positions", "symbols", "timeframes"):
             assert key in keys, key
         # ...and each carries its current value, not a placeholder.
         by_key = {f["key"]: f for f in body["settings"]}
@@ -652,13 +618,12 @@ def test_readouts_include_the_bare_margin_amount_read(tmp_path):
     _run(_with_client(tmp_path, go))
 
 
-def test_readouts_include_status_settings_ladder_and_tpsl(tmp_path):
+def test_readouts_include_status_settings_and_tpsl(tmp_path):
     async def go(client, agent):
         body = await (await client.get("/api/state",
                                        headers={"X-Auth-Token": TOKEN})).json()
         ro = body["readouts"]
         assert "=== status ===" in ro["status"]
-        assert "=== TP ladder ===" in ro["ladder"]
         assert "TP/SL method" in ro["tpsl"]
         # `settings trade` is the engine's documented "show trading settings".
         assert ro["settings"]

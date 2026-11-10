@@ -65,7 +65,6 @@ def _run(coro):
     ("what is the engine status", "status"),
     # tpsl / ladder
     ("show me the tp/sl", "tpsl"),
-    ("show me the ladder", "ladder"),
     # price / funding / symbols
     ("what is the price of BTCUSDT", "price BTCUSDT"),
     ("show me the funding rate", "funding"),
@@ -227,16 +226,16 @@ def test_place_order_from_a_sentence_is_refused_not_guessed(tmp_path):
 # 4. The engine answers about its OWN settings, from the repo
 # ==========================================================================
 
-def test_tp_sl_min_stop_ticks_is_explained_from_the_repo(tmp_path):
-    """The engine once said it had no access to the engine. It does."""
+def test_taker_fee_rate_is_explained_from_the_repo(tmp_path):
+    """A question about a known setting is answered from the repo itself."""
     a = _agent(tmp_path)
-    out = _run(a.handle("what does TP_SL_MIN_STOP_TICKS do"))
+    out = _run(a.handle("what does TAKER_FEE_RATE do"))
     assert "no access" not in out.lower()
-    assert "TP_SL_MIN_STOP_TICKS" in out
+    assert "TAKER_FEE_RATE" in out
     assert "jrock/config.py" in out
-    assert "tick" in out.lower()
+    assert "fee" in out.lower()
     # it must state the ACTUAL configured value
-    assert str(a.s.tpsl_min_stop_ticks) in out
+    assert str(a.s.taker_fee_rate) in out
 
 
 def test_taker_fee_rate_is_explained(tmp_path):
