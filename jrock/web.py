@@ -48,6 +48,15 @@ log = logging.getLogger("jrock.web")
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 MAX_BODY_BYTES = 64 * 1024
 
+#: aiohttp 3.9+ wants application state keyed by ``web.AppKey`` instances, not
+#: plain strings: a string key emits ``NotAppKeyWarning`` on every write and is
+#: slated for removal. These three keys are the app's entire shared state - the
+#: agent, the auth token and the command lock - so they are declared once here
+#: and used at every read and write site.
+AGENT_KEY: web.AppKey[JRockAgent] = web.AppKey("agent", JRockAgent)
+TOKEN_KEY: web.AppKey[str] = web.AppKey("token", str)
+LOCK_KEY: web.AppKey[asyncio.Lock] = web.AppKey("lock", asyncio.Lock)
+
 #: How often the page re-reads /api/state. The engine's own report loop uses
 #: the same default (EngineState.report_interval), so the dashboard and the
 #: engine agree on what "a report every 30 seconds" means.
@@ -453,7 +462,7 @@ setInterval(refresh, REPORT_INTERVAL_SEC * 1000);
 
 def _authorized(request: web.Request) -> bool:
     supplied = request.headers.get("X-Auth-Token") or request.query.get("token", "")
-    expected = request.app["token"]
+    expected = request.app[TOKEN_KEY]
     return secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
 
@@ -476,9 +485,9 @@ async def command(request: web.Request) -> web.Response:
     if not isinstance(line, str) or not line.strip():
         return web.json_response({"error": 'expected a non-empty "line"'}, status=400)
 
-    agent: JRockAgent = request.app["agent"]
+    agent: JRockAgent = request.app[AGENT_KEY]
     # The agent is stateful and the CLI runs one command at a time; keep that.
-    async with request.app["lock"]:
+    async with request.app[LOCK_KEY]:
         try:
             output = await agent.handle(line)
         except Exception as e:  # noqa: BLE001
@@ -750,8 +759,8 @@ async def state(request: web.Request) -> web.Response:
     """The structured snapshot the page polls every REPORT_INTERVAL_SEC."""
     if not _authorized(request):
         return web.json_response({"error": "unauthorized"}, status=401)
-    agent: JRockAgent = request.app["agent"]
-    async with request.app["lock"]:
+    agent: JRockAgent = request.app[AGENT_KEY]
+    async with request.app[LOCK_KEY]:
         return web.json_response(await build_state(agent))
 
 
@@ -780,8 +789,8 @@ async def autotrade(request: web.Request) -> web.Response:
                        'Resend with {"on": true, "confirm": true}.'),
         }, status=409)
 
-    agent: JRockAgent = request.app["agent"]
-    async with request.app["lock"]:
+    agent: JRockAgent = request.app[AGENT_KEY]
+    async with request.app[LOCK_KEY]:
         try:
             output = await agent.engine.command("start trading" if on else "stop trading")
         except Exception as e:  # noqa: BLE001
@@ -837,8 +846,8 @@ async def settings(request: web.Request) -> web.Response:
         return web.json_response({"error": "value is required"}, status=400)
 
     cmd = SETTING_COMMANDS[key].format(v=_fmt_value(value))
-    agent: JRockAgent = request.app["agent"]
-    async with request.app["lock"]:
+    agent: JRockAgent = request.app[AGENT_KEY]
+    async with request.app[LOCK_KEY]:
         try:
             output = await agent.engine.command(cmd)
         except Exception as e:  # noqa: BLE001
@@ -876,8 +885,8 @@ async def margin(request: web.Request) -> web.Response:
 
     cmd = SYMBOL_SETTING_COMMANDS[f"margin_{action}"].format(
         s=symbol.strip().upper(), v=_fmt_value(amount))
-    agent: JRockAgent = request.app["agent"]
-    async with request.app["lock"]:
+    agent: JRockAgent = request.app[AGENT_KEY]
+    async with request.app[LOCK_KEY]:
         try:
             output = await agent.engine.command(cmd)
         except Exception as e:  # noqa: BLE001
@@ -900,13 +909,13 @@ async def toggle(request: web.Request) -> web.Response:
             "allowed": sorted(TOGGLE_COMMANDS),
         }, status=400)
 
-    agent: JRockAgent = request.app["agent"]
+    agent: JRockAgent = request.app[AGENT_KEY]
     s = agent.engine.state
     on_cmd, off_cmd = TOGGLE_COMMANDS[key]
     current = {"scan_on": s.scan_on, "report_on": s.report_on,
                "reversal": s.reversal, "mid_management": s.mid_management}[key]
     cmd = off_cmd if current else on_cmd
-    async with request.app["lock"]:
+    async with request.app[LOCK_KEY]:
         try:
             output = await agent.engine.command(cmd)
         except Exception as e:  # noqa: BLE001
@@ -916,9 +925,9 @@ async def toggle(request: web.Request) -> web.Response:
 
 def make_app(agent: JRockAgent, token: str) -> web.Application:
     app = web.Application(client_max_size=MAX_BODY_BYTES)
-    app["agent"] = agent
-    app["token"] = token
-    app["lock"] = asyncio.Lock()
+    app[AGENT_KEY] = agent
+    app[TOKEN_KEY] = token
+    app[LOCK_KEY] = asyncio.Lock()
 
     async def on_startup(app: web.Application) -> None:
         print(await agent.startup())
