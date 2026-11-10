@@ -52,6 +52,58 @@ class TpSlPlan:
         }
 
 
+def _check_stop_side(*, side: str, liq: float, sl: float, entry: float, ref: float,
+                     d: float, rules: PairRules) -> None:
+    """Refuse when the stop does not fit between the liq price and the mark side.
+
+    At high leverage with a coarse tick there may be no room at all; refuse
+    with the numbers instead of emitting an invalid stop.
+    """
+    if side.upper() in ("LONG", "BUY"):
+        if not (liq < sl < min(entry, ref)):
+            raise TpSlSideError(
+                f"{rules.symbol} LONG: no valid stop-loss exists. The stop must "
+                f"sit between the liquidation price {liq:.{rules.quote_precision}f} "
+                f"and {min(entry, ref):.{rules.quote_precision}f} "
+                f"(entry={entry:.{rules.quote_precision}f}, "
+                f"mark={ref:.{rules.quote_precision}f}), keeping "
+                f"{d:.{rules.quote_precision}f} clear of both. "
+                f"Lower the leverage or widen the tick.")
+    else:
+        if not (max(entry, ref) < sl < liq):
+            raise TpSlSideError(
+                f"{rules.symbol} SHORT: no valid stop-loss exists. The stop must "
+                f"sit between {max(entry, ref):.{rules.quote_precision}f} and the "
+                f"liquidation price {liq:.{rules.quote_precision}f} "
+                f"(entry={entry:.{rules.quote_precision}f}, "
+                f"mark={ref:.{rules.quote_precision}f}), keeping "
+                f"{d:.{rules.quote_precision}f} clear of both. "
+                f"Lower the leverage or widen the tick.")
+
+
+def _plan_tp(*, side: str, entry: float, ref: float, sl_dist: float,
+             strength: str, confidence: float, is_long: bool, rules: PairRules,
+             min_stop_ticks: int) -> float:
+    """The take-profit price: a multiple of the stop distance, clamped."""
+    mult = R_MULTIPLE.get(strength, 1.8)
+    mult *= 0.85 + (max(0.0, min(100.0, confidence)) / 100.0) * 0.3
+
+    tp_dist = sl_dist * mult
+    tp = entry + tp_dist if is_long else entry - tp_dist
+    tp = round_price(tp, rules.quote_precision)
+
+    # --- clamp the TP to the correct side of BOTH entry and mark.
+    tp = clamp_tp(side=side, tp=tp, entry=entry, mark=ref, rules=rules,
+                  min_ticks=min_stop_ticks)
+    return tp
+
+
+def _roi_pct(p: float, entry: float, side: str, leverage: int) -> float:
+    """The ROI in % that price p realizes against the entry."""
+    raw = (p - entry) / entry if side.upper() in ("LONG", "BUY") else (entry - p) / entry
+    return raw * leverage * 100.0
+
+
 def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
               strength: str, confidence: float, tiers: list[Tier],
               rules: PairRules, liq_sl_distance_pct: float = 50.0,
@@ -87,47 +139,17 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
                   min_ticks=min_stop_ticks, liq=liq)
 
     # --- feasibility: the stop must fit BETWEEN the liquidation price and the
-    # mark-side limit. At high leverage with a coarse tick there may be no room
-    # at all; refuse with the numbers instead of emitting an invalid stop.
-    if is_long:
-        if not (liq < sl < min(entry, ref)):
-            raise TpSlSideError(
-                f"{rules.symbol} LONG: no valid stop-loss exists. The stop must "
-                f"sit between the liquidation price {liq:.{rules.quote_precision}f} "
-                f"and {min(entry, ref):.{rules.quote_precision}f} "
-                f"(entry={entry:.{rules.quote_precision}f}, "
-                f"mark={ref:.{rules.quote_precision}f}), keeping "
-                f"{d:.{rules.quote_precision}f} clear of both. "
-                f"Lower the leverage or widen the tick.")
-    else:
-        if not (max(entry, ref) < sl < liq):
-            raise TpSlSideError(
-                f"{rules.symbol} SHORT: no valid stop-loss exists. The stop must "
-                f"sit between {max(entry, ref):.{rules.quote_precision}f} and the "
-                f"liquidation price {liq:.{rules.quote_precision}f} "
-                f"(entry={entry:.{rules.quote_precision}f}, "
-                f"mark={ref:.{rules.quote_precision}f}), keeping "
-                f"{d:.{rules.quote_precision}f} clear of both. "
-                f"Lower the leverage or widen the tick.")
+    # mark-side limit.
+    _check_stop_side(side=side, liq=liq, sl=sl, entry=entry, ref=ref, d=d,
+                     rules=rules)
 
     sl_dist = abs(entry - sl)
-    mult = R_MULTIPLE.get(strength, 1.8)
-    mult *= 0.85 + (max(0.0, min(100.0, confidence)) / 100.0) * 0.3
+    tp = _plan_tp(side=side, entry=entry, ref=ref, sl_dist=sl_dist,
+                  strength=strength, confidence=confidence, is_long=is_long,
+                  rules=rules, min_stop_ticks=min_stop_ticks)
 
-    tp_dist = sl_dist * mult
-    tp = entry + tp_dist if is_long else entry - tp_dist
-    tp = round_price(tp, rules.quote_precision)
-
-    # --- clamp the TP to the correct side of BOTH entry and mark.
-    tp = clamp_tp(side=side, tp=tp, entry=entry, mark=ref, rules=rules,
-                  min_ticks=min_stop_ticks)
-
-    def roi(p: float) -> float:
-        raw = (p - entry) / entry if side.upper() in ("LONG", "BUY") else (entry - p) / entry
-        return raw * leverage * 100.0
-
-    sl_roi = roi(sl)
-    tp_roi = roi(tp)
+    sl_roi = _roi_pct(sl, entry, side, leverage)
+    tp_roi = _roi_pct(tp, entry, side, leverage)
     rr = abs(tp_roi / sl_roi) if sl_roi else 0.0
 
     notes = []

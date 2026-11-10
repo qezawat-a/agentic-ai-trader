@@ -144,11 +144,13 @@ def test_engine_mid_management_call_carries_the_reversal_threshold():
     loop needs a live exchange; the reversal confidence must be forwarded."""
     import inspect
     import jrock.trader.engine as engine_mod
-    src = inspect.getsource(engine_mod.TraderEngine.manage_positions)
+    # The per-position work lives in a helper now - look for the call in the
+    # whole class so a future split cannot hide it.
+    src = inspect.getsource(engine_mod.TraderEngine)
     assert "mid_management_action(" in src
     call = src.split("mid_management_action(", 1)[1].split(")", 1)[0]
     assert "reversal_confidence" in call, (
-        "manage_positions must pass state.reversal_confidence to "
+        "the management path must pass state.reversal_confidence to "
         "mid_management_action; without it the user's setting is ignored")
 
 

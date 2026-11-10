@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import random
 import string
@@ -37,6 +38,8 @@ from urllib.parse import urlencode
 import aiohttp
 
 from .errors import BitunixAPIError, describe
+
+log = logging.getLogger(__name__)
 
 
 def _nonce(n: int = 32) -> str:
@@ -201,11 +204,11 @@ class BitunixClient:
                 "query_signed": query,
                 "body_signed": body,
             }
-            # Spec: print the exact pre-image and the resulting signature so the
+            # Spec: log the exact pre-image and the resulting signature so the
             # user can diff them against the official demo repo.
-            print("[BITUNIX_DEBUG_SIGN] preimage = " + message)
-            print("[BITUNIX_DEBUG_SIGN] digest   = " + digest)
-            print("[BITUNIX_DEBUG_SIGN] sign     = " + sign)
+            log.debug("[BITUNIX_DEBUG_SIGN] preimage = %s", message)
+            log.debug("[BITUNIX_DEBUG_SIGN] digest   = %s", digest)
+            log.debug("[BITUNIX_DEBUG_SIGN] sign     = %s", sign)
         return sign
 
     def _headers(self, nonce: str, timestamp: str, sign: str) -> dict[str, str]:
@@ -503,7 +506,7 @@ class BitunixClient:
                                           "subAccountId": sub_account_id,
                                           "includeSubAccounts": _wire_bool(include_sub_accounts)})
 
-    async def get_history_positions(self, symbol: str | None = None, skip: int = 0,
+    async def get_history_positions(self, symbol: str | None = None, *, skip: int = 0,
                                     limit: int = 20,
                                     start_time: int | None = None,
                                     end_time: int | None = None,
@@ -616,7 +619,7 @@ class BitunixClient:
         return order_row(await self.request("POST", "/api/v1/futures/trade/modify_order",
                                             body=kwargs))
 
-    async def get_pending_orders(self, symbol: str | None = None, skip: int = 0,
+    async def get_pending_orders(self, symbol: str | None = None, *, skip: int = 0,
                                  limit: int = 20, order_id: str | None = None,
                                  client_id: str | None = None, status: str | None = None,
                                  start_time: int | None = None,
@@ -644,7 +647,7 @@ class BitunixClient:
                                           "endTime": end_time})
         return order_rows(data)
 
-    async def get_history_orders(self, symbol: str | None = None, skip: int = 0,
+    async def get_history_orders(self, symbol: str | None = None, *, skip: int = 0,
                                  limit: int = 20, start_time: int | None = None,
                                  end_time: int | None = None,
                                  order_id: str | None = None,
@@ -676,7 +679,7 @@ class BitunixClient:
         return await self.request("GET", "/api/v1/futures/trade/get_order_detail",
                                   params={"orderId": order_id, "clientId": client_id})
 
-    async def get_history_trades(self, symbol: str | None = None, skip: int = 0,
+    async def get_history_trades(self, symbol: str | None = None, *, skip: int = 0,
                                  limit: int = 20, start_time: int | None = None,
                                  end_time: int | None = None,
                                  order_id: str | None = None,
@@ -708,7 +711,7 @@ class BitunixClient:
     #   get_history_order -> get_history_orders
     #   cancel_order      -> also needs `symbol`, not just `orderId`
     #   get_*_order       -> use `skip`/`limit`, not `page`/`pageSize`
-    async def place_tp_sl_order(self, symbol: str, position_id: str,
+    async def place_tp_sl_order(self, symbol: str, position_id: str, *,
                                 tp_price: str | None = None,
                                 sl_price: str | None = None,
                                 tp_stop_type: str | None = None,
@@ -772,7 +775,7 @@ class BitunixClient:
         return order_row(await self.request("POST", "/api/v1/futures/tpsl/position/place_order",
                                             body=body))
 
-    async def modify_tp_sl_order(self, order_id: str,
+    async def modify_tp_sl_order(self, order_id: str, *,
                                  tp_price: str | None = None,
                                  sl_price: str | None = None,
                                  tp_stop_type: str | None = None,
@@ -851,7 +854,7 @@ class BitunixClient:
                                           "side": side, "positionMode": position_mode,
                                           "skip": skip, "limit": limit})
 
-    async def get_history_tp_sl_order(self, symbol: str | None = None,
+    async def get_history_tp_sl_order(self, symbol: str | None = None, *,
                                       side: int | None = None,
                                       position_mode: int | None = None,
                                       start_time: int | None = None,

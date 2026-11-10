@@ -51,11 +51,9 @@ def _strength(conf: float, agreeing: int) -> str:
     return "none"
 
 
-def aggregate(symbol: str, per_tf: dict[str, list[Signal]], *,
-              min_agreeing: int = 3, min_confidence: float = 70.0,
-              tf_min_confidence: float = 60.0) -> Aggregate:
-    agg = Aggregate(symbol=symbol, per_tf=per_tf)
-
+def _collect_votes(per_tf: dict[str, list[Signal]],
+                   tf_min_confidence: float) -> tuple[list[Signal], list[Signal]]:
+    """Split the actionable signals above tf_min_confidence into long/short."""
     long_votes: list[Signal] = []
     short_votes: list[Signal] = []
     for tf, signals in per_tf.items():
@@ -68,25 +66,52 @@ def aggregate(symbol: str, per_tf: dict[str, list[Signal]], *,
                 long_votes.append(s)
             else:
                 short_votes.append(s)
+    return long_votes, short_votes
+
+
+def _dedupe_votes(votes: list[Signal]) -> list[Signal]:
+    """One vote per (strategy, timeframe) - keep the strongest."""
+    best: dict[tuple[str, str], Signal] = {}
+    for s in votes:
+        k = (s.strategy, s.timeframe)
+        if k not in best or s.confidence > best[k].confidence:
+            best[k] = s
+    return list(best.values())
+
+
+def _distinct_strategies(votes: list[Signal]) -> int:
+    """A strategy agreeing on 3 TFs is still 1 strategy."""
+    return len({s.strategy for s in votes})
+
+
+def _weighted_confidence(votes: list[Signal]) -> tuple[float, set[str]]:
+    """Mean confidence over the timeframe weights, plus the TFs that voted."""
+    total_w = 0.0
+    weighted = 0.0
+    tfs_hit: set[str] = set()
+    for s in votes:
+        w = TF_WEIGHTS.get(s.timeframe, 1.0)
+        weighted += s.confidence * w
+        total_w += w
+        tfs_hit.add(s.timeframe)
+    mean_conf = weighted / total_w if total_w else 0.0
+    return mean_conf, tfs_hit
+
+
+def aggregate(symbol: str, per_tf: dict[str, list[Signal]], *,
+              min_agreeing: int = 3, min_confidence: float = 70.0,
+              tf_min_confidence: float = 60.0) -> Aggregate:
+    agg = Aggregate(symbol=symbol, per_tf=per_tf)
+
+    long_votes, short_votes = _collect_votes(per_tf, tf_min_confidence)
 
     # de-duplicate: one vote per (strategy, timeframe) - keep the strongest
-    def dedupe(votes: list[Signal]) -> list[Signal]:
-        best: dict[tuple[str, str], Signal] = {}
-        for s in votes:
-            k = (s.strategy, s.timeframe)
-            if k not in best or s.confidence > best[k].confidence:
-                best[k] = s
-        return list(best.values())
-
-    long_votes = dedupe(long_votes)
-    short_votes = dedupe(short_votes)
+    long_votes = _dedupe_votes(long_votes)
+    short_votes = _dedupe_votes(short_votes)
 
     # count distinct strategies (a strategy agreeing on 3 TFs is still 1 strategy,
     # but multi-TF agreement raises confidence)
-    def distinct(votes: list[Signal]) -> int:
-        return len({s.strategy for s in votes})
-
-    n_long, n_short = distinct(long_votes), distinct(short_votes)
+    n_long, n_short = _distinct_strategies(long_votes), _distinct_strategies(short_votes)
     if n_long == 0 and n_short == 0:
         agg.reason = "no actionable signals above tf_min_confidence"
         return agg
@@ -107,15 +132,7 @@ def aggregate(symbol: str, per_tf: dict[str, list[Signal]], *,
         return agg
 
     # weighted confidence
-    total_w = 0.0
-    weighted = 0.0
-    tfs_hit: set[str] = set()
-    for s in votes:
-        w = TF_WEIGHTS.get(s.timeframe, 1.0)
-        weighted += s.confidence * w
-        total_w += w
-        tfs_hit.add(s.timeframe)
-    mean_conf = weighted / total_w if total_w else 0.0
+    mean_conf, tfs_hit = _weighted_confidence(votes)
 
     agreement_bonus = min(12.0, (agg.agreeing - min_agreeing) * 3.0)
     tf_bonus = min(8.0, (len(tfs_hit) - 1) * 2.5)

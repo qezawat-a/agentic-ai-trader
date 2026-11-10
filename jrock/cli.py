@@ -61,6 +61,10 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = load_settings(args.env)
     agent = JRockAgent(settings)
+    # The engine is a library and does not print. The CLI is the terminal, so
+    # the periodic report is shown here - the same text the Telegram bot
+    # pushes to the chat.
+    agent.engine.report_sink = lambda rep: print("\n" + rep + "\n", flush=True)
 
     if args.startup:
         print(asyncio.run(agent.startup()))

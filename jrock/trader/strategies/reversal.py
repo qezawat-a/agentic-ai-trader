@@ -73,7 +73,7 @@ class HammerOversoldBounce(BaseStrategy):
 
         ind = {"rsi": round(rv, 2), "hammer": hammer, "ema50": last(e50)}
         if conf >= 60 and hammer:
-            return self.signal("LONG", conf, f"Hammer at RSI {rv:.1f}", timeframe, symbol, ind)
+            return self.signal("LONG", conf, f"Hammer at RSI {rv:.1f}", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no hammer setup", timeframe, symbol, ind)
 
 
@@ -114,7 +114,7 @@ class MorningStarDivergence(BaseStrategy):
 
         ind = {"morning_star": star, "divergence": div, "hist": last(hist)}
         if conf >= 60 and star:
-            return self.signal("LONG", conf, "Morning star + MACD divergence", timeframe, symbol, ind)
+            return self.signal("LONG", conf, "Morning star + MACD divergence", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no morning star", timeframe, symbol, ind)
 
 
@@ -153,7 +153,7 @@ class ShootingStarOverbought(BaseStrategy):
 
         ind = {"rsi": round(rv, 2), "shooting_star": star, "ema50": last(e50)}
         if conf >= 60 and star:
-            return self.signal("SHORT", conf, f"Shooting star at RSI {rv:.1f}", timeframe, symbol, ind)
+            return self.signal("SHORT", conf, f"Shooting star at RSI {rv:.1f}", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no shooting star", timeframe, symbol, ind)
 
 
@@ -192,5 +192,5 @@ class DarkCloudCoverDeathCross(BaseStrategy):
 
         ind = {"dark_cloud": dark_cloud, "macd_cross": macd_cross, "hist": last(hist)}
         if conf >= 60 and dark_cloud:
-            return self.signal("SHORT", conf, "Dark cloud cover + MACD cross", timeframe, symbol, ind)
+            return self.signal("SHORT", conf, "Dark cloud cover + MACD cross", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no dark cloud cover", timeframe, symbol, ind)

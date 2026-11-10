@@ -44,7 +44,7 @@ class BollingerUpperBreakout(BaseStrategy):
 
         ind = {"upper": u, "mid": m, "rsi": round(rv, 2), "fresh_break": fresh}
         if conf >= 60 and broke:
-            return self.signal("LONG", conf, f"BB upper breakout, RSI {rv:.1f}", timeframe, symbol, ind)
+            return self.signal("LONG", conf, f"BB upper breakout, RSI {rv:.1f}", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no BB breakout", timeframe, symbol, ind)
 
 
@@ -85,5 +85,5 @@ class MidBandMacdCross(BaseStrategy):
 
         ind = {"mid": m, "rsi": round(rv, 2), "macd_cross": cross, "above_mid": above_mid}
         if conf >= 60 and above_mid and macd_bull:
-            return self.signal("LONG", conf, "MACD cross above BB mid-band", timeframe, symbol, ind)
+            return self.signal("LONG", conf, "MACD cross above BB mid-band", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no mid-band MACD cross", timeframe, symbol, ind)

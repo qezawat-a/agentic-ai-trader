@@ -196,6 +196,12 @@ QUERY_COMMANDS: frozenset[str] = frozenset({
     "/tpsl", "/batch",
 })
 
+#: Modules that are PROGRAMS, not libraries: they own stdout. `print()` in
+#: them is the interface (a CLI, the self-heal runner, the Telegram bot).
+_PRINT_ALLOWED_MODULES = frozenset({
+    "cli.py", "self_heal.py", "telegram_bot.py",
+})
+
 # Natural-language intents we handle deterministically instead of guessing.
 FREE_MODEL_INTENT = re.compile(
     r"\b(switch|use|pick|select|set|go|change)\b.*\bfree\b.*\bmodel\b"
@@ -509,36 +515,9 @@ class JRockAgent:
             return ""
         low = raw.lower()
 
-        # Permission toggles are LOCAL and reversible: they never move money,
-        # so they never ask for a confirmation. "auto accept on" (without
-        # "edit") used to fall through to the model, which answered with a
-        # question of its own and then asked again for the "yes" - a loop
-        # with no way out for a one-word toggle.
-        if low.startswith("auto accept"):
-            val = low.split()[-1]
-            on = val in ("on", "true", "1", "yes")
-            self.perms.auto_accept_edit = on
-            self.perms.audit.write("toggle_auto_accept", value=on)
-            return f"auto accept edit = {on}"
-        if low.startswith("device access"):
-            val = low.split()[-1]
-            self.perms.full_device_access = val in ("on", "true", "1", "yes")
-            self.perms.audit.write("toggle_device_access", value=self.perms.full_device_access)
-            return f"device access = {self.perms.full_device_access}"
-        if low == "audit":
-            return json.dumps(self.perms.audit.tail(30), indent=2)
-        if low == "pending":
-            if not self.perms.pending:
-                return "no pending edits"
-            return "\n\n".join(f"[{i}] {p['path']}\n{p['diff'][:1500]}"
-                               for i, p in enumerate(self.perms.pending))
-        if low.startswith("approve"):
-            parts = raw.split()
-            idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            item = self.perms.approve_pending(idx)
-            if not item:
-                return "nothing to approve"
-            return f"approved {item['path']} - re-run the edit to apply it"
+        reply = self._handle_permission_command(low, raw)
+        if reply is not None:
+            return reply
 
         if not low.startswith("/"):
             return await self.route_bare(raw)
@@ -547,6 +526,7 @@ class JRockAgent:
         cmd = cmd.lower()
         rest = rest.strip()
 
+        # The agent's own surface: who it is, what it knows, what it can check.
         if cmd in ("/help", "/?"):
             return HELP
         if cmd == "/models":
@@ -573,8 +553,70 @@ class JRockAgent:
             return self.soul()
         if cmd == "/think":
             return self.cmd_think(rest)
-        if cmd == "/ws":
-            return await self.cmd_ws(rest)
+        if cmd == "/memory":
+            return self.cmd_memory(rest)
+        if cmd == "/code_review":
+            return self.cmd_code_review(rest)
+        if cmd == "/bug_fix":
+            return self.cmd_bug_fix(rest)
+        if cmd == "/verify":
+            return self.cmd_verify()
+        if cmd == "/simplify":
+            return self.cmd_simplify(rest)
+        if cmd == "/team_spawn":
+            return await self.cmd_team_spawn(rest)
+        if cmd == "/check_ai":
+            return await self.cmd_check_ai()
+        if cmd == "/check_system":
+            return await self.cmd_check_system()
+        if cmd == "/autopsy":
+            return self.cmd_autopsy(rest)
+        if cmd == "/diagnose":
+            return await self.cmd_diagnose()
+
+        reply = await self._dispatch_trading_command(cmd, rest)
+        if reply is not None:
+            return reply
+        return f"Unknown command {cmd}. Try /help"
+
+    def _handle_permission_command(self, low: str, raw: str) -> str | None:
+        """Permission toggles and the pending-edit queue.
+
+        Permission toggles are LOCAL and reversible: they never move money,
+        so they never ask for a confirmation. "auto accept on" (without
+        "edit") used to fall through to the model, which answered with a
+        question of its own and then asked again for the "yes" - a loop
+        with no way out for a one-word toggle.
+        """
+        if low.startswith("auto accept"):
+            val = low.split()[-1]
+            on = val in ("on", "true", "1", "yes")
+            self.perms.auto_accept_edit = on
+            self.perms.audit.write("toggle_auto_accept", value=on)
+            return f"auto accept edit = {on}"
+        if low.startswith("device access"):
+            val = low.split()[-1]
+            self.perms.full_device_access = val in ("on", "true", "1", "yes")
+            self.perms.audit.write("toggle_device_access", value=self.perms.full_device_access)
+            return f"device access = {self.perms.full_device_access}"
+        if low == "audit":
+            return json.dumps(self.perms.audit.tail(30), indent=2)
+        if low == "pending":
+            if not self.perms.pending:
+                return "no pending edits"
+            return "\n\n".join(f"[{i}] {p['path']}\n{p['diff'][:1500]}"
+                               for i, p in enumerate(self.perms.pending))
+        if low.startswith("approve"):
+            parts = raw.split()
+            idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            item = self.perms.approve_pending(idx)
+            if not item:
+                return "nothing to approve"
+            return f"approved {item['path']} - re-run the edit to apply it"
+        return None
+
+    async def _dispatch_trading_command(self, cmd: str, rest: str) -> str | None:
+        """The trading surface: account, positions, orders, prices, engine."""
         if cmd == "/balance":
             return await self.cmd_balance()
         if cmd == "/positions":
@@ -603,28 +645,9 @@ class JRockAgent:
             return await self.engine.status()
         if cmd == "/symbols":
             return await self.cmd_symbols(rest)
-        if cmd == "/memory":
-            return self.cmd_memory(rest)
-        if cmd == "/code_review":
-            return self.cmd_code_review(rest)
-        if cmd == "/bug_fix":
-            return self.cmd_bug_fix(rest)
-        if cmd == "/verify":
-            return self.cmd_verify()
-        if cmd == "/simplify":
-            return self.cmd_simplify(rest)
-        if cmd == "/team_spawn":
-            return await self.cmd_team_spawn(rest)
-        if cmd == "/check_ai":
-            return await self.cmd_check_ai()
-        if cmd == "/check_system":
-            return await self.cmd_check_system()
-        if cmd == "/autopsy":
-            return self.cmd_autopsy(rest)
-        if cmd == "/diagnose":
-            return await self.cmd_diagnose()
-
-        return f"Unknown command {cmd}. Try /help"
+        if cmd == "/ws":
+            return await self.cmd_ws(rest)
+        return None
 
     # ------------------------------------------------------------ routing
     async def route_bare(self, raw: str) -> str:
@@ -918,7 +941,13 @@ class JRockAgent:
         if soul.startswith("(no soul file)"):
             soul = ""
         parts = [soul.strip()] if soul.strip() else []
-        parts.append(
+        parts.append(self._conversation_contract())
+        parts.append(self._capability_section())
+        return "\n\n".join(parts)
+
+    def _conversation_contract(self) -> str:
+        """The conversational half of the prompt: how to read intent and reply."""
+        return (
             "## How you talk\n"
             "You are a conversational partner, not a command parser. The user "
             "may write in English or Persian (Farsi), formally or casually, and "
@@ -955,8 +984,11 @@ class JRockAgent:
             "- Be brief and warm. No filler praise, no walls of text, no "
             "restating the question back at them.\n"
         )
+
+    def _capability_section(self) -> str:
+        """The capability half of the prompt: what the agent itself can do."""
         handbook = self._agent_handbook()
-        parts.append(
+        return (
             "## What you can do\n"
             "You are not a passive listener: you run a live futures engine and "
             "you have your own command surface. The handbook below is YOUR "
@@ -979,7 +1011,6 @@ class JRockAgent:
             "handlers run before you are reached, so if a message reaches you "
             "it is genuinely free text - answer it as such."
         )
-        return "\n\n".join(parts)
 
     def _agent_handbook(self) -> str:
         """The command sections of HELP, extracted live.
@@ -1042,15 +1073,7 @@ class JRockAgent:
         max_tokens = self._max_tokens_for(level)
         reasoning = self.reasoning_params(model)
 
-        payload = {
-            "model": model,
-            "messages": ([{"role": "system", "content": system}]
-                         + self._history_messages()
-                         + [{"role": "user", "content": text}]),
-            "max_tokens": max_tokens,
-            "temperature": 0.2,
-        }
-        payload.update(reasoning)
+        payload = self._chat_payload(text, system, model, max_tokens, reasoning)
         log.debug("chat: thinking_level=%s model=%s max_tokens=%s params=%s",
                   level, model, max_tokens, describe_params(reasoning))
 
@@ -1080,24 +1103,46 @@ class JRockAgent:
 
         # ---- retry once with thinking off when the budget ate the answer
         if verdict.retry_with_off and level != "off":
-            retry_payload = dict(payload)
-            for k in ("reasoning_effort", "thinking_budget"):
-                retry_payload.pop(k, None)
-            retry_payload["max_tokens"] = self.BASE_MAX_TOKENS
-            log.debug("chat: retrying with thinking=off (was %s)", level)
-            status2, body2, parsed2 = await self._post_chat(url, retry_payload)
-            if status2 == 200:
-                v2 = diagnose_empty(parsed2, status2)
-                if not v2.is_empty:
-                    out = parsed2["choices"][0]["message"]["content"].strip()
-                    self.memory.episode("chat", text[:120], out[:120], ok=True)
-                    self._remember_turn(text, out)
-                    return (f"[retried with thinking=off after an empty response at "
-                            f"level {level}]\n\n{out}")
-            log.warning("chat: retry with thinking=off also failed: %s", body2[:400])
+            retried = await self._retry_chat_thinking_off(url, payload, level, text)
+            if retried is not None:
+                return retried
 
         self.memory.episode("chat", text[:120], f"EMPTY:{verdict.cause}", ok=False)
         return render_empty(verdict, level, max_tokens)
+
+    def _chat_payload(self, text: str, system: str, model: str,
+                      max_tokens: int, reasoning: dict) -> dict:
+        """The request body: system prompt, replayed history, and the user turn."""
+        payload = {
+            "model": model,
+            "messages": ([{"role": "system", "content": system}]
+                         + self._history_messages()
+                         + [{"role": "user", "content": text}]),
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+        }
+        payload.update(reasoning)
+        return payload
+
+    async def _retry_chat_thinking_off(self, url: str, payload: dict,
+                                       level: str, text: str) -> str | None:
+        """Retry once with thinking off, when the reasoning budget ate the answer."""
+        retry_payload = dict(payload)
+        for k in ("reasoning_effort", "thinking_budget"):
+            retry_payload.pop(k, None)
+        retry_payload["max_tokens"] = self.BASE_MAX_TOKENS
+        log.debug("chat: retrying with thinking=off (was %s)", level)
+        status2, body2, parsed2 = await self._post_chat(url, retry_payload)
+        if status2 == 200:
+            v2 = diagnose_empty(parsed2, status2)
+            if not v2.is_empty:
+                out = parsed2["choices"][0]["message"]["content"].strip()
+                self.memory.episode("chat", text[:120], out[:120], ok=True)
+                self._remember_turn(text, out)
+                return (f"[retried with thinking=off after an empty response at "
+                        f"level {level}]\n\n{out}")
+        log.warning("chat: retry with thinking=off also failed: %s", body2[:400])
+        return None
 
     async def cmd_models(self, rest: str = "") -> str:
         from .model_selector import list_model_info
@@ -1554,77 +1599,96 @@ class JRockAgent:
         Position and Partial are enforced by the exchange; Trailing and Account
         are software and only run while the manage loop is up.
         """
-        from .trader.errors import BitunixAPIError
         args = [x.strip() for x in rest.replace(",", " ").split() if x.strip()]
         sub = args[0].lower() if args else ""
 
         if sub in ("pending", "orders"):
-            if not self._has_bitunix_keys():
-                return missing_keys_message()
-            try:
-                data = await self.engine.client.get_pending_tp_sl_order(
-                    symbol=args[1].upper() if len(args) > 1 else None, limit=20)
-            except BitunixAPIError as e:
-                return f"Bitunix error {e.code}: {e.msg or e}"
-            except Exception as e:  # noqa: BLE001
-                return f"pending TP/SL failed: {type(e).__name__}: {e}"
-            rows = data if isinstance(data, list) else [data] if data else []
-            if not rows:
-                return "no pending TP/SL orders"
-            lines = ["=== pending TP/SL orders ==="]
-            for o in rows:
-                lines.append(
-                    f"  {o.get('symbol')} id={o.get('id')} pos={o.get('positionId')} "
-                    f"tp={o.get('tpPrice')}({o.get('tpStopType')}) "
-                    f"sl={o.get('slPrice')}({o.get('slStopType')}) "
-                    f"tpQty={o.get('tpQty')} slQty={o.get('slQty')}")
-            return "\n".join(lines)
-
+            return await self._tpsl_pending(args)
         if sub in ("history", "hist"):
-            if not self._has_bitunix_keys():
-                return missing_keys_message()
-            try:
-                data = await self.engine.client.get_history_tp_sl_order(
-                    symbol=args[1].upper() if len(args) > 1 else None, limit=20)
-            except BitunixAPIError as e:
-                return f"Bitunix error {e.code}: {e.msg or e}"
-            except Exception as e:  # noqa: BLE001
-                return f"TP/SL history failed: {type(e).__name__}: {e}"
-            rows = (data or {}).get("orderList") if isinstance(data, dict) else data
-            rows = rows if isinstance(rows, list) else []
-            if not rows:
-                return "no TP/SL history"
-            lines = ["=== TP/SL history ==="]
-            for o in rows[:20]:
-                lines.append(f"  {o.get('symbol')} id={o.get('id')} "
-                             f"status={o.get('status')} tp={o.get('tpPrice')} "
-                             f"sl={o.get('slPrice')} ctime={o.get('ctime')}")
-            return "\n".join(lines)
-
+            return await self._tpsl_history(args)
         if sub in ("cancel", "off"):
-            if len(args) < 3:
-                return ("usage: /tpsl cancel SYMBOL ORDER_ID\n"
-                        "(official: BOTH symbol and orderId are required)")
-            if not self._has_bitunix_keys():
-                return missing_keys_message()
-            try:
-                res = await self.engine.client.cancel_tp_sl_order(
-                    args[1].upper(), args[2])
-            except BitunixAPIError as e:
-                return f"Bitunix error {e.code}: {e.msg or e}"
-            except Exception as e:  # noqa: BLE001
-                return f"cancel failed: {type(e).__name__}: {e}"
-            return f"cancel requested: {res}"
-
+            return await self._tpsl_cancel(args)
         if sub in ("method", "set") and len(args) > 1:
-            m = args[1].upper()
-            if m not in ("POSITION", "PARTIAL", "TRAILING", "ACCOUNT"):
-                return ("method must be one of POSITION | PARTIAL | TRAILING | ACCOUNT")
-            self.engine.state.tpsl_method = m
-            self.engine._persist_if_changed()
-            return self.engine.tpsl_method_report()
+            return self._tpsl_set_method(args)
 
         # default: show the methods and which method is active
+        return self._tpsl_overview()
+
+    async def _tpsl_pending(self, args: list[str]) -> str:
+        """The live pending TP/SL orders."""
+        from .trader.errors import BitunixAPIError
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+        try:
+            data = await self.engine.client.get_pending_tp_sl_order(
+                symbol=args[1].upper() if len(args) > 1 else None, limit=20)
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"pending TP/SL failed: {type(e).__name__}: {e}"
+        rows = data if isinstance(data, list) else [data] if data else []
+        if not rows:
+            return "no pending TP/SL orders"
+        lines = ["=== pending TP/SL orders ==="]
+        for o in rows:
+            lines.append(
+                f"  {o.get('symbol')} id={o.get('id')} pos={o.get('positionId')} "
+                f"tp={o.get('tpPrice')}({o.get('tpStopType')}) "
+                f"sl={o.get('slPrice')}({o.get('slStopType')}) "
+                f"tpQty={o.get('tpQty')} slQty={o.get('slQty')}")
+        return "\n".join(lines)
+
+    async def _tpsl_history(self, args: list[str]) -> str:
+        """The closed TP/SL order history."""
+        from .trader.errors import BitunixAPIError
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+        try:
+            data = await self.engine.client.get_history_tp_sl_order(
+                symbol=args[1].upper() if len(args) > 1 else None, limit=20)
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"TP/SL history failed: {type(e).__name__}: {e}"
+        rows = (data or {}).get("orderList") if isinstance(data, dict) else data
+        rows = rows if isinstance(rows, list) else []
+        if not rows:
+            return "no TP/SL history"
+        lines = ["=== TP/SL history ==="]
+        for o in rows[:20]:
+            lines.append(f"  {o.get('symbol')} id={o.get('id')} "
+                         f"status={o.get('status')} tp={o.get('tpPrice')} "
+                         f"sl={o.get('slPrice')} ctime={o.get('ctime')}")
+        return "\n".join(lines)
+
+    async def _tpsl_cancel(self, args: list[str]) -> str:
+        """Cancel one TP/SL order - the official endpoint needs symbol AND id."""
+        from .trader.errors import BitunixAPIError
+        if len(args) < 3:
+            return ("usage: /tpsl cancel SYMBOL ORDER_ID\n"
+                    "(official: BOTH symbol and orderId are required)")
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+        try:
+            res = await self.engine.client.cancel_tp_sl_order(
+                args[1].upper(), args[2])
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"cancel failed: {type(e).__name__}: {e}"
+        return f"cancel requested: {res}"
+
+    def _tpsl_set_method(self, args: list[str]) -> str:
+        """Switch the enforced TP/SL method (POSITION or PARTIAL)."""
+        m = args[1].upper()
+        if m not in ("POSITION", "PARTIAL", "TRAILING", "ACCOUNT"):
+            return ("method must be one of POSITION | PARTIAL | TRAILING | ACCOUNT")
+        self.engine.state.tpsl_method = m
+        self.engine._persist_if_changed()
+        return self.engine.tpsl_method_report()
+
+    def _tpsl_overview(self) -> str:
+        """The four methods, and which one is active."""
         return "\n".join([
             "=== the TP/SL methods ===",
             "  1. POSITION  one TP/SL closes the ENTIRE position (native, exchange-enforced)",
@@ -1714,7 +1778,6 @@ class JRockAgent:
         margin mode and leverage. A token that is not a tradable pair is
         dropped with a warning instead of being sent (which would 20015).
         """
-        from .trader.errors import BitunixAPIError
         if not self._has_bitunix_keys():
             return missing_keys_message()
 
@@ -1722,43 +1785,53 @@ class JRockAgent:
         syms = [t for t in tokens if t not in self.SETTINGS_KEYWORDS]
 
         lines = ["=== account trading settings ==="]
+        lines.append(await self._settings_position_mode())
+        lines.extend(self._settings_config_lines())
+        await self._settings_per_symbol(syms, lines)
+        return "\n".join(lines)
 
-        # 1) Position mode - the account-level endpoint. It takes no
-        #    parameters, so it cannot raise 20015.
+    async def _settings_position_mode(self) -> str:
+        """The account-level position mode - it takes no parameters, so it
+        cannot raise 20015."""
+        from .trader.errors import BitunixAPIError
         try:
             mode = await self.engine.client.get_position_mode()
             pm = (mode or {}).get("positionMode") if isinstance(mode, dict) else mode
-            lines.append(f"position mode: {pm or '?'}")
+            return f"position mode: {pm or '?'}"
         except BitunixAPIError as e:
-            lines.append(f"position mode: error {e.code}: {e.msg or e}")
+            return f"position mode: error {e.code}: {e.msg or e}"
         except Exception as e:  # noqa: BLE001
-            lines.append(f"position mode: {type(e).__name__}: {e}")
+            return f"position mode: {type(e).__name__}: {e}"
 
-        # 2) The trading configuration. This is the account-level config the
-        #    command has always shown - margin mode, leverage and the rest of
-        #    the engine's trading parameters. No per-symbol listing.
+    def _settings_config_lines(self) -> list[str]:
+        """The account-level config: margin mode, leverage and the rest of the
+        engine's trading parameters. No per-symbol listing."""
         s = self.engine.state
-        lines.append(f"margin mode: {s.margin_mode}")
-        lines.append(f"leverage: {s.leverage}x")
-        lines.append(f"max open positions: {s.max_open_positions}")
-        lines.append(f"risk per trade: {s.risk_pct}%")
-        lines.append(f"breakeven: {s.breakeven_pct}%  "
-                     f"trailing trigger: {s.trailing_trigger_roi_pct}% ROI  "
-                     f"liq SL distance: {s.liq_sl_distance_pct}%")
-        lines.append(f"min agreeing strategies: {s.min_agreeing}  "
-                     f"timeframes: {','.join(s.timeframes)}")
-        lines.append(f"min confidence: {s.min_confidence}  "
-                     f"tf min confidence: {s.tf_min_confidence}")
-        lines.append(f"scan interval: {s.scan_interval}s  "
-                     f"report interval: {s.report_interval}s")
-        lines.append(f"tpsl method: {s.tpsl_method}  "
-                     f"partial ladder: {s.partial_tp_ladder or 'off'} "
-                     f"(account TP/SL {s.account_tp_usdt:g}/{s.account_sl_usdt:g} USDT)")
-        lines.append(f"engine_on={s.engine_on} scan_on={s.scan_on} "
-                     f"autotrade={s.autotrade} mid_management={s.mid_management}")
+        return [
+            f"margin mode: {s.margin_mode}",
+            f"leverage: {s.leverage}x",
+            f"max open positions: {s.max_open_positions}",
+            f"risk per trade: {s.risk_pct}%",
+            f"breakeven: {s.breakeven_pct}%  "
+            f"trailing trigger: {s.trailing_trigger_roi_pct}% ROI  "
+            f"liq SL distance: {s.liq_sl_distance_pct}%",
+            f"min agreeing strategies: {s.min_agreeing}  "
+            f"timeframes: {','.join(s.timeframes)}",
+            f"min confidence: {s.min_confidence}  "
+            f"tf min confidence: {s.tf_min_confidence}",
+            f"scan interval: {s.scan_interval}s  "
+            f"report interval: {s.report_interval}s",
+            f"tpsl method: {s.tpsl_method}  "
+            f"partial ladder: {s.partial_tp_ladder or 'off'} "
+            f"(account TP/SL {s.account_tp_usdt:g}/{s.account_sl_usdt:g} USDT)",
+            f"engine_on={s.engine_on} scan_on={s.scan_on} "
+            f"autotrade={s.autotrade} mid_management={s.mid_management}",
+        ]
 
-        # 3) Only when the user names a REAL symbol, show that symbol's
-        #    configured margin mode + leverage. Never a wall of symbols.
+    async def _settings_per_symbol(self, syms: list[str], lines: list[str]) -> None:
+        """Only when the user names a REAL symbol, show that symbol's
+        configured margin mode + leverage. Never a wall of symbols."""
+        from .trader.errors import BitunixAPIError
         if syms:
             valid = await self._valid_symbols(syms)
             if valid is None:
@@ -1772,26 +1845,26 @@ class JRockAgent:
                                  f"symbol(s) {', '.join(bad)} "
                                  f"(not a tradable futures pair)")
                 syms = [x for x in syms if x in valid]
-        if syms:
-            try:
-                data = await self.engine.client.get_trading_settings(",".join(syms))
-            except BitunixAPIError as e:
-                if e.code == 20015:
-                    lines.append(f"per-symbol settings: error 20015 - "
-                                 f"{', '.join(syms)} is not a tradable futures "
-                                 f"pair (use /symbols to list valid pairs)")
-                else:
-                    lines.append(f"per-symbol settings: error {e.code}: {e.msg or e}")
-            except Exception as e:  # noqa: BLE001
-                lines.append(f"per-symbol settings: {type(e).__name__}: {e}")
+        if not syms:
+            return
+        try:
+            data = await self.engine.client.get_trading_settings(",".join(syms))
+        except BitunixAPIError as e:
+            if e.code == 20015:
+                lines.append(f"per-symbol settings: error 20015 - "
+                             f"{', '.join(syms)} is not a tradable futures "
+                             f"pair (use /symbols to list valid pairs)")
             else:
-                rows = data if isinstance(data, list) else ([data] if data else [])
-                for r in rows:
-                    if isinstance(r, dict):
-                        lines.append(f"  {r.get('symbol')}: "
-                                     f"leverage={r.get('leverage')}x "
-                                     f"marginMode={r.get('marginMode')}")
-        return "\n".join(lines)
+                lines.append(f"per-symbol settings: error {e.code}: {e.msg or e}")
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"per-symbol settings: {type(e).__name__}: {e}")
+        else:
+            rows = data if isinstance(data, list) else ([data] if data else [])
+            for r in rows:
+                if isinstance(r, dict):
+                    lines.append(f"  {r.get('symbol')}: "
+                                 f"leverage={r.get('leverage')}x "
+                                 f"marginMode={r.get('marginMode')}")
 
     async def _valid_symbols(self, syms: list[str]) -> set[str] | None:
         """Best-effort: the subset of `syms` that are tradable futures pairs.
@@ -1950,8 +2023,16 @@ class JRockAgent:
                     # skip the reviewer's own pattern table (self-match false positive)
                     if "TODO|FIXME|XXX" in line_text or "swallowed exception" in line_text:
                         continue
-                    # print() is legitimate in the CLI entrypoint
-                    if msg.startswith("print()") and f.name == "cli.py":
+                    # ...and its own print() rule, which the pattern above
+                    # matches literally - the reviewer was flagging itself.
+                    if msg.startswith("print()") and "print" in line_text and (
+                            "library code" in line_text or "print()" in line_text
+                            or "cli.py" in line_text):
+                        continue
+                    # print() is legitimate in the CLI entrypoints and in the
+                    # modules that ARE programs (they have a __main__ block):
+                    # a library must not write to stdout.
+                    if msg.startswith("print()") and f.name in _PRINT_ALLOWED_MODULES:
                         continue
                     issues.append(f"{rel}:{ln}: {msg}")
         if not issues:

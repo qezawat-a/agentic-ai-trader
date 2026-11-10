@@ -291,6 +291,72 @@ def _free_only() -> bool:
     return os.getenv("FREE_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _free_then_paid(free: list[ModelInfo], paid: list[ModelInfo],
+                    max_probe: int, max_paid_probe: int) -> list[ModelInfo]:
+    """Free models first, then paid ones into the remaining probe slots."""
+    candidates = free[:max_probe]
+    if len(candidates) < max_probe:
+        candidates += paid[:min(max_paid_probe, max_probe - len(candidates))]
+    return candidates
+
+
+async def _run_probes(session: aiohttp.ClientSession, base_url: str,
+                      api_key: str, candidates: list[ModelInfo],
+                      concurrency: int) -> tuple[list[ModelProbe], float | None, bool]:
+    """Probe the candidates: the free ones together, the paid ones one by one.
+
+    Returns (probes, balance, free_worked). `free_worked` is True when a free
+    model already answered, so the paid ones were never probed.
+    """
+    sem = asyncio.Semaphore(concurrency)
+    balance: float | None = None
+    probes: list[ModelProbe] = []
+
+    async def run(m: ModelInfo) -> ModelProbe:
+        async with sem:
+            return await probe_model(session, base_url, api_key, m.id, free=m.free)
+
+    # Free first, sequentially in small batches so a 402 on the first paid
+    # model can stop us from wasting probes on the rest.
+    free_c = [m for m in candidates if m.free]
+    paid_c = [m for m in candidates if not m.free]
+
+    if free_c:
+        probes.extend(await asyncio.gather(*(run(m) for m in free_c)))
+        working = [p for p in probes if p.works]
+        if working:
+            return probes, None, True
+
+    for p in probes:
+        if p.balance is not None:
+            balance = p.balance
+            break
+
+    if paid_c:
+        if balance is not None and balance <= 0:
+            for m in paid_c:
+                probes.append(ModelProbe(
+                    id=m.id, score=m.score, free=False, status="skipped",
+                    error=f"skipped - account balance is {balance}, add credits or use a free model"))
+        else:
+            for m in paid_c:
+                p = await run(m)
+                probes.append(p)
+                if p.balance is not None:
+                    balance = p.balance
+                    if balance <= 0:
+                        rest = paid_c[paid_c.index(m) + 1:]
+                        for r in rest:
+                            probes.append(ModelProbe(
+                                id=r.id, score=r.score, free=False, status="skipped",
+                                error=f"skipped - account balance is {balance}"))
+                        break
+                if p.works:
+                    break
+
+    return probes, balance, False
+
+
 async def autoset_model(base_url: str, api_key: str, max_probe: int = 8,
                         concurrency: int = 4, free_only: bool | None = None,
                         max_paid_probe: int = 3) -> AutoSetResult:
@@ -329,59 +395,17 @@ async def autoset_model(base_url: str, api_key: str, max_probe: int = 8,
                     message=(f"FREE_ONLY is set but none of the {len(infos)} models on "
                              f"{base_url} advertise free pricing. Unset FREE_ONLY or add credits."))
         else:
-            candidates = free[:max_probe]
-            if len(candidates) < max_probe:
-                candidates += paid[:min(max_paid_probe, max_probe - len(candidates))]
+            candidates = _free_then_paid(free, paid, max_probe, max_paid_probe)
 
         if not candidates:
             return AutoSetResult(base_url, False, listed=len(infos),
                                  message="No chat-capable models found in the /models list.")
 
-        sem = asyncio.Semaphore(concurrency)
-        balance: float | None = None
-        probes: list[ModelProbe] = []
-
-        async def run(m: ModelInfo) -> ModelProbe:
-            async with sem:
-                return await probe_model(session, base_url, api_key, m.id, free=m.free)
-
-        # Free first, sequentially in small batches so a 402 on the first paid
-        # model can stop us from wasting probes on the rest.
-        free_c = [m for m in candidates if m.free]
-        paid_c = [m for m in candidates if not m.free]
-
-        if free_c:
-            probes.extend(await asyncio.gather(*(run(m) for m in free_c)))
+        probes, balance, free_worked = await _run_probes(
+            session, base_url, api_key, candidates, concurrency)
+        if free_worked:
             working = [p for p in probes if p.works]
-            if working:
-                return _pick(base_url, working, probes, len(infos), len(free), None)
-
-        for p in probes:
-            if p.balance is not None:
-                balance = p.balance
-                break
-
-        if paid_c:
-            if balance is not None and balance <= 0:
-                for m in paid_c:
-                    probes.append(ModelProbe(
-                        id=m.id, score=m.score, free=False, status="skipped",
-                        error=f"skipped - account balance is {balance}, add credits or use a free model"))
-            else:
-                for m in paid_c:
-                    p = await run(m)
-                    probes.append(p)
-                    if p.balance is not None:
-                        balance = p.balance
-                        if balance <= 0:
-                            rest = paid_c[paid_c.index(m) + 1:]
-                            for r in rest:
-                                probes.append(ModelProbe(
-                                    id=r.id, score=r.score, free=False, status="skipped",
-                                    error=f"skipped - account balance is {balance}"))
-                            break
-                    if p.works:
-                        break
+            return _pick(base_url, working, probes, len(infos), len(free), None)
 
     working = [p for p in probes if p.works]
     if working:

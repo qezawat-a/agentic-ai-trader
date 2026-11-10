@@ -116,6 +116,162 @@ def _check_str(value: Any, field: str) -> str:
     return s
 
 
+def _check_order_enums(side: Any, orderType: Any, tradeSide: Any,
+                       effect: Any) -> tuple[str, str, str | None, str | None]:
+    """The four order enums, normalized to uppercase and checked."""
+    side = _norm(side)
+    _check(side in SIDES, "side", "BUY, SELL")
+    orderType = _norm(orderType)
+    _check(orderType in ORDER_TYPES, "orderType", "LIMIT, MARKET")
+    tradeSide = _norm(tradeSide)
+    _check(tradeSide is None or tradeSide in TRADE_SIDES, "tradeSide",
+           "OPEN, CLOSE (or omit in one-way mode)")
+    if effect is not None:
+        effect = _norm(effect)
+        _check(effect in EFFECTS, "effect", "GTC, IOC, FOK, POST_ONLY")
+    return side, orderType, tradeSide, effect
+
+
+def _check_tpsl_enums(tpStopType: Any, slStopType: Any, tpOrderType: Any,
+                      slOrderType: Any) -> tuple[str | None, str | None,
+                                               str | None, str | None]:
+    """The TP/SL enums, normalized to uppercase and checked."""
+    if tpStopType is not None:
+        tpStopType = _norm(tpStopType)
+        _check(tpStopType in STOP_TYPES, "tpStopType", "MARK_PRICE, LAST_PRICE")
+    if slStopType is not None:
+        slStopType = _norm(slStopType)
+        _check(slStopType in STOP_TYPES, "slStopType", "MARK_PRICE, LAST_PRICE")
+    if tpOrderType is not None:
+        tpOrderType = _norm(tpOrderType)
+        _check(tpOrderType in ORDER_PRICE_TYPES, "tpOrderType", "LIMIT, MARKET")
+    if slOrderType is not None:
+        slOrderType = _norm(slOrderType)
+        _check(slOrderType in ORDER_PRICE_TYPES, "slOrderType", "LIMIT, MARKET")
+    return tpStopType, slStopType, tpOrderType, slOrderType
+
+
+def _format_qty_and_price(qty: Any, price: Any, rules: PairRules | None,
+                           orderType: str) -> tuple[str, str | None]:
+    """The qty and price as strings, against the symbol's rules."""
+    qty_s = _check_str(qty, "qty")
+    price_s = _check_str(price, "price") if price is not None else None
+    if rules is None:
+        return qty_s, price_s
+
+    try:
+        qty_f = float(qty_s)
+    except ValueError:
+        raise OrderValidationError(f"order field 'qty' is not a number: {qty_s!r}")
+    if qty_f < rules.min_trade_volume:
+        raise OrderValidationError(
+            f"order field 'qty' {qty_s} is below the symbol minimum "
+            f"minTradeVolume={rules.min_trade_volume}")
+    if rules.max_market_order_volume and orderType == "MARKET" \
+            and qty_f > rules.max_market_order_volume:
+        raise OrderValidationError(
+            f"order field 'qty' {qty_s} exceeds maxMarketOrderVolume="
+            f"{rules.max_market_order_volume}")
+    if rules.max_limit_order_volume and orderType == "LIMIT" \
+            and qty_f > rules.max_limit_order_volume:
+        raise OrderValidationError(
+            f"order field 'qty' {qty_s} exceeds maxLimitOrderVolume="
+            f"{rules.max_limit_order_volume}")
+    # re-format to the symbol's precision (never send more decimals than allowed)
+    qty_s = format_qty(qty_f, rules)
+    if price_s is not None:
+        try:
+            price_f = float(price_s)
+        except ValueError:
+            raise OrderValidationError(f"order field 'price' is not a number: {price_s!r}")
+        price_s = format_price(price_f, rules)
+    return qty_s, price_s
+
+
+def _check_order_type_rules(orderType: str, price_s: str | None,
+                            effect: str | None) -> str | None:
+    """The LIMIT / MARKET rules. Returns the (possibly defaulted) effect."""
+    if orderType == "LIMIT":
+        if price_s is None:
+            raise OrderValidationError("order field 'price' is required for LIMIT orders.")
+        if effect is None:
+            effect = "GTC"
+    else:  # MARKET
+        if price_s is not None:
+            raise OrderValidationError(
+                "order field 'price' must be ABSENT for MARKET orders (got "
+                f"{price_s!r}). Bitunix rejects a price on a market order.")
+        if effect is not None:
+            raise OrderValidationError(
+                "order field 'effect' is only valid for LIMIT orders.")
+    return effect
+
+
+def _check_trade_side_and_position(tradeSide: str | None,
+                                   positionId: str | None) -> None:
+    """tradeSide and positionId must agree.
+
+    Official place_order: "tradeSide - Only required in hedge-mode" and
+    "positionId - Only required when tradeSide is CLOSE". So tradeSide=None
+    (one-way mode) means neither field is sent: the position is identified by
+    the symbol (one position per symbol in one-way mode) plus reduceOnly.
+    """
+    if tradeSide is None and positionId is not None:
+        raise OrderValidationError(
+            "order field 'positionId' is only valid together with tradeSide.")
+    if tradeSide == "CLOSE" and positionId is None:
+        raise OrderValidationError(
+            "order field 'positionId' is required when tradeSide == CLOSE.")
+    if tradeSide == "OPEN" and positionId is not None:
+        raise OrderValidationError(
+            "order field 'positionId' is only valid when tradeSide == CLOSE.")
+
+
+def _price_field(v: Any, field: str, rules: PairRules | None) -> str | None:
+    """A TP/SL price as a string, respecting the symbol's tick size."""
+    if v is None:
+        return None
+    s = _check_str(v, field)
+    if rules is not None:
+        try:
+            s = format_price(float(s), rules)
+        except ValueError:
+            raise OrderValidationError(f"order field '{field}' is not a number: {s!r}")
+    return s
+
+
+def _validate_tpsl_placement(sym: str, side: str, tpPrice: str | None,
+                             slPrice: str | None, rules: PairRules | None, *,
+                             mark_price: float | None, entry_price: float | None,
+                             min_stop_ticks: int) -> None:
+    """The TP/SL must sit on the correct side of the mark and the entry.
+
+    The exchange enforces this (30020-30033) and rejects the whole order, so
+    refuse locally with the numbers instead of sending it.
+    """
+    if rules is None or (tpPrice is None and slPrice is None):
+        return
+    ref_mark = mark_price if (mark_price is not None and mark_price > 0) else None
+    ref_entry = entry_price if (entry_price is not None and entry_price > 0) else None
+    if ref_mark is None and ref_entry is None:
+        raise OrderValidationError(
+            "cannot validate TP/SL: neither mark_price nor entry_price was "
+            "supplied, so the correct side is unknown. Pass mark_price.")
+    ref_mark = ref_mark if ref_mark is not None else ref_entry
+    ref_entry = ref_entry if ref_entry is not None else ref_mark
+    # BUY opens a long, SELL opens a short (tradeSide == OPEN).
+    direction = "LONG" if side == "BUY" else "SHORT"
+    violations = validate_tpsl_side(
+        symbol=sym, side=direction, entry=ref_entry, mark=ref_mark,
+        sl=float(slPrice) if slPrice is not None else None,
+        tp=float(tpPrice) if tpPrice is not None else None,
+        rules=rules, min_ticks=min_stop_ticks)
+    if violations:
+        raise OrderValidationError(
+            "TP/SL on the wrong side of the price - the exchange would "
+            "reject this order:\n  " + "\n  ".join(violations))
+
+
 def build_order_body(*, symbol: str, qty: Any, side: str, orderType: str,
                      tradeSide: str | None = "OPEN", price: Any = None,
                      positionId: str | None = None, effect: str | None = None,
@@ -138,92 +294,19 @@ def build_order_body(*, symbol: str, qty: Any, side: str, orderType: str,
             f"{sym} is not a listed futures symbol. Closest matches: {', '.join(close) or 'none'}")
 
     # --- enums (case-insensitive, normalized to uppercase)
-    side = _norm(side)
-    _check(side in SIDES, "side", "BUY, SELL")
-    orderType = _norm(orderType)
-    _check(orderType in ORDER_TYPES, "orderType", "LIMIT, MARKET")
-    tradeSide = _norm(tradeSide)
-    _check(tradeSide is None or tradeSide in TRADE_SIDES, "tradeSide",
-           "OPEN, CLOSE (or omit in one-way mode)")
-    if effect is not None:
-        effect = _norm(effect)
-        _check(effect in EFFECTS, "effect", "GTC, IOC, FOK, POST_ONLY")
-    if tpStopType is not None:
-        tpStopType = _norm(tpStopType)
-        _check(tpStopType in STOP_TYPES, "tpStopType", "MARK_PRICE, LAST_PRICE")
-    if slStopType is not None:
-        slStopType = _norm(slStopType)
-        _check(slStopType in STOP_TYPES, "slStopType", "MARK_PRICE, LAST_PRICE")
-    if tpOrderType is not None:
-        tpOrderType = _norm(tpOrderType)
-        _check(tpOrderType in ORDER_PRICE_TYPES, "tpOrderType", "LIMIT, MARKET")
-    if slOrderType is not None:
-        slOrderType = _norm(slOrderType)
-        _check(slOrderType in ORDER_PRICE_TYPES, "slOrderType", "LIMIT, MARKET")
+    side, orderType, tradeSide, effect = _check_order_enums(
+        side, orderType, tradeSide, effect)
+    tpStopType, slStopType, tpOrderType, slOrderType = _check_tpsl_enums(
+        tpStopType, slStopType, tpOrderType, slOrderType)
 
-    # --- qty / price strings
-    qty_s = _check_str(qty, "qty")
-    price_s = _check_str(price, "price") if price is not None else None
-
-    # --- precision / min / max against the symbol's rules
-    if rules is not None:
-        try:
-            qty_f = float(qty_s)
-        except ValueError:
-            raise OrderValidationError(f"order field 'qty' is not a number: {qty_s!r}")
-        if qty_f < rules.min_trade_volume:
-            raise OrderValidationError(
-                f"order field 'qty' {qty_s} is below the symbol minimum "
-                f"minTradeVolume={rules.min_trade_volume}")
-        if rules.max_market_order_volume and orderType == "MARKET" \
-                and qty_f > rules.max_market_order_volume:
-            raise OrderValidationError(
-                f"order field 'qty' {qty_s} exceeds maxMarketOrderVolume="
-                f"{rules.max_market_order_volume}")
-        if rules.max_limit_order_volume and orderType == "LIMIT" \
-                and qty_f > rules.max_limit_order_volume:
-            raise OrderValidationError(
-                f"order field 'qty' {qty_s} exceeds maxLimitOrderVolume="
-                f"{rules.max_limit_order_volume}")
-        # re-format to the symbol's precision (never send more decimals than allowed)
-        qty_s = format_qty(qty_f, rules)
-        if price_s is not None:
-            try:
-                price_f = float(price_s)
-            except ValueError:
-                raise OrderValidationError(f"order field 'price' is not a number: {price_s!r}")
-            price_s = format_price(price_f, rules)
+    # --- qty / price strings, formatted to the symbol's rules
+    qty_s, price_s = _format_qty_and_price(qty, price, rules, orderType)
 
     # --- LIMIT / MARKET rules
-    if orderType == "LIMIT":
-        if price_s is None:
-            raise OrderValidationError("order field 'price' is required for LIMIT orders.")
-        if effect is None:
-            effect = "GTC"
-    else:  # MARKET
-        if price_s is not None:
-            raise OrderValidationError(
-                "order field 'price' must be ABSENT for MARKET orders (got "
-                f"{price_s!r}). Bitunix rejects a price on a market order.")
-        if effect is not None:
-            raise OrderValidationError(
-                "order field 'effect' is only valid for LIMIT orders.")
+    effect = _check_order_type_rules(orderType, price_s, effect)
 
     # --- tradeSide / positionId
-    #
-    # Official place_order: "tradeSide - Only required in hedge-mode" and
-    # "positionId - Only required when tradeSide is CLOSE". So tradeSide=None
-    # (one-way mode) means neither field is sent: the position is identified by
-    # the symbol (one position per symbol in one-way mode) plus reduceOnly.
-    if tradeSide is None and positionId is not None:
-        raise OrderValidationError(
-            "order field 'positionId' is only valid together with tradeSide.")
-    if tradeSide == "CLOSE" and positionId is None:
-        raise OrderValidationError(
-            "order field 'positionId' is required when tradeSide == CLOSE.")
-    if tradeSide == "OPEN" and positionId is not None:
-        raise OrderValidationError(
-            "order field 'positionId' is only valid when tradeSide == CLOSE.")
+    _check_trade_side_and_position(tradeSide, positionId)
 
     # --- reduceOnly
     if reduceOnly is not None and not isinstance(reduceOnly, bool):
@@ -238,45 +321,17 @@ def build_order_body(*, symbol: str, qty: Any, side: str, orderType: str,
                 f"order field 'clientId' must be alphanumeric and <= {CLIENT_ID_MAX} chars.")
 
     # --- TP/SL prices must be STRINGS respecting tick size
-    def _price_field(v: Any, field: str) -> str | None:
-        if v is None:
-            return None
-        s = _check_str(v, field)
-        if rules is not None:
-            try:
-                s = format_price(float(s), rules)
-            except ValueError:
-                raise OrderValidationError(f"order field '{field}' is not a number: {s!r}")
-        return s
-
-    tpPrice = _price_field(tpPrice, "tpPrice")
-    slPrice = _price_field(slPrice, "slPrice")
-    tpOrderPrice = _price_field(tpOrderPrice, "tpOrderPrice")
-    slOrderPrice = _price_field(slOrderPrice, "slOrderPrice")
+    tpPrice = _price_field(tpPrice, "tpPrice", rules)
+    slPrice = _price_field(slPrice, "slPrice", rules)
+    tpOrderPrice = _price_field(tpOrderPrice, "tpOrderPrice", rules)
+    slOrderPrice = _price_field(slOrderPrice, "slOrderPrice", rules)
 
     # --- TP/SL must sit on the correct side of BOTH the mark price and the
     # entry price. The exchange enforces this (30020-30033) and rejects the
     # whole order, so refuse locally with the numbers instead of sending it.
-    if rules is not None and (tpPrice is not None or slPrice is not None):
-        ref_mark = mark_price if (mark_price is not None and mark_price > 0) else None
-        ref_entry = entry_price if (entry_price is not None and entry_price > 0) else None
-        if ref_mark is None and ref_entry is None:
-            raise OrderValidationError(
-                "cannot validate TP/SL: neither mark_price nor entry_price was "
-                "supplied, so the correct side is unknown. Pass mark_price.")
-        ref_mark = ref_mark if ref_mark is not None else ref_entry
-        ref_entry = ref_entry if ref_entry is not None else ref_mark
-        # BUY opens a long, SELL opens a short (tradeSide == OPEN).
-        direction = "LONG" if side == "BUY" else "SHORT"
-        violations = validate_tpsl_side(
-            symbol=sym, side=direction, entry=ref_entry, mark=ref_mark,
-            sl=float(slPrice) if slPrice is not None else None,
-            tp=float(tpPrice) if tpPrice is not None else None,
-            rules=rules, min_ticks=min_stop_ticks)
-        if violations:
-            raise OrderValidationError(
-                "TP/SL on the wrong side of the price - the exchange would "
-                "reject this order:\n  " + "\n  ".join(violations))
+    _validate_tpsl_placement(sym, side, tpPrice, slPrice, rules,
+                             mark_price=mark_price, entry_price=entry_price,
+                             min_stop_ticks=min_stop_ticks)
 
     spec = OrderSpec(
         symbol=sym, qty=qty_s, side=side, tradeSide=tradeSide, orderType=orderType,

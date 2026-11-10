@@ -43,6 +43,6 @@ class VwapBreakdownAlert(BaseStrategy):
 
         ind = {"vwap": round(v, 6), "close": closes[-1], "macd": last(line), "dist_pct": round(dist, 3)}
         if conf >= 60 and below:
-            return self.signal("SHORT", conf, f"VWAP breakdown ({dist:.2f}% below)", timeframe, symbol, ind,
+            return self.signal("SHORT", conf, f"VWAP breakdown ({dist:.2f}% below)", timeframe=timeframe, symbol=symbol, indicators=ind,
                                tags=["risk_alert"])
         return self.neutral("price above VWAP", timeframe, symbol, ind)

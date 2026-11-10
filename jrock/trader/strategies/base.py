@@ -49,7 +49,7 @@ class BaseStrategy:
                 indicators: dict | None = None) -> Signal:
         return Signal(self.name, "NEUTRAL", 0.0, reason, timeframe, symbol, indicators or {})
 
-    def signal(self, direction: str, confidence: float, reason: str,
+    def signal(self, direction: str, confidence: float, reason: str, *,
                timeframe: str = "", symbol: str = "",
                indicators: dict | None = None, tags: list[str] | None = None) -> Signal:
         return Signal(self.name, direction, max(0.0, min(100.0, confidence)),

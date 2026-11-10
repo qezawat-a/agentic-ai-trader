@@ -118,13 +118,49 @@ class EngineState:
     account_sl_usdt: float = 0.0
 
 
+@dataclass
+class _EntryContext:
+    """Everything one entry attempt needs, in one object.
+
+    The pre-flight changes the size, the leverage and the plan several times:
+    the tier cap lowers the leverage, which re-sizes the order, which re-plans
+    the stop. One object carries them so the steps stay in order and cannot
+    drift apart - and so the steps can be split into functions without every
+    one of them taking ten parameters.
+    """
+    sym: str
+    side: str
+    price: float
+    mark: float
+    equity: float
+    rules: PairRules
+    tiers: list[Tier]
+    agg: Aggregate
+    leverage: int = 0
+    qty: float = 0.0
+    notional: float = 0.0
+    plan: Any = None
+    notes: list[str] = field(default_factory=list)
+
+
 class TraderEngine:
     def __init__(self, settings: Settings, data_dir: Path | None = None,
                  store: Store | None = None):
         self.s = settings
         self.data_dir = data_dir or settings.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.state = EngineState(
+        self.state = self._build_state(settings)
+        self.client = BitunixClient(BitunixConfig(
+            api_key=settings.bitunix_api_key,
+            api_secret=settings.bitunix_api_secret,
+            base_url=settings.bitunix_base_url,
+            ws_public=settings.bitunix_ws_public,
+        ))
+        self._init_runtime(settings, store)
+
+    def _build_state(self, settings: Settings) -> EngineState:
+        """The engine's live settings, seeded from the config."""
+        return EngineState(
             symbols=list(settings.symbols),
             leverage=settings.leverage,
             margin_mode=settings.margin_mode,
@@ -146,12 +182,9 @@ class TraderEngine:
             account_tp_usdt=settings.account_tp_usdt,
             account_sl_usdt=settings.account_sl_usdt,
         )
-        self.client = BitunixClient(BitunixConfig(
-            api_key=settings.bitunix_api_key,
-            api_secret=settings.bitunix_api_secret,
-            base_url=settings.bitunix_base_url,
-            ws_public=settings.bitunix_ws_public,
-        ))
+
+    def _init_runtime(self, settings: Settings, store: Store | None) -> None:
+        """Everything that is runtime state rather than configuration."""
         # The exchange's real position mode, cached. `state.position_mode` is only
         # the bot's intent: a rejected change_position_mode leaves them different,
         # and the order body must follow what the exchange actually reports.
@@ -163,6 +196,9 @@ class TraderEngine:
         self.positions: dict[str, PositionState] = {}
         #: symbol -> when it was closed (epoch). Drives the re-entry cooldown.
         self._closed_at: dict[str, float] = {}
+        #: symbols the exchange says cannot be traded (error 20015). Scanned
+        #: once, then skipped: retrying them every cycle was pure noise.
+        self._untradable: dict[str, str] = {}
         self.last_aggregates: dict[str, Aggregate] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
@@ -186,12 +222,8 @@ class TraderEngine:
         self.tpsl_path = self.data_dir / "tpsl.jsonl"
         self.signals_path = self.data_dir / "signals.jsonl"
         # --- persistence: one store owns every durable value
-        self.store = store if store is not None else Store(data_dir=self.data_dir)
+        self.store = self._open_store(settings, store)
         self._snapshot: dict[str, Any] = {}
-        if settings.bitunix_api_key:
-            self.store.register_secret(settings.bitunix_api_key)
-        if settings.bitunix_api_secret:
-            self.store.register_secret(settings.bitunix_api_secret)
         self.restored = self._restore_from_store()
         #: set on restore when autotrade was ON before the restart, so the
         #: banner can say so out loud instead of silently resuming live orders.
@@ -200,6 +232,15 @@ class TraderEngine:
         self.engine_was_on: bool = False
         # Optional hook so the agent can add its own settings to `status`.
         self.status_extra: Callable[[], list[str]] | None = None
+
+    def _open_store(self, settings: Settings, store: Store | None) -> Store:
+        """The store, with the API secrets registered as secrets."""
+        st = store if store is not None else Store(data_dir=self.data_dir)
+        if settings.bitunix_api_key:
+            st.register_secret(settings.bitunix_api_key)
+        if settings.bitunix_api_secret:
+            st.register_secret(settings.bitunix_api_secret)
+        return st
 
     # ============================================================== persistence
     #: EngineState fields that survive a restart. Deliberately excludes
@@ -737,11 +778,23 @@ class TraderEngine:
 
     # ================================================================ scanning
     async def scan_symbol(self, symbol: str) -> Aggregate:
+        if symbol in self._untradable:
+            return Aggregate(symbol=symbol)
         per_tf: dict[str, list] = {}
         for tf in self.state.timeframes:
             try:
                 candles = await self.get_candles(symbol, tf, 300)
             except BitunixAPIError as e:
+                if e.code == 20015:
+                    # The exchange says this futures pair cannot be traded.
+                    # Retrying it every timeframe of every cycle filled the
+                    # report with errors that were not failures - the symbol
+                    # is simply not tradable. Learn it once and skip it.
+                    self._untradable[symbol] = str(e)
+                    self.state.errors.append(
+                        f"skip {symbol}: not tradable ({e}) - removed from "
+                        f"the scan")
+                    return Aggregate(symbol=symbol)
                 self.state.errors.append(f"kline {symbol} {tf}: {e}")
                 continue
             if not candles:
@@ -876,34 +929,632 @@ class TraderEngine:
                 f"open and close it again in a loop")
 
     async def try_enter(self, agg: Aggregate) -> dict:
+        ctx, err = await self._entry_context(agg)
+        if err is not None:
+            return err
+        assert ctx is not None
+        sym, side, price, mark = ctx.sym, ctx.side, ctx.price, ctx.mark
+        rules, equity, tiers = ctx.rules, ctx.equity, ctx.tiers
+
+        err = self._resolve_leverage(ctx)
+        if err is not None:
+            return err
+        err = self._size_position(ctx)
+        if err is not None:
+            return err
+        err = self._apply_tier_cap(ctx)
+        if err is not None:
+            return err
+        err = self._preflight_balance(ctx)
+        if err is not None:
+            return err
+        plan = ctx.plan
+        assert plan is not None
+
+        await self._apply_leverage_and_margin_mode(ctx)
+
+        order_side = "BUY" if side == "LONG" else "SELL"
+
+        # The trigger type is read ONCE and used for both the local validation
+        # below and the tpStopType/slStopType sent on the wire. Reading it twice
+        # is how the two can drift apart.
+        trigger_type = TRIGGER_TYPE
+
+        # --- re-read the mark price immediately before sending and re-clamp.
+        # The plan above was built from a mark read several round-trips ago
+        # (account, tiers, margin mode, leverage). On a fast-moving symbol the
+        # mark can cross the stop in that window, and the exchange validates
+        # against the mark at the moment the request lands - not the one we
+        # planned with. Re-clamping here is what makes the stop safe on the
+        # wire rather than only at planning time.
+        mark_now = await self.get_trigger_price(sym, last=price)
+        if mark_now > 0:
+            mark = ctx.mark = mark_now
+        plan.sl = clamp_sl(side=side, sl=plan.sl, entry=price, mark=mark,
+                           rules=rules, min_ticks=MIN_STOP_TICKS,
+                           liq=plan.liq)
+        plan.tp = clamp_tp(side=side, tp=plan.tp, entry=price, mark=mark,
+                           rules=rules, min_ticks=MIN_STOP_TICKS)
+
+        # --- which TP goes on the entry order.
+        partial_method, rungs, tp_for_order = self._entry_exits(ctx)
+
+        if not self._tpsl_side_ok(sym, side, price, mark, sl=plan.sl,
+                                  tp=tp_for_order, rules=rules):
+            return {"ok": False,
+                    "reason": "TP/SL would be rejected by the exchange after the "
+                              "mark price moved; order not sent"}
+
+        body, err = await self._build_entry_body(ctx, order_side, plan,
+                                                  tp_for_order, trigger_type)
+        if err is not None:
+            return err
+        res, err = await self._send_entry_order(ctx, body)
+        if err is not None:
+            return err
+
+        order_id = str(order_row(res).get("orderId") or "")
+        self._log_trade({
+            "event": "open", "ts": time.time(), "symbol": sym, "side": side,
+            "qty": ctx.qty, "entry": price, "order_id": order_id,
+            "confidence": round(ctx.agg.confidence, 2), "strength": ctx.agg.strength,
+            "agreeing": ctx.agg.agreeing, "plan": plan.as_dict(),
+        })
+        self._log_tpsl({"event": "placed", "ts": time.time(), "symbol": sym,
+                        "order_id": order_id, **plan.as_dict()})
+
+        # register runtime state
+        await self._register_filled_position(ctx, plan, partial_method, rungs,
+                                             trigger_type)
+
+        return {"ok": True, "order_id": order_id, "symbol": sym, "side": side,
+                "qty": ctx.qty, "entry": price, "plan": plan.as_dict()}
+
+    def _resolve_leverage(self, ctx: _EntryContext) -> dict | None:
+        """The leverage THIS order may use, and the provisional TP/SL plan.
+
+        The provisional plan is needed BEFORE the size: the stop distance is
+        what the risk sizing divides by.
+        """
+        # --- leverage feasibility against the STOP, not just the balance.
+        #
+        # A stop must sit strictly between the liquidation price and the
+        # mark-side limit. The liquidation price is derived from the ENTRY, and
+        # a MARKET order fills at the last price - which can be on the far side
+        # of the mark. At 100x with a 0.5% maintenance margin the liquidation
+        # price lands ~0.5% below the entry, so when the mark already sits
+        # 1.3% below the last price the liquidation price is ABOVE the mark and
+        # there is no room for a stop at all. The engine then raised
+        # "no valid stop-loss exists" on every scan, forever, for a symbol it
+        # could have traded perfectly well at a lower leverage.
+        #
+        # The worst-case fill is the price that makes the liquidation price
+        # closest to the mark: the HIGHER of last/mark for a LONG, the LOWER
+        # for a SHORT. Solving the liquidation formula for L gives the highest
+        # leverage at which a stop still fits.
+        worst_entry = max(ctx.price, ctx.mark) if ctx.side == "LONG" else min(ctx.price, ctx.mark)
+
+        # --- leverage for THIS order, resolved locally.
+        #
+        # `self.state.leverage` is the user's setting and is NEVER written here.
+        # It used to be mutated in place when a stop did not fit, which meant a
+        # single awkward symbol silently rewrote the leverage for every other
+        # symbol and every later scan - and, worse, made a margin problem look
+        # like it had been "fixed" by lowering leverage. Leverage and margin are
+        # independent knobs: margin decides how much of the balance one position
+        # locks, leverage only decides how much notional that margin controls.
+        # The ONLY reasons to use a different leverage for one order are the two
+        # the exchange itself imposes: no room for a stop, or a tier cap.
+        ctx.leverage = int(self.state.leverage)
+        ctx.notes: list[str] = []
+
+        lev_tier = tier_for_leverage(ctx.tiers, ctx.leverage) or pick_tier(ctx.tiers, 0.0)
+        max_lev_for_stop = max_leverage_for_stop(
+            entry=worst_entry, mark=ctx.mark, side=ctx.side,
+            maintenance_margin_rate=lev_tier.maintenance_margin_rate,
+            rules=ctx.rules, min_ticks=MIN_STOP_TICKS)
+
+        if max_lev_for_stop <= 0:
+            msg = (f"{ctx.sym}: no stop-loss can fit at any leverage - the mark "
+                   f"price {ctx.mark:.{ctx.rules.quote_precision}f} has already moved "
+                   f"past the entry {ctx.price:.{ctx.rules.quote_precision}f} by more "
+                   f"than the maintenance margin allows. Wait for the price to "
+                   f"come back, or skip this signal.")
+            self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+            return {"ok": False, "reason": msg}
+
+        if ctx.leverage > max_lev_for_stop:
+            err = self._auto_reduced_leverage(ctx, max_lev_for_stop)
+            if err is not None:
+                return err
+
+        # The largest notional this balance can actually PAY FOR at the
+        # configured leverage - margin PLUS the taker fee, with the safety
+        # headroom. This is the true upper bound of the order.
+        # (`equity * leverage` ignored the fee and over-stated the bound, which
+        # also pushed the tier selection into a higher band than the real order.)
+        max_notional = max_notional_for_balance(
+            ctx.equity, ctx.leverage, self.s.taker_fee_rate,
+            self.s.margin_safety_pct)
+
+        # Provisional plan: only the stop-loss is needed here, to size the
+        # order. It is built at a notional whose tier still permits the
+        # configured leverage - at a high leverage the affordable maximum can
+        # land in a tier whose maintenance-margin rate makes the liquidation
+        # formula degenerate (liq on the wrong side of entry), which would
+        # raise TpSlSideError for an order that is actually fine. The tier the
+        # REAL order notional lands in is checked after sizing.
+        prov_tier = tier_for_leverage(ctx.tiers, ctx.leverage)
+        return self._provisional_plan(ctx, prov_tier, max_notional)
+
+    def _auto_reduced_leverage(self, ctx: _EntryContext,
+                               max_lev_for_stop: int) -> dict | None:
+        """The leverage that still leaves room for a stop - or the reason not.
+
+        Clamping to the highest leverage that still leaves room for a stop is
+        the difference between "the bot never trades this symbol" and "the bot
+        trades it at a sane leverage". The user's setting is never changed.
+        """
+        if self.s.leverage_auto_reduce:
+            log.warning(
+                "%s: leverage %dx leaves no room for a stop-loss between "
+                "the liquidation price and the mark %s (entry %s) - "
+                "using %dx for this order (the setting is unchanged)",
+                ctx.sym, ctx.leverage, ctx.mark, ctx.price, max_lev_for_stop)
+            ctx.notes.append(
+                f"leverage {ctx.sym}: {ctx.leverage}x leaves no room for a "
+                f"stop-loss (mark {ctx.mark:.{ctx.rules.quote_precision}f}, entry "
+                f"{ctx.price:.{ctx.rules.quote_precision}f}); using "
+                f"{max_lev_for_stop}x for this order")
+            ctx.leverage = max_lev_for_stop
+            return None
+        msg = (f"leverage {ctx.leverage}x leaves no room for a "
+               f"stop-loss on {ctx.sym}: the stop must sit between the "
+               f"liquidation price and the mark "
+               f"{ctx.mark:.{ctx.rules.quote_precision}f} (entry "
+               f"{ctx.price:.{ctx.rules.quote_precision}f}), and at "
+               f"{ctx.leverage}x the liquidation price is already "
+               f"past the mark. The highest leverage that still fits is "
+               f"{max_lev_for_stop}x. Lower the leverage, or set "
+               f"LEVERAGE_AUTO_REDUCE=true to let the engine clamp it.")
+        self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+        return {"ok": False, "reason": msg}
+
+    def _provisional_plan(self, ctx: _EntryContext, prov_tier: Any,
+                           max_notional: float) -> dict | None:
+        """The plan before the size is known: the stop the sizing divides by."""
+        if prov_tier is None:
+            # The exchange caps leverage below the setting at EVERY size. That
+            # is the one documented reason to lower it, so lower it to the
+            # exchange's own maximum and carry on - refusing here would leave
+            # the user with a symbol that can never trade.
+            max_lev = max((t.leverage for t in ctx.tiers), default=0)
+            if max_lev <= 0:
+                msg = (f"leverage {ctx.leverage}x is above the maximum allowed for "
+                       f"{ctx.sym} at any position size, and the exchange reported "
+                       f"no usable tier. Lower the leverage.")
+                self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+                return {"ok": False, "reason": msg}
+            ctx.notes.append(
+                f"leverage {ctx.sym}: {ctx.leverage}x is above the exchange maximum "
+                f"{max_lev}x for this symbol; using {max_lev}x for this order")
+            ctx.leverage = max_lev
+            prov_tier = tier_for_leverage(ctx.tiers, ctx.leverage) or pick_tier(ctx.tiers, 0.0)
+
+        prov_notional = max_notional
+        if prov_tier.end_value != float("inf") and prov_tier.end_value > 0:
+            prov_notional = min(max_notional, prov_tier.end_value * 0.9999)
+
+        try:
+            ctx.plan = plan_tpsl(
+                side=ctx.side, entry=ctx.price, leverage=ctx.leverage,
+                notional=prov_notional,
+                strength=ctx.agg.strength, confidence=ctx.agg.confidence, tiers=ctx.tiers, rules=ctx.rules,
+                liq_sl_distance_pct=self.state.liq_sl_distance_pct,
+                breakeven_pct=self.state.breakeven_pct,
+                trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
+                mark=ctx.mark, min_stop_ticks=MIN_STOP_TICKS,
+            )
+        except TpSlSideError as e:
+            self.state.errors.append(f"tpsl {ctx.sym}: {e}")
+            return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
+
+        ctx.qty = 0.0
+        return None
+
+    def _size_position(self, ctx: _EntryContext) -> dict | None:
+        """The size of the order, in base coin."""
+        # --- sizing.
+        #
+        # MARGIN_AMOUNT_PCT is the SIZING AUTHORITY when it is set: "use this
+        # share of my balance as margin on this position". It used to be passed
+        # to position_size_by_risk as an upper bound, and because the risk-based
+        # size was almost always the smaller of the two the cap never bound - so
+        # the margin actually locked was whatever risk sizing produced (a 10%
+        # setting produced ~2% of the balance) and the setting looked like it
+        # did nothing. Sizing FROM the percentage is what makes the number the
+        # user set the number they see on the position.
+        #
+        # risk_pct is the fallback for when the knob is 0 (disabled), not a
+        # silent override of it. The risk implied at the stop is reported so the
+        # user can see what the margin target actually costs them.
+        if self.state.margin_amount_pct > 0:
+            ctx.qty = position_size_by_margin(
+                ctx.equity, self.state.margin_amount_pct, ctx.price, ctx.leverage, ctx.rules,
+                fee_rate=self.s.taker_fee_rate,
+                safety_pct=self.s.margin_safety_pct)
+            if ctx.qty > 0 and ctx.plan.sl > 0:
+                implied_risk = abs(ctx.price - ctx.plan.sl) * ctx.qty
+                ctx.notes.append(
+                    f"size {ctx.sym}: MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
+                    f"-> qty {ctx.qty} (notional {ctx.qty * ctx.price:.4f} USDT, margin "
+                    f"{margin_required(ctx.qty * ctx.price, ctx.leverage):.4f} USDT at "
+                    f"{ctx.leverage}x); risk at the stop is {implied_risk:.4f} USDT "
+                    f"({implied_risk / ctx.equity * 100:.2f}% of balance, "
+                    f"risk_pct={self.state.risk_pct:g}% is not applied while "
+                    f"the margin target is set)")
+        else:
+            ctx.qty = position_size_by_risk(
+                ctx.equity, self.state.risk_pct, ctx.price, ctx.plan.sl, ctx.leverage, ctx.rules,
+                fee_rate=self.s.taker_fee_rate,
+                safety_pct=self.s.margin_safety_pct)
+        if ctx.qty <= 0:
+            return {"ok": False, "reason": "computed qty is 0 (risk too small or below min volume)"}
+
+        # ORDER_UNIT only changes how the size is EXPRESSED; the wire format is
+        # always base-coin qty. QUANTITY (the default) is a no-op, so the
+        # historical behaviour is unchanged. NOTIONAL/COST re-derive qty from
+        # the risk-sized notional/margin so the two can never disagree.
+        order_unit = (self.s.order_unit or "QUANTITY").upper()
+        if order_unit != "QUANTITY":
+            sized_notional = ctx.qty * ctx.price
+            amount = unit_from_qty(ctx.qty, order_unit, ctx.price, ctx.leverage)
+            ctx.qty = qty_from_unit(amount, order_unit, ctx.price, ctx.leverage, ctx.rules)
+            if ctx.qty <= 0:
+                return {"ok": False,
+                        "reason": f"computed qty is 0 in {order_unit} units "
+                                  f"(amount={amount}, notional={sized_notional})"}
+
+        return None
+
+    def _apply_tier_cap(self, ctx: _EntryContext) -> dict | None:
+        """The exchange tier cap: lower the leverage, re-size, re-plan."""
+        # --- pre-flight: the required margin must fit the real available
+        # balance, and the engine's own bounds. Without this the request is
+        # sent and the exchange answers 20003 Insufficient balance.
+        ctx.notional = ctx.qty * ctx.price
+
+        # The tier the REAL order notional lands in caps the leverage. Checked
+        # against the actual notional, not `equity * leverage` (which lands in a
+        # higher tier and produced a bogus 20003 for an order that was fine).
+        #
+        # When the tier does cap it, the exchange's own maximum is the answer:
+        # lower the leverage to that cap, re-size and re-plan, and say so. The
+        # loop is bounded because each pass can only lower the leverage, and a
+        # lower leverage at a fixed margin budget means a smaller notional,
+        # which lands in a tier that permits at least as much leverage.
+        for _ in range(3):
+            tier_msg = tier_leverage_violation(ctx.tiers, ctx.notional, ctx.leverage)
+            if not tier_msg:
+                break
+            cap = pick_tier(ctx.tiers, ctx.notional).leverage
+            if cap <= 0 or cap >= ctx.leverage:
+                msg = f"{ctx.sym}: {tier_msg}"
+                self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+                return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+            ctx.notes.append(
+                f"leverage {ctx.sym}: {ctx.leverage}x exceeds the exchange tier cap "
+                f"{cap}x for a {ctx.notional:.2f} USDT position; using {cap}x "
+                f"for this order")
+            ctx.leverage = cap
+            if self.state.margin_amount_pct > 0:
+                ctx.qty = position_size_by_margin(
+                    ctx.equity, self.state.margin_amount_pct, ctx.price, ctx.leverage, ctx.rules,
+                    fee_rate=self.s.taker_fee_rate,
+                    safety_pct=self.s.margin_safety_pct)
+            else:
+                ctx.qty = position_size_by_risk(
+                    ctx.equity, self.state.risk_pct, ctx.price, ctx.plan.sl, ctx.leverage, ctx.rules,
+                    fee_rate=self.s.taker_fee_rate,
+                    safety_pct=self.s.margin_safety_pct)
+            if ctx.qty <= 0:
+                return {"ok": False,
+                        "reason": "computed qty is 0 after the exchange tier "
+                                  "capped the leverage"}
+            ctx.notional = ctx.qty * ctx.price
+            try:
+                ctx.plan = plan_tpsl(
+                    side=ctx.side, entry=ctx.price, leverage=ctx.leverage,
+                    notional=ctx.notional, strength=ctx.agg.strength,
+                    confidence=ctx.agg.confidence, tiers=ctx.tiers, rules=ctx.rules,
+                    liq_sl_distance_pct=self.state.liq_sl_distance_pct,
+                    breakeven_pct=self.state.breakeven_pct,
+                    trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
+                    mark=ctx.mark, min_stop_ticks=MIN_STOP_TICKS,
+                )
+            except TpSlSideError as e:
+                self.state.errors.append(f"tpsl {ctx.sym}: {e}")
+                return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
+        else:
+            msg = (f"{ctx.sym}: the exchange tier cap could not be satisfied at any "
+                   f"leverage for a {ctx.notional:.2f} USDT position.")
+            self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+
+        return None
+
+    def _preflight_balance(self, ctx: _EntryContext) -> dict | None:
+        """The margin, the balance and the engine's own bounds."""
+        # A tier/leverage CLAMP is a safety decision, not a routine note: it
+        # stays in `errors` so it cannot be hidden. The routine margin-budget
+        # sizing note below goes to `notes` instead - it used to be reported
+        # as a failure, which buried the real errors behind noise.
+        for note in ctx.notes:
+            self.state.errors.append(note)
+
+        margin_real = margin_required(ctx.notional, ctx.leverage)
+        # Opening a MARKET order costs the initial margin AND a taker fee, and
+        # the exchange deducts BOTH from the available balance at once. Checking
+        # only the margin let `margin == equity` pass locally and then fail on
+        # the exchange with 20003 once the fee was added.
+        fee_real = fee_for_notional(ctx.notional, self.s.taker_fee_rate)
+        required_real = margin_real + fee_real
+        # Reserve the configured headroom so a price move between sizing and the
+        # request landing cannot push the cost back over the balance.
+        usable_equity = ctx.equity * (1.0 - max(0.0, min(0.9, self.s.margin_safety_pct / 100.0)))
+
+        if required_real > usable_equity:
+            msg = (f"insufficient balance for {ctx.sym}: required {required_real:.4f} USDT "
+                   f"(margin {margin_real:.4f} + fee {fee_real:.4f}) vs available "
+                   f"{ctx.equity:.4f} USDT"
+                   + (f" (usable {usable_equity:.4f} after "
+                      f"MARGIN_SAFETY_PCT={self.s.margin_safety_pct:g}%)"
+                      if self.s.margin_safety_pct else "")
+                   + f" for qty={ctx.qty}, notional={ctx.notional:.4f} at "
+                     f"{ctx.leverage}x. Lower the leverage, lower risk_pct, "
+                     f"or add funds.")
+            self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+        # MARGIN_AMOUNT_PCT: the margin this ONE order locks may not exceed the
+        # configured share of the spendable balance. Sizing already targets it,
+        # so this only fires when something downstream (an ORDER_UNIT
+        # re-derivation, a min-volume floor) pushed the size back up. The
+        # correct response is to CLAMP the size to the budget and say so - not
+        # to refuse, and never to touch the leverage, which has nothing to do
+        # with how much of the balance one position may lock.
+        err = self._clamp_to_margin_budget(ctx, margin_real)
+        if err is not None:
+            return err
+        margin_real = margin_required(ctx.notional, ctx.leverage)
+        fee_real = fee_for_notional(ctx.notional, self.s.taker_fee_rate)
+        required_real = margin_real + fee_real
+        err = self._check_engine_bounds(ctx, margin_real)
+        if err is not None:
+            return err
+
+        # re-plan with the real notional
+        try:
+            ctx.plan = plan_tpsl(
+                side=ctx.side, entry=ctx.price, leverage=ctx.leverage,
+                notional=ctx.qty * ctx.price, strength=ctx.agg.strength, confidence=ctx.agg.confidence,
+                tiers=ctx.tiers, rules=ctx.rules,
+                liq_sl_distance_pct=self.state.liq_sl_distance_pct,
+                breakeven_pct=self.state.breakeven_pct,
+                trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
+                mark=ctx.mark, min_stop_ticks=MIN_STOP_TICKS,
+            )
+        except TpSlSideError as e:
+            self.state.errors.append(f"tpsl {ctx.sym}: {e}")
+            return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
+
+        return None
+
+    def _clamp_to_margin_budget(self, ctx: _EntryContext,
+                                margin_real: float) -> dict | None:
+        """Keep the margin this ONE order locks inside its budget.
+
+        MARGIN_AMOUNT_PCT: the margin this ONE order locks may not exceed the
+        configured share of the spendable balance. Sizing already targets it,
+        so this only fires when something downstream (an ORDER_UNIT
+        re-derivation, a min-volume floor) pushed the size back up. The
+        correct response is to CLAMP the size to the budget and say so - not
+        to refuse, and never to touch the leverage, which has nothing to do
+        with how much of the balance one position may lock.
+        """
+        if self.state.margin_amount_pct <= 0:
+            return None
+        budget = margin_budget(ctx.equity, self.state.margin_amount_pct,
+                               self.s.margin_safety_pct)
+        if margin_real <= budget:
+            return None
+        max_notional_budget = max_notional_for_margin(
+            budget, ctx.leverage, self.s.taker_fee_rate)
+        clamped = round_step(max_notional_budget / ctx.price, ctx.rules.base_precision)
+        if clamped < ctx.rules.min_trade_volume:
+            msg = (f"margin {margin_real:.4f} USDT for {ctx.sym} exceeds the "
+                   f"MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
+                   f"budget of {budget:.4f} USDT, and clamping to the "
+                   f"budget leaves {clamped} below the symbol's minimum "
+                   f"volume {ctx.rules.min_trade_volume}. Raise "
+                   f"MARGIN_AMOUNT_PCT or add funds.")
+            self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+            return {"ok": False, "reason": msg}
+        self.state.notes.append(
+            f"margin {ctx.sym}: qty {ctx.qty} would lock {margin_real:.4f} USDT, "
+            f"above the MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
+            f"budget of {budget:.4f} USDT; clamped to qty {clamped} "
+            f"(notional {clamped * ctx.price:.4f} USDT). Leverage is "
+            f"unchanged at {ctx.leverage}x.")
+        ctx.qty = clamped
+        ctx.notional = ctx.qty * ctx.price
+        return None
+
+    def _check_engine_bounds(self, ctx: _EntryContext,
+                             margin_real: float) -> dict | None:
+        """The engine's own margin and notional bounds (MIN/MAX_*_USDT)."""
+        margin_real = margin_real
+        if self.s.min_margin_usdt and margin_real < self.s.min_margin_usdt:
+            msg = (f"required margin {margin_real:.4f} USDT is below the configured "
+                   f"MIN_MARGIN_USDT={self.s.min_margin_usdt} for {ctx.sym} "
+                   f"(qty={ctx.qty}, notional={ctx.notional:.4f}).")
+            self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+            return {"ok": False, "reason": msg}
+        if self.s.max_margin_usdt and margin_real > self.s.max_margin_usdt:
+            msg = (f"required margin {margin_real:.4f} USDT exceeds the configured "
+                   f"MAX_MARGIN_USDT={self.s.max_margin_usdt} for {ctx.sym} "
+                   f"(qty={ctx.qty}, notional={ctx.notional:.4f}).")
+            self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+            return {"ok": False, "reason": msg}
+        if self.s.max_notional_usdt and ctx.notional > self.s.max_notional_usdt:
+            msg = (f"notional {ctx.notional:.4f} USDT exceeds the configured "
+                   f"MAX_NOTIONAL_USDT={self.s.max_notional_usdt} for {ctx.sym} "
+                   f"(qty={ctx.qty}, margin={margin_real:.4f}).")
+            self.state.errors.append(f"preflight {ctx.sym}: {msg}")
+            return {"ok": False, "reason": msg}
+        return None
+
+    async def _apply_leverage_and_margin_mode(self, ctx: _EntryContext) -> None:
+        """Make the exchange's leverage and margin mode match this order."""
+        try:
+            await self.client.change_margin_mode(ctx.sym, self.state.margin_mode)
+        except BitunixAPIError as e:
+            if e.code not in (20006, 20009):
+                self.state.errors.append(f"margin_mode {ctx.sym}: {e}")
+        try:
+            await self.client.change_leverage(ctx.sym, ctx.leverage)
+        except BitunixAPIError as e:
+            if e.code not in (20006,):
+                self.state.errors.append(f"leverage {ctx.sym}: {e}")
+
+    async def _build_entry_body(self, ctx: _EntryContext, order_side: str,
+                                plan: Any, tp_for_order: float | None,
+                                trigger_type: str) -> tuple[dict | None, dict | None]:
+        """The exact body that goes on the wire, after local validation."""
+        try:
+            body = build_order_body(
+                symbol=ctx.sym, qty=ctx.qty, side=order_side,
+                orderType="MARKET", reduceOnly=False,
+                tpPrice=tp_for_order, tpStopType=trigger_type, tpOrderType="MARKET",
+                slPrice=plan.sl, slStopType=trigger_type, slOrderType="MARKET",
+                rules=ctx.rules, known_symbols=set(self.rules) or None,
+                mark_price=ctx.mark, entry_price=ctx.price,
+                min_stop_ticks=MIN_STOP_TICKS,
+                **await self._trade_side_fields("OPEN"),
+            )
+        except OrderValidationError as e:
+            self.state.errors.append(f"order validation {ctx.sym}: {e}")
+            return None, {"ok": False, "reason": f"order validation failed: {e}"}
+        return body, None
+
+    async def _send_entry_order(self, ctx: _EntryContext,
+                                 body: dict) -> tuple[Any, dict | None]:
+        """Send the entry order."""
+        try:
+            res = await self.client.place_order(**body)
+        except BitunixAPIError as e:
+            log_order_body(body, e)
+            self.state.errors.append(f"place_order {ctx.sym}: {e}")
+            return None, {"ok": False, "reason": f"place_order failed: {e}",
+                          "hint": e.hint}
+        return res, None
+
+    def _entry_exits(self, ctx: _EntryContext) -> tuple[bool, list, float | None]:
+        """Which take-profit rides on the entry order, and the rungs that own it.
+
+        With the PARTIAL method the rungs ARE the take-profit plan: each rung
+        becomes its own native tpsl/place_order carrying tpQty (parked right
+        after the fill, see `_place_partial_rungs`). Attaching the whole-position
+        TP here would flatten the entire remainder the moment it is touched, so
+        with PARTIAL the entry order carries the STOP only.
+        """
+        plan = ctx.plan
+        partial_method = (self.state.tpsl_method or "POSITION").upper() == "PARTIAL"
+        rungs: list = []
+        if partial_method:
+            try:
+                rungs = parse_partial_ladder(self.state.partial_tp_ladder)
+            except PartialLadderError as e:
+                plan.notes = (plan.notes + "; " if plan.notes else "") + (
+                    f"PARTIAL ladder invalid ({e}); whole-position TP attached")
+                log.warning("partial ladder %r invalid: %s - using the "
+                            "whole-position TP", self.state.partial_tp_ladder, e)
+                partial_method = False
+            else:
+                if not rungs:
+                    partial_method = False
+                else:
+                    plan.notes = (plan.notes + "; " if plan.notes else "") + (
+                        "PARTIAL ladder: no whole-position TP attached at entry "
+                        f"({len(rungs)} rungs own the exits)")
+        tp_for_order = None if partial_method else plan.tp
+        return partial_method, rungs, tp_for_order
+
+    async def _register_filled_position(self, ctx: _EntryContext, plan: Any,
+                                         partial_method: bool, rungs: list,
+                                         trigger_type: str) -> None:
+        """Record the filled position, and park the PARTIAL rungs on it."""
+        sym = ctx.sym
+        positions = await self.open_positions()
+        for p in positions:
+            if p.get("symbol") != sym:
+                continue
+            pid = str(p.get("positionId"))
+            fill_entry = float(p.get("avgOpenPrice") or ctx.price)
+            fill_qty = float(p.get("qty") or ctx.qty)
+            self.positions[pid] = PositionState(
+                position_id=pid, symbol=sym, side=ctx.side,
+                entry=fill_entry,
+                qty=fill_qty,
+                leverage=int(p.get("leverage") or self.state.leverage),
+                sl=plan.sl, tp=(0.0 if partial_method else plan.tp),
+                liq=float(p.get("liqPrice") or plan.liq),
+                opened_ts=time.time(),
+            )
+            # With the PARTIAL method the rungs are parked at entry as
+            # native exchange-enforced TP orders (tpQty each), so the
+            # exits survive even if this engine dies.
+            if partial_method:
+                await self._place_partial_rungs(
+                    sym, pid, ctx.side, fill_entry, fill_qty,
+                    sl_dist=abs(fill_entry - plan.sl),
+                    rungs=rungs, rules=ctx.rules, trigger_type=trigger_type)
+            break
+        self.persist_positions()
+
+    async def _entry_context(self, agg: Aggregate) -> tuple[_EntryContext | None, dict | None]:
+        """The guards every entry needs, and the numbers it starts from.
+
+        Returns (context, None) when the entry may proceed, or (None, error)
+        with the reason it may not.
+        """
         sym = agg.symbol
         if not agg.actionable:
-            return {"ok": False, "reason": "not actionable"}
+            return None, {"ok": False, "reason": "not actionable"}
 
         # anti-churn: a symbol closed a moment ago is not re-entered
         cool = self._reentry_block(sym)
         if cool:
-            return {"ok": False, "reason": cool}
+            return None, {"ok": False, "reason": cool}
 
         live = await self.live_positions()
         positions = live or []
         self.reconcile_positions(live)
         if len(positions) >= self.state.max_open_positions:
-            return {"ok": False, "reason": f"max open positions ({self.state.max_open_positions}) reached"}
+            return None, {"ok": False, "reason": f"max open positions ({self.state.max_open_positions}) reached"}
         if any(p.get("symbol") == sym for p in positions):
-            return {"ok": False, "reason": f"position already open on {sym}"}
+            return None, {"ok": False, "reason": f"position already open on {sym}"}
 
         if sym not in self.rules:
             await self.load_rules([sym])
         rules = self.rules.get(sym)
         if rules is None:
-            return {"ok": False, "reason": f"no trading rules for {sym}"}
+            return None, {"ok": False, "reason": f"no trading rules for {sym}"}
         if not rules.api_supported or rules.symbol_status != "OPEN":
-            return {"ok": False, "reason": f"{sym} not tradable (status={rules.symbol_status})"}
+            return None, {"ok": False, "reason": f"{sym} not tradable (status={rules.symbol_status})"}
 
         price = await self.get_price(sym)
         if price <= 0:
-            return {"ok": False, "reason": f"no price for {sym}"}
+            return None, {"ok": False, "reason": f"no price for {sym}"}
 
         # Direction is resolved here because the mark-price fallback below
         # needs it. Using it before assignment raised UnboundLocalError on the
@@ -935,480 +1586,14 @@ class TraderEngine:
             a = acct[0] if isinstance(acct, list) and acct else (acct or {})
             equity = spendable_balance(a)
         except BitunixAPIError as e:
-            return {"ok": False, "reason": f"account: {e}"}
+            return None, {"ok": False, "reason": f"account: {e}"}
         if equity <= 0:
-            return {"ok": False, "reason": "no available balance"}
+            return None, {"ok": False, "reason": "no available balance"}
 
         tiers = await self.load_tiers(sym)
-
-        # --- leverage feasibility against the STOP, not just the balance.
-        #
-        # A stop must sit strictly between the liquidation price and the
-        # mark-side limit. The liquidation price is derived from the ENTRY, and
-        # a MARKET order fills at the last price - which can be on the far side
-        # of the mark. At 100x with a 0.5% maintenance margin the liquidation
-        # price lands ~0.5% below the entry, so when the mark already sits
-        # 1.3% below the last price the liquidation price is ABOVE the mark and
-        # there is no room for a stop at all. The engine then raised
-        # "no valid stop-loss exists" on every scan, forever, for a symbol it
-        # could have traded perfectly well at a lower leverage.
-        #
-        # The worst-case fill is the price that makes the liquidation price
-        # closest to the mark: the HIGHER of last/mark for a LONG, the LOWER
-        # for a SHORT. Solving the liquidation formula for L gives the highest
-        # leverage at which a stop still fits.
-        worst_entry = max(price, mark) if side == "LONG" else min(price, mark)
-
-        # --- leverage for THIS order, resolved locally.
-        #
-        # `self.state.leverage` is the user's setting and is NEVER written here.
-        # It used to be mutated in place when a stop did not fit, which meant a
-        # single awkward symbol silently rewrote the leverage for every other
-        # symbol and every later scan - and, worse, made a margin problem look
-        # like it had been "fixed" by lowering leverage. Leverage and margin are
-        # independent knobs: margin decides how much of the balance one position
-        # locks, leverage only decides how much notional that margin controls.
-        # The ONLY reasons to use a different leverage for one order are the two
-        # the exchange itself imposes: no room for a stop, or a tier cap.
-        leverage = int(self.state.leverage)
-        lev_notes: list[str] = []
-
-        lev_tier = tier_for_leverage(tiers, leverage) or pick_tier(tiers, 0.0)
-        max_lev_for_stop = max_leverage_for_stop(
-            entry=worst_entry, mark=mark, side=side,
-            maintenance_margin_rate=lev_tier.maintenance_margin_rate,
-            rules=rules, min_ticks=MIN_STOP_TICKS)
-
-        if max_lev_for_stop <= 0:
-            msg = (f"{sym}: no stop-loss can fit at any leverage - the mark "
-                   f"price {mark:.{rules.quote_precision}f} has already moved "
-                   f"past the entry {price:.{rules.quote_precision}f} by more "
-                   f"than the maintenance margin allows. Wait for the price to "
-                   f"come back, or skip this signal.")
-            self.state.errors.append(f"preflight {sym}: {msg}")
-            return {"ok": False, "reason": msg}
-
-        if leverage > max_lev_for_stop:
-            if self.s.leverage_auto_reduce:
-                # Clamp to the highest leverage that still leaves room for a
-                # stop. This is the difference between "the bot never trades
-                # this symbol" and "the bot trades it at a sane leverage".
-                log.warning(
-                    "%s: leverage %dx leaves no room for a stop-loss between "
-                    "the liquidation price and the mark %s (entry %s) - "
-                    "using %dx for this order (the setting is unchanged)",
-                    sym, leverage, mark, price, max_lev_for_stop)
-                lev_notes.append(
-                    f"leverage {sym}: {leverage}x leaves no room for a "
-                    f"stop-loss (mark {mark:.{rules.quote_precision}f}, entry "
-                    f"{price:.{rules.quote_precision}f}); using "
-                    f"{max_lev_for_stop}x for this order")
-                leverage = max_lev_for_stop
-            else:
-                msg = (f"leverage {leverage}x leaves no room for a "
-                       f"stop-loss on {sym}: the stop must sit between the "
-                       f"liquidation price and the mark "
-                       f"{mark:.{rules.quote_precision}f} (entry "
-                       f"{price:.{rules.quote_precision}f}), and at "
-                       f"{leverage}x the liquidation price is already "
-                       f"past the mark. The highest leverage that still fits is "
-                       f"{max_lev_for_stop}x. Lower the leverage, or set "
-                       f"LEVERAGE_AUTO_REDUCE=true to let the engine clamp it.")
-                self.state.errors.append(f"preflight {sym}: {msg}")
-                return {"ok": False, "reason": msg}
-
-        # The largest notional this balance can actually PAY FOR at the
-        # configured leverage - margin PLUS the taker fee, with the safety
-        # headroom. This is the true upper bound of the order.
-        # (`equity * leverage` ignored the fee and over-stated the bound, which
-        # also pushed the tier selection into a higher band than the real order.)
-        max_notional = max_notional_for_balance(
-            equity, leverage, self.s.taker_fee_rate,
-            self.s.margin_safety_pct)
-
-        # Provisional plan: only the stop-loss is needed here, to size the
-        # order. It is built at a notional whose tier still permits the
-        # configured leverage - at a high leverage the affordable maximum can
-        # land in a tier whose maintenance-margin rate makes the liquidation
-        # formula degenerate (liq on the wrong side of entry), which would
-        # raise TpSlSideError for an order that is actually fine. The tier the
-        # REAL order notional lands in is checked after sizing.
-        prov_tier = tier_for_leverage(tiers, leverage)
-        if prov_tier is None:
-            # The exchange caps leverage below the setting at EVERY size. That
-            # is the one documented reason to lower it, so lower it to the
-            # exchange's own maximum and carry on - refusing here would leave
-            # the user with a symbol that can never trade.
-            max_lev = max((t.leverage for t in tiers), default=0)
-            if max_lev <= 0:
-                msg = (f"leverage {leverage}x is above the maximum allowed for "
-                       f"{sym} at any position size, and the exchange reported "
-                       f"no usable tier. Lower the leverage.")
-                self.state.errors.append(f"preflight {sym}: {msg}")
-                return {"ok": False, "reason": msg}
-            lev_notes.append(
-                f"leverage {sym}: {leverage}x is above the exchange maximum "
-                f"{max_lev}x for this symbol; using {max_lev}x for this order")
-            leverage = max_lev
-            prov_tier = tier_for_leverage(tiers, leverage) or pick_tier(tiers, 0.0)
-
-        prov_notional = max_notional
-        if prov_tier.end_value != float("inf") and prov_tier.end_value > 0:
-            prov_notional = min(max_notional, prov_tier.end_value * 0.9999)
-
-        try:
-            plan = plan_tpsl(
-                side=side, entry=price, leverage=leverage,
-                notional=prov_notional,
-                strength=agg.strength, confidence=agg.confidence, tiers=tiers, rules=rules,
-                liq_sl_distance_pct=self.state.liq_sl_distance_pct,
-                breakeven_pct=self.state.breakeven_pct,
-                trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                mark=mark, min_stop_ticks=MIN_STOP_TICKS,
-            )
-        except TpSlSideError as e:
-            self.state.errors.append(f"tpsl {sym}: {e}")
-            return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
-
-        # --- sizing.
-        #
-        # MARGIN_AMOUNT_PCT is the SIZING AUTHORITY when it is set: "use this
-        # share of my balance as margin on this position". It used to be passed
-        # to position_size_by_risk as an upper bound, and because the risk-based
-        # size was almost always the smaller of the two the cap never bound - so
-        # the margin actually locked was whatever risk sizing produced (a 10%
-        # setting produced ~2% of the balance) and the setting looked like it
-        # did nothing. Sizing FROM the percentage is what makes the number the
-        # user set the number they see on the position.
-        #
-        # risk_pct is the fallback for when the knob is 0 (disabled), not a
-        # silent override of it. The risk implied at the stop is reported so the
-        # user can see what the margin target actually costs them.
-        if self.state.margin_amount_pct > 0:
-            qty = position_size_by_margin(
-                equity, self.state.margin_amount_pct, price, leverage, rules,
-                fee_rate=self.s.taker_fee_rate,
-                safety_pct=self.s.margin_safety_pct)
-            if qty > 0 and plan.sl > 0:
-                implied_risk = abs(price - plan.sl) * qty
-                lev_notes.append(
-                    f"size {sym}: MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
-                    f"-> qty {qty} (notional {qty * price:.4f} USDT, margin "
-                    f"{margin_required(qty * price, leverage):.4f} USDT at "
-                    f"{leverage}x); risk at the stop is {implied_risk:.4f} USDT "
-                    f"({implied_risk / equity * 100:.2f}% of balance, "
-                    f"risk_pct={self.state.risk_pct:g}% is not applied while "
-                    f"the margin target is set)")
-        else:
-            qty = position_size_by_risk(
-                equity, self.state.risk_pct, price, plan.sl, leverage, rules,
-                fee_rate=self.s.taker_fee_rate,
-                safety_pct=self.s.margin_safety_pct)
-        if qty <= 0:
-            return {"ok": False, "reason": "computed qty is 0 (risk too small or below min volume)"}
-
-        # ORDER_UNIT only changes how the size is EXPRESSED; the wire format is
-        # always base-coin qty. QUANTITY (the default) is a no-op, so the
-        # historical behaviour is unchanged. NOTIONAL/COST re-derive qty from
-        # the risk-sized notional/margin so the two can never disagree.
-        order_unit = (self.s.order_unit or "QUANTITY").upper()
-        if order_unit != "QUANTITY":
-            sized_notional = qty * price
-            amount = unit_from_qty(qty, order_unit, price, leverage)
-            qty = qty_from_unit(amount, order_unit, price, leverage, rules)
-            if qty <= 0:
-                return {"ok": False,
-                        "reason": f"computed qty is 0 in {order_unit} units "
-                                  f"(amount={amount}, notional={sized_notional})"}
-
-        # --- pre-flight: the required margin must fit the real available
-        # balance, and the engine's own bounds. Without this the request is
-        # sent and the exchange answers 20003 Insufficient balance.
-        notional_real = qty * price
-
-        # The tier the REAL order notional lands in caps the leverage. Checked
-        # against the actual notional, not `equity * leverage` (which lands in a
-        # higher tier and produced a bogus 20003 for an order that was fine).
-        #
-        # When the tier does cap it, the exchange's own maximum is the answer:
-        # lower the leverage to that cap, re-size and re-plan, and say so. The
-        # loop is bounded because each pass can only lower the leverage, and a
-        # lower leverage at a fixed margin budget means a smaller notional,
-        # which lands in a tier that permits at least as much leverage.
-        for _ in range(3):
-            tier_msg = tier_leverage_violation(tiers, notional_real, leverage)
-            if not tier_msg:
-                break
-            cap = pick_tier(tiers, notional_real).leverage
-            if cap <= 0 or cap >= leverage:
-                msg = f"{sym}: {tier_msg}"
-                self.state.errors.append(f"preflight {sym}: {msg}")
-                return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
-            lev_notes.append(
-                f"leverage {sym}: {leverage}x exceeds the exchange tier cap "
-                f"{cap}x for a {notional_real:.2f} USDT position; using {cap}x "
-                f"for this order")
-            leverage = cap
-            if self.state.margin_amount_pct > 0:
-                qty = position_size_by_margin(
-                    equity, self.state.margin_amount_pct, price, leverage, rules,
-                    fee_rate=self.s.taker_fee_rate,
-                    safety_pct=self.s.margin_safety_pct)
-            else:
-                qty = position_size_by_risk(
-                    equity, self.state.risk_pct, price, plan.sl, leverage, rules,
-                    fee_rate=self.s.taker_fee_rate,
-                    safety_pct=self.s.margin_safety_pct)
-            if qty <= 0:
-                return {"ok": False,
-                        "reason": "computed qty is 0 after the exchange tier "
-                                  "capped the leverage"}
-            notional_real = qty * price
-            try:
-                plan = plan_tpsl(
-                    side=side, entry=price, leverage=leverage,
-                    notional=notional_real, strength=agg.strength,
-                    confidence=agg.confidence, tiers=tiers, rules=rules,
-                    liq_sl_distance_pct=self.state.liq_sl_distance_pct,
-                    breakeven_pct=self.state.breakeven_pct,
-                    trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                    mark=mark, min_stop_ticks=MIN_STOP_TICKS,
-                )
-            except TpSlSideError as e:
-                self.state.errors.append(f"tpsl {sym}: {e}")
-                return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
-        else:
-            msg = (f"{sym}: the exchange tier cap could not be satisfied at any "
-                   f"leverage for a {notional_real:.2f} USDT position.")
-            self.state.errors.append(f"preflight {sym}: {msg}")
-            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
-
-        # A tier/leverage CLAMP is a safety decision, not a routine note: it
-        # stays in `errors` so it cannot be hidden. The routine margin-budget
-        # sizing note below goes to `notes` instead - it used to be reported
-        # as a failure, which buried the real errors behind noise.
-        for note in lev_notes:
-            self.state.errors.append(note)
-
-        margin_real = margin_required(notional_real, leverage)
-        # Opening a MARKET order costs the initial margin AND a taker fee, and
-        # the exchange deducts BOTH from the available balance at once. Checking
-        # only the margin let `margin == equity` pass locally and then fail on
-        # the exchange with 20003 once the fee was added.
-        fee_real = fee_for_notional(notional_real, self.s.taker_fee_rate)
-        required_real = margin_real + fee_real
-        # Reserve the configured headroom so a price move between sizing and the
-        # request landing cannot push the cost back over the balance.
-        usable_equity = equity * (1.0 - max(0.0, min(0.9, self.s.margin_safety_pct / 100.0)))
-
-        if required_real > usable_equity:
-            msg = (f"insufficient balance for {sym}: required {required_real:.4f} USDT "
-                   f"(margin {margin_real:.4f} + fee {fee_real:.4f}) vs available "
-                   f"{equity:.4f} USDT"
-                   + (f" (usable {usable_equity:.4f} after "
-                      f"MARGIN_SAFETY_PCT={self.s.margin_safety_pct:g}%)"
-                      if self.s.margin_safety_pct else "")
-                   + f" for qty={qty}, notional={notional_real:.4f} at "
-                     f"{leverage}x. Lower the leverage, lower risk_pct, "
-                     f"or add funds.")
-            self.state.errors.append(f"preflight {sym}: {msg}")
-            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
-        # MARGIN_AMOUNT_PCT: the margin this ONE order locks may not exceed the
-        # configured share of the spendable balance. Sizing already targets it,
-        # so this only fires when something downstream (an ORDER_UNIT
-        # re-derivation, a min-volume floor) pushed the size back up. The
-        # correct response is to CLAMP the size to the budget and say so - not
-        # to refuse, and never to touch the leverage, which has nothing to do
-        # with how much of the balance one position may lock.
-        if self.state.margin_amount_pct > 0:
-            budget = margin_budget(equity, self.state.margin_amount_pct,
-                                   self.s.margin_safety_pct)
-            if margin_real > budget:
-                max_notional_budget = max_notional_for_margin(
-                    budget, leverage, self.s.taker_fee_rate)
-                clamped = round_step(max_notional_budget / price, rules.base_precision)
-                if clamped < rules.min_trade_volume:
-                    msg = (f"margin {margin_real:.4f} USDT for {sym} exceeds the "
-                           f"MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
-                           f"budget of {budget:.4f} USDT, and clamping to the "
-                           f"budget leaves {clamped} below the symbol's minimum "
-                           f"volume {rules.min_trade_volume}. Raise "
-                           f"MARGIN_AMOUNT_PCT or add funds.")
-                    self.state.errors.append(f"preflight {sym}: {msg}")
-                    return {"ok": False, "reason": msg}
-                self.state.notes.append(
-                    f"margin {sym}: qty {qty} would lock {margin_real:.4f} USDT, "
-                    f"above the MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
-                    f"budget of {budget:.4f} USDT; clamped to qty {clamped} "
-                    f"(notional {clamped * price:.4f} USDT). Leverage is "
-                    f"unchanged at {leverage}x.")
-                qty = clamped
-                notional_real = qty * price
-                margin_real = margin_required(notional_real, leverage)
-                fee_real = fee_for_notional(notional_real, self.s.taker_fee_rate)
-                required_real = margin_real + fee_real
-        if self.s.min_margin_usdt and margin_real < self.s.min_margin_usdt:
-            msg = (f"required margin {margin_real:.4f} USDT is below the configured "
-                   f"MIN_MARGIN_USDT={self.s.min_margin_usdt} for {sym} "
-                   f"(qty={qty}, notional={notional_real:.4f}).")
-            self.state.errors.append(f"preflight {sym}: {msg}")
-            return {"ok": False, "reason": msg}
-        if self.s.max_margin_usdt and margin_real > self.s.max_margin_usdt:
-            msg = (f"required margin {margin_real:.4f} USDT exceeds the configured "
-                   f"MAX_MARGIN_USDT={self.s.max_margin_usdt} for {sym} "
-                   f"(qty={qty}, notional={notional_real:.4f}).")
-            self.state.errors.append(f"preflight {sym}: {msg}")
-            return {"ok": False, "reason": msg}
-        if self.s.max_notional_usdt and notional_real > self.s.max_notional_usdt:
-            msg = (f"notional {notional_real:.4f} USDT exceeds the configured "
-                   f"MAX_NOTIONAL_USDT={self.s.max_notional_usdt} for {sym} "
-                   f"(qty={qty}, margin={margin_real:.4f}).")
-            self.state.errors.append(f"preflight {sym}: {msg}")
-            return {"ok": False, "reason": msg}
-
-        # re-plan with the real notional
-        try:
-            plan = plan_tpsl(
-                side=side, entry=price, leverage=leverage,
-                notional=qty * price, strength=agg.strength, confidence=agg.confidence,
-                tiers=tiers, rules=rules,
-                liq_sl_distance_pct=self.state.liq_sl_distance_pct,
-                breakeven_pct=self.state.breakeven_pct,
-                trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                mark=mark, min_stop_ticks=MIN_STOP_TICKS,
-            )
-        except TpSlSideError as e:
-            self.state.errors.append(f"tpsl {sym}: {e}")
-            return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
-
-        # ensure leverage / margin mode
-        try:
-            await self.client.change_margin_mode(sym, self.state.margin_mode)
-        except BitunixAPIError as e:
-            if e.code not in (20006, 20009):
-                self.state.errors.append(f"margin_mode {sym}: {e}")
-        try:
-            await self.client.change_leverage(sym, leverage)
-        except BitunixAPIError as e:
-            if e.code not in (20006,):
-                self.state.errors.append(f"leverage {sym}: {e}")
-
-        order_side = "BUY" if side == "LONG" else "SELL"
-
-        # The trigger type is read ONCE and used for both the local validation
-        # below and the tpStopType/slStopType sent on the wire. Reading it twice
-        # is how the two can drift apart.
-        trigger_type = TRIGGER_TYPE
-
-        # --- re-read the mark price immediately before sending and re-clamp.
-        # The plan above was built from a mark read several round-trips ago
-        # (account, tiers, margin mode, leverage). On a fast-moving symbol the
-        # mark can cross the stop in that window, and the exchange validates
-        # against the mark at the moment the request lands - not the one we
-        # planned with. Re-clamping here is what makes the stop safe on the
-        # wire rather than only at planning time.
-        mark_now = await self.get_trigger_price(sym, last=price)
-        if mark_now > 0:
-            mark = mark_now
-        plan.sl = clamp_sl(side=side, sl=plan.sl, entry=price, mark=mark,
-                           rules=rules, min_ticks=MIN_STOP_TICKS,
-                           liq=plan.liq)
-        plan.tp = clamp_tp(side=side, tp=plan.tp, entry=price, mark=mark,
-                           rules=rules, min_ticks=MIN_STOP_TICKS)
-
-        # --- which TP goes on the entry order.
-        #
-        # With the PARTIAL method the rungs ARE the take-profit plan: each rung
-        # becomes its own native tpsl/place_order carrying tpQty (parked right
-        # after the fill, see `_place_partial_rungs`). Attaching plan.tp as a
-        # whole-position native TP here would flatten the entire remainder the
-        # moment it is touched, so with PARTIAL the entry order carries the
-        # STOP only.
-        partial_method = (self.state.tpsl_method or "POSITION").upper() == "PARTIAL"
-        if partial_method:
-            try:
-                rungs = parse_partial_ladder(self.state.partial_tp_ladder)
-            except PartialLadderError as e:
-                plan.notes = (plan.notes + "; " if plan.notes else "") + (
-                    f"PARTIAL ladder invalid ({e}); whole-position TP attached")
-                log.warning("partial ladder %r invalid: %s - using the "
-                            "whole-position TP", self.state.partial_tp_ladder, e)
-                partial_method = False
-            else:
-                if not rungs:
-                    partial_method = False
-                else:
-                    plan.notes = (plan.notes + "; " if plan.notes else "") + (
-                        "PARTIAL ladder: no whole-position TP attached at entry "
-                        f"({len(rungs)} rungs own the exits)")
-        tp_for_order = None if partial_method else plan.tp
-
-        if not self._tpsl_side_ok(sym, side, price, mark, plan.sl, tp_for_order, rules):
-            return {"ok": False,
-                    "reason": "TP/SL would be rejected by the exchange after the "
-                              "mark price moved; order not sent"}
-
-        try:
-            body = build_order_body(
-                symbol=sym, qty=qty, side=order_side,
-                orderType="MARKET", reduceOnly=False,
-                tpPrice=tp_for_order, tpStopType=trigger_type, tpOrderType="MARKET",
-                slPrice=plan.sl, slStopType=trigger_type, slOrderType="MARKET",
-                rules=rules, known_symbols=set(self.rules) or None,
-                mark_price=mark, entry_price=price,
-                min_stop_ticks=MIN_STOP_TICKS,
-                **await self._trade_side_fields("OPEN"),
-            )
-        except OrderValidationError as e:
-            self.state.errors.append(f"order validation {sym}: {e}")
-            return {"ok": False, "reason": f"order validation failed: {e}"}
-        try:
-            res = await self.client.place_order(**body)
-        except BitunixAPIError as e:
-            log_order_body(body, e)
-            self.state.errors.append(f"place_order {sym}: {e}")
-            return {"ok": False, "reason": f"place_order failed: {e}", "hint": e.hint}
-
-        order_id = str(order_row(res).get("orderId") or "")
-        self._log_trade({
-            "event": "open", "ts": time.time(), "symbol": sym, "side": side,
-            "qty": qty, "entry": price, "order_id": order_id,
-            "confidence": round(agg.confidence, 2), "strength": agg.strength,
-            "agreeing": agg.agreeing, "plan": plan.as_dict(),
-        })
-        self._log_tpsl({"event": "placed", "ts": time.time(), "symbol": sym,
-                        "order_id": order_id, **plan.as_dict()})
-
-        # register runtime state
-        await asyncio.sleep(1.0)
-        positions = await self.open_positions()
-        for p in positions:
-            if p.get("symbol") == sym:
-                pid = str(p.get("positionId"))
-                fill_entry = float(p.get("avgOpenPrice") or price)
-                fill_qty = float(p.get("qty") or qty)
-                self.positions[pid] = PositionState(
-                    position_id=pid, symbol=sym, side=side,
-                    entry=fill_entry,
-                    qty=fill_qty,
-                    leverage=int(p.get("leverage") or self.state.leverage),
-                    sl=plan.sl, tp=(0.0 if partial_method else plan.tp),
-                    liq=float(p.get("liqPrice") or plan.liq),
-                    opened_ts=time.time(),
-                )
-                # With the PARTIAL method the rungs are parked at entry as
-                # native exchange-enforced TP orders (tpQty each), so the
-                # exits survive even if this engine dies.
-                if partial_method:
-                    await self._place_partial_rungs(
-                        sym, pid, side, fill_entry, fill_qty,
-                        sl_dist=abs(fill_entry - plan.sl),
-                        rungs=rungs, rules=rules, trigger_type=trigger_type)
-                break
-        self.persist_positions()
-
-        return {"ok": True, "order_id": order_id, "symbol": sym, "side": side,
-                "qty": qty, "entry": price, "plan": plan.as_dict()}
+        ctx = _EntryContext(sym=sym, side=side, price=price, mark=mark,
+                            equity=equity, rules=rules, tiers=tiers, agg=agg)
+        return ctx, None
 
     async def close_position(self, symbol: str | None = None,
                              position_id: str | None = None,
@@ -1441,43 +1626,23 @@ class TraderEngine:
             return {"ok": False, "reason": str(e), "hint": e.hint}
 
     # ================================================================ management
-    async def _place_partial_rungs(self, sym: str, pid: str, side: str,
-                                   entry: float, qty: float, *,
-                                   sl_dist: float, rungs: list[LadderRung],
-                                   rules: PairRules, trigger_type: str) -> None:
-        """PARTIAL TP/SL (method 2 of 4): park each rung as a NATIVE order.
-
-        Every rung becomes its own `/tpsl/place_order` with `tpQty` at height
-        `r × sl_dist` from the entry, placed the moment the position exists.
-        The exchange then enforces the whole scale-out plan on its own - the
-        engine does not fire rungs, re-park them, or need a backstop order,
-        because every exit lives server-side.
+    def _plan_rungs(self, rungs: list[LadderRung], qty: float,
+                    rules: PairRules,
+                    skipped: list[dict]) -> list[tuple[LadderRung, float, float]]:
+        """The rung allocation: which rung closes how many units, at which R.
 
         A rung smaller than the exchange's minimum order volume cannot exist
-        as its own order; it is MERGED into the next rung (fewer prices, same
-        shares). If the position is too small to split at all, ONE
-        whole-position TP at the outermost rung is attached through the
-        position endpoint instead - a plan is preserved, not nothing.
+        as its own order; it is merged into the next one. The old code merged
+        as it went and DROPPED the remainder: with a 29-unit position and
+        minTradeVolume 10, the rungs were 11 (40%), 10 (35%) and 7 (25%) - the
+        last one was too small to place and there was no next rung to merge it
+        into, so 8 units of the position were left with a stop and NO
+        take-profit at all. The plan is computed first so a remainder can be
+        folded into the last placeable rung instead of vanishing.
         """
-        if not rungs or qty <= 0 or sl_dist <= 0:
-            return
-        is_long = side.upper() in ("LONG", "BUY")
         min_qty = float(rules.min_trade_volume or 0)
-        placed = []
-        skipped = []
-        allocated = 0.0
-
-        # --- PLAN first, then place.
-        #
-        # A rung smaller than the exchange's minimum order volume cannot exist
-        # as its own order; it is merged into the next one. The old code merged
-        # as it went and DROPPED the remainder: with a 29-unit position and
-        # minTradeVolume 10, the rungs were 11 (40%), 10 (35%) and 7 (25%) -
-        # the last one was too small to place and there was no next rung to
-        # merge it into, so 8 units of the position were left with a stop and
-        # NO take-profit at all. The plan is computed first so a remainder can
-        # be folded into the last placeable rung instead of vanishing.
         plan: list[tuple[LadderRung, float, float]] = []   # (rung, share, qty)
+        allocated = 0.0
         carry_share = 0.0
         for rung in rungs:
             share = rung.share + carry_share
@@ -1512,7 +1677,6 @@ class TraderEngine:
                                     "reason": "below minTradeVolume - merged "
                                               "into the previous rung"})
                     plan[-1] = (rung, share + carry_share, min(merged, qty))
-                    allocated += min(merged, qty) - step_qty
                 else:
                     skipped.append({"share": carry_share, "r": rung.r,
                                     "reason": "below minTradeVolume - no rung "
@@ -1521,6 +1685,33 @@ class TraderEngine:
                 skipped.append({"share": carry_share, "r": rungs[-1].r,
                                 "reason": "below minTradeVolume - the position "
                                           "is too small to split"})
+        return plan
+
+    async def _place_partial_rungs(self, sym: str, pid: str, side: str,
+                                   entry: float, qty: float, *,
+                                   sl_dist: float, rungs: list[LadderRung],
+                                   rules: PairRules, trigger_type: str) -> None:
+        """PARTIAL TP/SL (method 2 of 4): park each rung as a NATIVE order.
+
+        Every rung becomes its own `/tpsl/place_order` with `tpQty` at height
+        `r × sl_dist` from the entry, placed the moment the position exists.
+        The exchange then enforces the whole scale-out plan on its own - the
+        engine does not fire rungs, re-park them, or need a backstop order,
+        because every exit lives server-side.
+
+        A rung smaller than the exchange's minimum order volume cannot exist
+        as its own order; it is MERGED into the next rung (fewer prices, same
+        shares). If the position is too small to split at all, ONE
+        whole-position TP at the outermost rung is attached through the
+        position endpoint instead - a plan is preserved, not nothing.
+        """
+        if not rungs or qty <= 0 or sl_dist <= 0:
+            return
+        is_long = side.upper() in ("LONG", "BUY")
+        placed = []
+        skipped = []
+        plan = self._plan_rungs(rungs, qty, rules, skipped)
+        allocated = sum(step for _r, _s, step in plan)
 
         for rung, share, step_qty in plan:
             target = rung_target(side, entry, sl_dist, rung.r)
@@ -1660,7 +1851,7 @@ class TraderEngine:
                 self.state.errors.append(f"manage_loop: {type(e).__name__}: {e}")
             await asyncio.sleep(max(5, self.state.scan_interval))
 
-    def _tpsl_side_ok(self, sym: str, side: str, entry: float, mark: float,
+    def _tpsl_side_ok(self, sym: str, side: str, entry: float, mark: float, *,
                       sl: float | None, tp: float | None,
                       rules: PairRules) -> bool:
         """Last gate before a managed TP/SL is sent.
@@ -1692,48 +1883,156 @@ class TraderEngine:
                 self.positions.pop(pid, None)
 
         # --- ACCOUNT TP/SL: the whole futures account is the control unit.
-        # When TOTAL unrealized PnL crosses the configured threshold, every
-        # position closes. Bitunix exposes no API for this, so it is enforced
-        # here in software - which means it only fires while this loop is
-        # running. That limitation is stated in /status, not hidden.
-        acct_cfg = self.account_cfg()
-        if acct_cfg.enabled and positions:
-            total_pnl = total_unrealized_pnl(positions)
-            equity = 0.0
-            try:
-                # Total account equity, NOT just `available`: `available` already
-                # excludes the margin locked by open positions, so using it alone
-                # makes an x%-of-equity threshold fire far too early.
-                equity = account_equity(await self.client.get_single_account())
-            except (BitunixAPIError, TypeError, ValueError):
-                equity = 0.0
-            decision = account_tpsl_decision(total_pnl=total_pnl, equity=equity,
-                                             cfg=acct_cfg)
-            if decision.should_close_all:
-                log.warning("ACCOUNT TP/SL: %s", decision.reason)
-                closed = await self.close_all_positions(
-                    reason=f"account_{decision.trigger}")
-                actions.append({"action": f"account_{decision.trigger}",
-                                "total_pnl": round(total_pnl, 2),
-                                "threshold": decision.threshold,
-                                "reason": decision.reason, "result": closed})
-                self._log_tpsl({"event": f"account_{decision.trigger}",
-                                "ts": time.time(), "total_pnl": round(total_pnl, 2),
-                                "threshold": decision.threshold,
-                                "reason": decision.reason})
-                self.persist_positions()
-                return actions
+        closed_all = await self._manage_account_tpsl(positions)
+        if closed_all is not None:
+            actions.append(closed_all)
+            return actions
 
         for p in positions:
+            actions.extend(await self._manage_one_position(p))
+
+        # Management state (breakeven_done / trailing_stop / peak_roi) must hit
+        # the disk even if the process is killed a moment later.
+        self.persist_positions()
+        return actions
+
+    async def _manage_account_tpsl(self, positions: list[dict]) -> dict | None:
+        """ACCOUNT TP/SL: the whole futures account is the control unit.
+
+        When TOTAL unrealized PnL crosses the configured threshold, every
+        position closes. Bitunix exposes no API for this, so it is enforced
+        here in software - which means it only fires while this loop is
+        running. That limitation is stated in /status, not hidden.
+
+        Returns the action that was taken, or None when nothing fired.
+        """
+        acct_cfg = self.account_cfg()
+        if not acct_cfg.enabled or not positions:
+            return None
+        total_pnl = total_unrealized_pnl(positions)
+        equity = 0.0
+        try:
+            # Total account equity, NOT just `available`: `available` already
+            # excludes the margin locked by open positions, so using it alone
+            # makes an x%-of-equity threshold fire far too early.
+            equity = account_equity(await self.client.get_single_account())
+        except (BitunixAPIError, TypeError, ValueError):
+            equity = 0.0
+        decision = account_tpsl_decision(total_pnl=total_pnl, equity=equity,
+                                         cfg=acct_cfg)
+        if not decision.should_close_all:
+            return None
+        log.warning("ACCOUNT TP/SL: %s", decision.reason)
+        closed = await self.close_all_positions(reason=f"account_{decision.trigger}")
+        self._log_tpsl({"event": f"account_{decision.trigger}",
+                        "ts": time.time(), "total_pnl": round(total_pnl, 2),
+                        "threshold": decision.threshold,
+                        "reason": decision.reason})
+        self.persist_positions()
+        return {"action": f"account_{decision.trigger}",
+                "total_pnl": round(total_pnl, 2),
+                "threshold": decision.threshold,
+                "reason": decision.reason, "result": closed}
+
+    def _reconcile_qty(self, st: PositionState, p: dict, sym: str, pid: str,
+                       rules: PairRules) -> None:
+        """Reconcile the size with the exchange before acting on it.
+
+        Something outside this list can shrink a position between two passes:
+        the stop filling, a native rung TP triggering, a manual close. Acting
+        on a stale qty would send a modify/re-close bigger than the position
+        (rejected) or keep managing dust that is already gone. The exchange is
+        the source of truth for SIZE.
+        """
+        live_qty = abs(float(p.get("qty") or 0))
+        if live_qty <= 0 or st.qty <= 0:
+            return
+        man_prec = max(0, int(rules.base_precision))
+        if (round(live_qty, man_prec) == round(st.qty, man_prec)
+                or math.isclose(live_qty, st.qty, rel_tol=1e-6)):
+            return
+        self._log_tpsl({"event": "qty_reconciled", "ts": time.time(),
+                        "symbol": sym, "position_id": pid,
+                        "engine_qty": st.qty, "exchange_qty": live_qty})
+        st.qty = live_qty
+
+    async def _apply_breakeven(self, st: PositionState, sym: str, pid: str,
+                               side: str, entry: float, mark: float, *,
+                               rules: PairRules, roi: float,
+                               trigger_type: str) -> dict | None:
+        """Move the stop to the entry once the ROI passes the threshold."""
+        if not should_breakeven(st, roi, self.state.breakeven_pct):
+            return None
+        sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
+                      rules=rules, min_ticks=MIN_STOP_TICKS,
+                      liq=st.liq or None)
+        if not self._tpsl_side_ok(sym, side, entry, mark, sl=sl, tp=st.tp, rules=rules):
+            return None
+        try:
+            await self.client.modify_position_tp_sl_order(
+                sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
+                sl_price=format_price(sl, rules),
+                tp_stop_type=trigger_type, sl_stop_type=trigger_type)
+        except BitunixAPIError as e:
+            self.state.errors.append(f"breakeven {sym}: {e}")
+            return None
+        st.breakeven_done = True
+        st.sl = sl
+        self._log_tpsl({"event": "breakeven", "ts": time.time(), "symbol": sym,
+                        "position_id": pid, "sl": sl, "roi": round(roi, 2)})
+        return {"action": "breakeven", "symbol": sym,
+                "sl": sl, "roi": round(roi, 2)}
+
+    async def _apply_trailing(self, st: PositionState, sym: str, pid: str,
+                              side: str, entry: float, mark: float, *,
+                              rules: PairRules, roi: float, price: float,
+                              trigger_type: str) -> dict | None:
+        """Ratchet the stop behind the price once the ROI passes the trigger."""
+        if not should_trail(st, roi, self.state.trailing_trigger_roi_pct):
+            return None
+        try:
+            candles = await self.get_candles(sym, "5m", 60)
+            a = atr(candles, 14)
+            atr_val = a[-1] if a and a[-1] else price * 0.002
+        except Exception:  # noqa: BLE001
+            atr_val = price * 0.002
+        new_stop = next_trailing_stop(st, price, atr_val)
+        if new_stop is None:
+            return None
+        sl = clamp_sl(side=side, sl=new_stop, entry=entry, mark=mark,
+                      rules=rules, min_ticks=MIN_STOP_TICKS,
+                      liq=st.liq or None)
+        if not self._tpsl_side_ok(sym, side, entry, mark, sl=sl, tp=st.tp, rules=rules):
+            return None
+        try:
+            await self.client.modify_position_tp_sl_order(
+                sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
+                sl_price=format_price(sl, rules),
+                tp_stop_type=trigger_type, sl_stop_type=trigger_type)
+        except BitunixAPIError as e:
+            self.state.errors.append(f"trail {sym}: {e}")
+            return None
+        st.trailing_stop = sl
+        st.trailing_active = True
+        st.sl = sl
+        self._log_tpsl({"event": "trail", "ts": time.time(), "symbol": sym,
+                        "position_id": pid, "sl": sl, "roi": round(roi, 2)})
+        return {"action": "trail", "symbol": sym,
+                "new_sl": sl, "roi": round(roi, 2)}
+
+    async def _manage_one_position(self, p: dict) -> list[dict]:
+        """Breakeven, trailing and the reversal close for ONE position."""
+        actions: list[dict] = []
+        if True:
             pid = str(p.get("positionId"))
             sym = p.get("symbol", "")
             side = p.get("side", "LONG")
             entry = float(p.get("avgOpenPrice") or 0)
             if entry <= 0:
-                continue
+                return actions
             price = await self.get_price(sym)
             if price <= 0:
-                continue
+                return actions
             lev = int(p.get("leverage") or self.state.leverage)
             roi = roi_pct(entry, price, side, lev)
 
@@ -1766,76 +2065,25 @@ class TraderEngine:
             if rules is None:
                 self.state.errors.append(
                     f"manage {sym}: no trading rules, skipping TP/SL update")
-                continue
+                return actions
 
-            # Reconcile the size with the exchange before acting on it.
-            # Something outside this list can shrink a position between two
-            # passes: the stop filling, a native rung TP triggering, a manual
-            # close. Acting on a stale qty would send a modify/re-close bigger
-            # than the position (rejected) or keep managing dust that
-            # is already gone. The exchange is the source of truth for SIZE.
-            live_qty = abs(float(p.get("qty") or 0))
-            if live_qty > 0 and st.qty > 0:
-                man_prec = max(0, int(rules.base_precision))
-                if (round(live_qty, man_prec) != round(st.qty, man_prec)
-                        and not math.isclose(live_qty, st.qty, rel_tol=1e-6)):
-                    self._log_tpsl({"event": "qty_reconciled", "ts": time.time(),
-                                    "symbol": sym, "position_id": pid,
-                                    "engine_qty": st.qty,
-                                    "exchange_qty": live_qty})
-                    st.qty = live_qty
+            self._reconcile_qty(st, p, sym, pid, rules)
 
             # 1) breakeven - always armed: move SL to entry once ROI passes
             # the threshold, with no ladder gating (the ladder machinery is
             # gone; TRAILING and ACCOUNT are also always armed below).
-            if should_breakeven(st, roi, self.state.breakeven_pct):
-                sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
-                              rules=rules, min_ticks=MIN_STOP_TICKS,
-                              liq=st.liq or None)
-                if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
-                    try:
-                        await self.client.modify_position_tp_sl_order(
-                            sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
-                            sl_price=format_price(sl, rules),
-                            tp_stop_type=trigger_type, sl_stop_type=trigger_type)
-                        st.breakeven_done = True
-                        st.sl = sl
-                        actions.append({"action": "breakeven", "symbol": sym,
-                                        "sl": sl, "roi": round(roi, 2)})
-                        self._log_tpsl({"event": "breakeven", "ts": time.time(), "symbol": sym,
-                                        "position_id": pid, "sl": sl, "roi": round(roi, 2)})
-                    except BitunixAPIError as e:
-                        self.state.errors.append(f"breakeven {sym}: {e}")
+            action = await self._apply_breakeven(
+                st, sym, pid, side, entry, mark, rules=rules, roi=roi,
+                trigger_type=trigger_type)
+            if action:
+                actions.append(action)
 
             # 2) trailing
-            if should_trail(st, roi, self.state.trailing_trigger_roi_pct):
-                try:
-                    candles = await self.get_candles(sym, "5m", 60)
-                    a = atr(candles, 14)
-                    atr_val = a[-1] if a and a[-1] else price * 0.002
-                except Exception:  # noqa: BLE001
-                    atr_val = price * 0.002
-                new_stop = next_trailing_stop(st, price, atr_val)
-                if new_stop is not None:
-                    sl = clamp_sl(side=side, sl=new_stop, entry=entry, mark=mark,
-                                  rules=rules, min_ticks=MIN_STOP_TICKS,
-                                  liq=st.liq or None)
-                    if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
-                        try:
-                            await self.client.modify_position_tp_sl_order(
-                                sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
-                                sl_price=format_price(sl, rules),
-                                tp_stop_type=trigger_type, sl_stop_type=trigger_type)
-                            st.trailing_stop = sl
-                            st.trailing_active = True
-                            st.sl = sl
-                            actions.append({"action": "trail", "symbol": sym,
-                                            "new_sl": sl, "roi": round(roi, 2)})
-                            self._log_tpsl({"event": "trail", "ts": time.time(), "symbol": sym,
-                                            "position_id": pid, "sl": sl,
-                                            "roi": round(roi, 2)})
-                        except BitunixAPIError as e:
-                            self.state.errors.append(f"trail {sym}: {e}")
+            action = await self._apply_trailing(
+                st, sym, pid, side, entry, mark, rules=rules, roi=roi, price=price,
+                trigger_type=trigger_type)
+            if action:
+                actions.append(action)
 
             # 3) mid-management
             agg = self.last_aggregates.get(sym)
@@ -1849,23 +2097,29 @@ class TraderEngine:
                                                 reason="reversal")
                 actions.append({"action": "close_reversal", "symbol": sym,
                                 "roi": round(roi, 2), "result": res})
-        # Management state (breakeven_done / trailing_stop / peak_roi) must hit
-        # the disk even if the process is killed a moment later.
-        self.persist_positions()
         return actions
 
     # ================================================================ reporting
+    #: Where the periodic report goes. The engine is a LIBRARY - it does not
+    #: print. The CLI installs `print` so the operator sees the report in the
+    #: terminal; the Telegram bot pushes the same text to the chat; with no
+    #: sink the report is only logged.
+    report_sink: Callable[[str], None] | None = None
+
     async def _report_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 if self.state.report_on:
                     rep = await self.report()
-                    print("\n" + rep + "\n", flush=True)
+                    if self.report_sink is not None:
+                        self.report_sink(rep)
+                    else:
+                        log.info("%s", rep)
                     self.state.last_report_ts = time.time()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
-                self.state.errors.append(f"report_loop: {e}")
+                self.state.errors.append(f"report_loop: {type(e).__name__}: {e}")
             await asyncio.sleep(max(5, self.state.report_interval))
 
     async def report(self) -> str:
@@ -1924,21 +2178,35 @@ class TraderEngine:
             method = "POSITION - one native TP/SL closes the whole position"
         lines = ["-- TP/SL --",
                  f"method: {method}",
-                 f"software: breakeven at {self.state.breakeven_pct:g}% ROI, "
-                 f"trailing from {self.state.trailing_trigger_roi_pct:g}% ROI "
-                 f"| {self.account_cfg().describe()}"]
+                 f"software: breakeven armed at +{self.state.breakeven_pct:g}% ROI, "
+                 f"trailing armed from +{self.state.trailing_trigger_roi_pct:g}% ROI "
+                 f"(both always on - they fire when the position's ROI passes the "
+                 f"threshold) | {self.account_cfg().describe()}"]
 
         # one line per managed position: what is armed, and by which method
         for st in self.positions.values():
             if live_ids is not None and st.position_id not in live_ids:
                 continue
             tp = f"{st.tp:g}" if st.tp else ("rungs" if m == "PARTIAL" else "none")
+            # "off" used to mean "the breakeven/trailing move has not fired
+            # yet" - which reads as "the feature is disabled". These are
+            # ALWAYS armed; they wait for the ROI threshold.
+            if st.breakeven_done:
+                be = "moved"
+            elif self.state.mid_management:
+                be = f"waiting(+{self.state.breakeven_pct:g}%)"
+            else:
+                be = "OFF(mid management off)"
+            if st.trailing_active:
+                trail = f"on@{st.trailing_stop:g}" if st.trailing_stop else "on"
+            elif self.state.mid_management:
+                trail = f"waiting(+{self.state.trailing_trigger_roi_pct:g}%)"
+            else:
+                trail = "OFF(mid management off)"
             lines.append(
                 f"  {st.symbol} {st.side} qty={st.qty:g} entry={st.entry:g} "
                 f"sl={st.sl:g} tp={tp} liq={st.liq:g} "
-                f"be={'on' if st.breakeven_done else 'off'} "
-                f"trail={'on' if st.trailing_active else 'off'}"
-                + (f"@{st.trailing_stop:g}" if st.trailing_stop else "")
+                f"be={be} trail={trail}"
                 + (f" peak_roi={st.peak_roi:.2f}%" if st.peak_roi else ""))
 
         # the rungs that are actually parked on the exchange, from the log -
@@ -2194,16 +2462,31 @@ class TraderEngine:
             self._persist_if_changed()
 
     async def _command(self, line: str) -> str:
-        """Route an engine command. Returns a human-readable result."""
+        """Route an engine command. Returns a human-readable result.
+
+        The branches are grouped by domain and tried in order - the first
+        group that recognises the command answers it. The order matters: a
+        bare "margin" is the margin AMOUNT, "margin mode" is the mode, and
+        "tpsl method" is the exit shape.
+        """
         raw = line.strip()
         if not raw:
             return ""
         low = raw.lower()
-        s = self.state
 
         def arg(prefix: str) -> str:
             return raw[len(prefix):].strip()
 
+        for handler in (self._cmd_trading, self._cmd_risk, self._cmd_positions,
+                        self._cmd_symbols, self._cmd_tpsl):
+            out = await handler(raw, low, arg)
+            if out is not None:
+                return out
+        return f"Unknown engine command: {raw!r}. Type 'help' for the list."
+
+    async def _cmd_trading(self, raw: str, low: str, arg) -> str | None:
+        """Trading control, the report, the scan and the history."""
+        s = self.state
         # --- trading control
         if low in ("start trading", "autotrade on"):
             s.autotrade = True
@@ -2245,6 +2528,11 @@ class TraderEngine:
         if low == "scan off":
             s.scan_on = False
             return "Scanner OFF."
+        return None
+
+    async def _cmd_risk(self, raw: str, low: str, arg) -> str | None:
+        """Mid management, the reversal rules and the thresholds."""
+        s = self.state
         if low.startswith("mid management"):
             s.mid_management = not s.mid_management
             return f"Mid management = {s.mid_management}."
@@ -2270,12 +2558,16 @@ class TraderEngine:
                 return f"Breakeven threshold = {s.breakeven_pct}% ROI."
             except (ValueError, IndexError):
                 return "Usage: Breakeven threshold pct 0.6"
+        if low.startswith("breakeven"):
+            return self._explain_breakeven()
         if low.startswith("trailing trigger"):
             try:
                 s.trailing_trigger_roi_pct = float(arg("trailing trigger").split()[-1])
                 return f"Trailing trigger = {s.trailing_trigger_roi_pct}% ROI."
             except (ValueError, IndexError):
                 return "Usage: Trailing trigger stop ROI pct 25"
+        if low.startswith("trailing"):
+            return self._explain_trailing()
         if low.startswith("liq sl distance"):
             try:
                 s.liq_sl_distance_pct = float(arg("liq sl distance").split()[-1])
@@ -2306,6 +2598,37 @@ class TraderEngine:
                 return f"TF min confidence = {s.tf_min_confidence}."
             except (ValueError, IndexError):
                 return "Usage: Tf min confidence 60"
+        return None
+
+    def _explain_breakeven(self) -> str:
+        """What breakeven is, and how to change it.
+
+        "breakeven on" / "enable breakeven": breakeven is not a switch - it
+        is ALWAYS armed and fires at the threshold. Saying so is better than
+        "Unknown engine command" (which is what the user got) or pretending a
+        switch was flipped.
+        """
+        s = self.state
+        if not s.mid_management:
+            return ("Breakeven is armed but MID MANAGEMENT IS OFF, so it "
+                    "never fires. Turn it on with: mid management on")
+        return (f"Breakeven is ALWAYS armed: the stop moves to the entry at "
+                f"+{s.breakeven_pct:g}% ROI. Change the threshold with: "
+                f"breakeven threshold pct {s.breakeven_pct:g}")
+
+    def _explain_trailing(self) -> str:
+        """What trailing is, and how to change it."""
+        s = self.state
+        if not s.mid_management:
+            return ("Trailing is armed but MID MANAGEMENT IS OFF, so it "
+                    "never fires. Turn it on with: mid management on")
+        return (f"Trailing is ALWAYS armed: the stop ratchets from "
+                f"+{s.trailing_trigger_roi_pct:g}% ROI. Change the trigger "
+                f"with: trailing trigger stop ROI pct {s.trailing_trigger_roi_pct:g}")
+
+    async def _cmd_positions(self, raw: str, low: str, arg) -> str | None:
+        """The positions, the margin and the account settings."""
+        s = self.state
         if low.startswith("positions history"):
             return json.dumps(await self.positions_history(), indent=2)
         if low.startswith("close position"):
@@ -2349,13 +2672,6 @@ class TraderEngine:
                 self._remember_position_mode(val)
                 return f"Position mode = {val}."
             return "Usage: Position mode HEDGE|ONE_WAY"
-        if low.startswith("symbols") or low.startswith("symbol "):
-            val = arg("symbols") if low.startswith("symbols") else arg("symbol")
-            syms = [x.strip().upper() for x in val.replace("=", " ").split(",") if x.strip()]
-            if syms:
-                s.symbols = syms
-                await self.load_rules(syms)
-                return f"Symbols = {','.join(syms)}"
             return "Usage: Symbols BTCUSDT,ETHUSDT"
         if low.startswith("max open positions"):
             try:
@@ -2370,6 +2686,42 @@ class TraderEngine:
             except (ValueError, IndexError):
                 return "Usage: leverage 10"
         # --------------------------------------------------- the TP/SL methods
+        return None
+
+    async def _cmd_symbols(self, raw: str, low: str, arg) -> str | None:
+        """The symbols to scan, and their precision rules."""
+        if not (low.startswith("symbols") or low.startswith("symbol ")):
+            return None
+        s = self.state
+        val = arg("symbols") if low.startswith("symbols") else arg("symbol")
+        syms: list[str] = []
+        bad: list[str] = []
+        for x in val.replace("=", " ").split(","):
+            # "symbols: INITUSDT, ERAUSDT" kept the colon, and the engine
+            # then scanned a symbol that does not exist - the exchange
+            # answered [20015] on every timeframe, every cycle, and the
+            # report filled up with errors that looked like real failures.
+            sym = x.strip().upper().lstrip(":").strip()
+            if not sym:
+                continue
+            if not re.fullmatch(r"[A-Z0-9]{2,15}USDT", sym):
+                bad.append(x.strip())
+                continue
+            syms.append(sym)
+        if syms:
+            s.symbols = syms
+            await self.load_rules(syms)
+            msg = f"Symbols = {','.join(syms)}"
+            if bad:
+                msg += (f" (ignored {', '.join(bad)} - not a symbol like "
+                        f"BTCUSDT)")
+            return msg
+        return "Usage: Symbols BTCUSDT,ETHUSDT"
+        return None
+
+    async def _cmd_tpsl(self, raw: str, low: str, arg) -> str | None:
+        """The exit shape (TP/SL method, ladder) and the account thresholds."""
+        s = self.state
         if low.startswith("tpsl method"):
             try:
                 m = arg("tpsl method").split()[-1].upper()
@@ -2415,9 +2767,7 @@ class TraderEngine:
                 return f"Risk per trade = {s.risk_pct}% of equity."
             except (ValueError, IndexError):
                 return "Usage: risk 1.0"
-
-        return f"Unknown engine command: {raw!r}. Type 'help' for the list."
-
+        return None
     async def _margin_adjust_command(self, raw: str) -> str:
         """`margin add SYMBOL AMOUNT` / `margin reduce SYMBOL AMOUNT`.
 

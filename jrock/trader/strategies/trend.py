@@ -44,7 +44,7 @@ class Ma200CrossMacdConfirm(BaseStrategy):
 
         ind = {"ma200": m, "close": closes[-1], "dist_pct": round(dist, 2), "macd_bull": macd_bull}
         if conf >= 60 and above and macd_bull:
-            return self.signal("LONG", conf, "MA200 reclaim + MACD confirm", timeframe, symbol, ind)
+            return self.signal("LONG", conf, "MA200 reclaim + MACD confirm", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no MA200 bullish turn", timeframe, symbol, ind)
 
 
@@ -87,7 +87,7 @@ class VegasTunnelBullish(BaseStrategy):
 
         ind = {"ema144": a, "ema169": b, "ema12": last(e12), "close": closes[-1]}
         if conf >= 60 and tunnel_up:
-            return self.signal("LONG", conf, "Vegas tunnel up + golden cross", timeframe, symbol, ind)
+            return self.signal("LONG", conf, "Vegas tunnel up + golden cross", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no tunnel-up golden cross", timeframe, symbol, ind)
 
 
@@ -127,7 +127,7 @@ class TemaCrossVwap(BaseStrategy):
 
         ind = {"tema": tv, "vwap": v, "slope_up": slope, "dist_pct": round(dist, 3)}
         if conf >= 60 and above:
-            return self.signal("LONG", conf, "TEMA above VWAP, aligned", timeframe, symbol, ind)
+            return self.signal("LONG", conf, "TEMA above VWAP, aligned", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no TEMA/VWAP alignment", timeframe, symbol, ind)
 
 
@@ -168,7 +168,7 @@ class Dema55TrendFollow(BaseStrategy):
 
         ind = {"dema55": dv, "slope_up": slope, "macd_bull": macd_bull, "dist_pct": round(dist, 2)}
         if conf >= 60 and above and slope:
-            return self.signal("LONG", conf, "DEMA55 trend follow", timeframe, symbol, ind)
+            return self.signal("LONG", conf, "DEMA55 trend follow", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no DEMA55 trend", timeframe, symbol, ind)
 
 
@@ -209,7 +209,7 @@ class VwapBullishConfirmation(BaseStrategy):
 
         ind = {"vwap": v, "close": closes[-1], "reclaimed": reclaimed, "dist_pct": round(dist, 3)}
         if conf >= 60 and above and macd_bull:
-            return self.signal("LONG", conf, "VWAP bullish confirmation", timeframe, symbol, ind)
+            return self.signal("LONG", conf, "VWAP bullish confirmation", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no VWAP bullish confirmation", timeframe, symbol, ind)
 
 
@@ -252,5 +252,5 @@ class ThreeWhiteSoldiers(BaseStrategy):
 
         ind = {"soldiers": soldiers, "rsi": round(rv, 2), "ema20": last(e20)}
         if conf >= 60 and soldiers:
-            return self.signal("LONG", conf, "Three white soldiers", timeframe, symbol, ind)
+            return self.signal("LONG", conf, "Three white soldiers", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no three white soldiers", timeframe, symbol, ind)

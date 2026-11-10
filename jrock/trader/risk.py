@@ -489,7 +489,7 @@ def position_size_by_margin(equity: float, margin_pct: float, entry: float,
 
 
 def position_size_by_risk(equity: float, risk_pct: float, entry: float,
-                          stop: float, leverage: int, rules: PairRules,
+                          stop: float, leverage: int, rules: PairRules, *,
                           fee_rate: float = TAKER_FEE_RATE,
                           safety_pct: float = 0.0,
                           margin_pct: float = 0.0) -> float:

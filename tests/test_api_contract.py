@@ -287,7 +287,10 @@ def test_paging_uses_skip_and_limit_not_page():
         for fn in ast.walk(tree):
             if isinstance(fn, ast.AsyncFunctionDef) and fn.name == fn_name:
                 found = True
-                args = [a.arg for a in fn.args.args]
+                # positional AND keyword-only: the optional filters are
+                # keyword-only, so a caller cannot pass them by accident
+                args = ([a.arg for a in fn.args.args]
+                        + [a.arg for a in fn.args.kwonlyargs])
                 assert "skip" in args and "limit" in args, f"{fn_name} must use skip/limit"
                 assert "page" not in args, f"{fn_name} still uses page"
                 assert "page_size" not in args, f"{fn_name} still uses page_size"

@@ -44,7 +44,7 @@ class VegasTunnelBearish(BaseStrategy):
 
         ind = {"ema144": a, "ema169": b, "ema12": last(e12), "close": closes[-1]}
         if conf >= 60 and tunnel_down:
-            return self.signal("SHORT", conf, "Vegas tunnel down + death cross", timeframe, symbol, ind)
+            return self.signal("SHORT", conf, "Vegas tunnel down + death cross", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no tunnel-down death cross", timeframe, symbol, ind)
 
 
@@ -86,7 +86,7 @@ class GoldenCrossLong(BaseStrategy):
 
         ind = {"ma50": last(ma50), "ma200": last(ma200), "vol_ratio": round(vol_ratio, 2)}
         if conf >= 60 and above:
-            return self.signal("LONG", conf, f"Golden cross, vol x{vol_ratio:.2f}", timeframe, symbol, ind)
+            return self.signal("LONG", conf, f"Golden cross, vol x{vol_ratio:.2f}", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no golden cross", timeframe, symbol, ind)
 
 
@@ -126,5 +126,5 @@ class DeathCrossShort(BaseStrategy):
 
         ind = {"ma50": last(ma50), "ma200": last(ma200), "vol_ratio": round(vol_ratio, 2)}
         if conf >= 60 and below:
-            return self.signal("SHORT", conf, f"Death cross, weak vol x{vol_ratio:.2f}", timeframe, symbol, ind)
+            return self.signal("SHORT", conf, f"Death cross, weak vol x{vol_ratio:.2f}", timeframe=timeframe, symbol=symbol, indicators=ind)
         return self.neutral("no death cross", timeframe, symbol, ind)

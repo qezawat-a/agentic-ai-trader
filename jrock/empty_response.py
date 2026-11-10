@@ -68,6 +68,48 @@ def _usage(body: dict) -> tuple[int | None, int | None]:
     return ct, rt
 
 
+def _tool_call_verdict(msg: dict, finish: str | None, ct: int | None,
+                       rt: int | None, http_status: int) -> EmptyVerdict | None:
+    """Verdict for a tool-call-only response, or None when there were none."""
+    tool_calls = msg.get("tool_calls")
+    if not (isinstance(tool_calls, list) and tool_calls):
+        return None
+    names = [t.get("function", {}).get("name") for t in tool_calls
+             if isinstance(t, dict)]
+    names = [n for n in names if n]
+    return EmptyVerdict("tool_call_only",
+                        f"model returned {len(tool_calls)} tool call(s) and no text"
+                        + (f": {', '.join(names)}" if names else ""),
+                        finish_reason=finish, completion_tokens=ct,
+                        reasoning_tokens=rt, http_status=http_status)
+
+
+def _length_verdict(finish: str | None, ct: int | None, rt: int | None,
+                    http_status: int) -> EmptyVerdict | None:
+    """Verdict for a token-cap exhaustion, or None when the cap was not hit."""
+    if finish != "length":
+        return None
+    if not ct:
+        return EmptyVerdict("length_zero_tokens",
+                            "hit the token cap before producing any output "
+                            "(0 completion tokens)",
+                            finish_reason=finish, completion_tokens=ct,
+                            reasoning_tokens=rt, http_status=http_status,
+                            retry_with_off=True)
+    if rt and ct and rt >= ct:
+        return EmptyVerdict("length_reasoning_only",
+                            f"all {ct} completion tokens were reasoning tokens "
+                            f"({rt} reasoning) - nothing left for the answer",
+                            finish_reason=finish, completion_tokens=ct,
+                            reasoning_tokens=rt, http_status=http_status,
+                            retry_with_off=True)
+    return EmptyVerdict("length_no_text",
+                        f"hit the token cap ({ct} completion tokens) with no text",
+                        finish_reason=finish, completion_tokens=ct,
+                        reasoning_tokens=rt, http_status=http_status,
+                        retry_with_off=True)
+
+
 def diagnose_empty(body: Any, http_status: int = 200) -> EmptyVerdict:
     """Classify a provider response. Returns cause='ok' when there IS content."""
     if not isinstance(body, dict):
@@ -102,16 +144,9 @@ def diagnose_empty(body: Any, http_status: int = 200) -> EmptyVerdict:
                             reasoning_tokens=rt, http_status=http_status)
 
     # 2) tool-call-only response
-    tool_calls = msg.get("tool_calls")
-    if isinstance(tool_calls, list) and tool_calls:
-        names = [t.get("function", {}).get("name") for t in tool_calls
-                 if isinstance(t, dict)]
-        names = [n for n in names if n]
-        return EmptyVerdict("tool_call_only",
-                            f"model returned {len(tool_calls)} tool call(s) and no text"
-                            + (f": {', '.join(names)}" if names else ""),
-                            finish_reason=finish, completion_tokens=ct,
-                            reasoning_tokens=rt, http_status=http_status)
+    tool_only = _tool_call_verdict(msg, finish, ct, rt, http_status)
+    if tool_only is not None:
+        return tool_only
 
     # 3) content filter
     if finish == "content_filter":
@@ -121,26 +156,9 @@ def diagnose_empty(body: Any, http_status: int = 200) -> EmptyVerdict:
                             reasoning_tokens=rt, http_status=http_status)
 
     # 4) length exhaustion - the interesting one
-    if finish == "length":
-        if not ct:
-            return EmptyVerdict("length_zero_tokens",
-                                "hit the token cap before producing any output "
-                                "(0 completion tokens)",
-                                finish_reason=finish, completion_tokens=ct,
-                                reasoning_tokens=rt, http_status=http_status,
-                                retry_with_off=True)
-        if rt and ct and rt >= ct:
-            return EmptyVerdict("length_reasoning_only",
-                                f"all {ct} completion tokens were reasoning tokens "
-                                f"({rt} reasoning) - nothing left for the answer",
-                                finish_reason=finish, completion_tokens=ct,
-                                reasoning_tokens=rt, http_status=http_status,
-                                retry_with_off=True)
-        return EmptyVerdict("length_no_text",
-                            f"hit the token cap ({ct} completion tokens) with no text",
-                            finish_reason=finish, completion_tokens=ct,
-                            reasoning_tokens=rt, http_status=http_status,
-                            retry_with_off=True)
+    capped = _length_verdict(finish, ct, rt, http_status)
+    if capped is not None:
+        return capped
 
     # 5) whitespace-only content
     if isinstance(content, str):
