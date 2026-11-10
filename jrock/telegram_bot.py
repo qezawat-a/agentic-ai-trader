@@ -1,17 +1,16 @@
 """Telegram front-end for the J+Rock trading engine.
 
-A chat replacement for the local web dashboard: the same read-only view of
-positions, open orders, PnL and engine state, delivered in a Telegram chat
-instead of a browser tab at 127.0.0.1:8080.
+A chat command surface for the engine: a read-only view of positions, open
+orders, PnL and engine state, delivered in a Telegram chat (the web dashboard
+was removed; this bot and the CLI are the two front-ends).
 
 Design notes
 ------------
 * **No token in code.** The bot token is read from ``TELEGRAM_BOT_TOKEN``. A
   missing token is a clear startup error, never a silent no-op.
 * **No second implementation of the data.** Everything here calls the same
-  ``build_state`` the dashboard uses (and the same ``agent.handle`` command
-  router), so the numbers cannot drift between the two front-ends. That is
-  also what keeps this module deletable if the dashboard ever goes away.
+  ``build_state`` snapshot in ``jrock.state`` (and the same ``agent.handle``
+  command router), so the numbers cannot drift between the two front-ends.
 * **Read-only plus the existing command surface.** The bot does not invent
   new trading actions: ``/orders`` and friends go through ``agent.handle``,
   so validation, clamping and persistence stay the engine's job.
@@ -50,7 +49,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("orders", "pending orders"),
     ("pnl", "account and PnL"),
     ("engine", "engine flags"),
-    ("tpsl", "the 4 TP/SL methods: show/set"),
+    ("tpsl", "TP/SL method + ladder state"),
     ("help", "this message"),
 ]
 
@@ -228,6 +227,8 @@ def render_engine(state: dict) -> str:
         f"scan {on(e.get('scan_on'))}\n"
         f"symbols {_e(', '.join(e.get('symbols') or []))}\n"
         f"leverage {_e(e.get('leverage'))}x  tpsl {_e(e.get('tpsl_method'))}\n"
+        f"partial ladder {_e(e.get('partial_tp_ladder') or '-')} "
+        f"(exchange-enforced)\n"
         f"scans {_e(e.get('scans'))}  errors {_e(e.get('errors'))}\n"
         + (f"<code>{_e(e.get('last_error'))}</code>" if e.get("last_error") else "")
     )
@@ -251,6 +252,7 @@ HELP_TOPICS: dict[str, str] = {
     "positions": "open positions",
     "orders": "pending orders",
     "pnl": "account and PnL",
+    "tpsl": "TP/SL method + PARTIAL ladder state",
 }
 
 
@@ -325,9 +327,9 @@ class JRockTelegramApp:
         self.bot = bot
 
     async def state(self) -> dict:
-        # Imported lazily so this module can be imported without aiohttp.web
-        # side effects and so a future dashboard removal is a one-line change.
-        from .web import build_state
+        # Imported lazily so the snapshot machinery (network calls + readouts)
+        # only loads with the rest of the agent.
+        from .state import build_state
         return await build_state(self.agent)
 
     async def handle(self, chat_id: int | str, text: str) -> None:

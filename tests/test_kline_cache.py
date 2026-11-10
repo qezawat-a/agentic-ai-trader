@@ -83,10 +83,12 @@ class FakeClient:
 
 
 def make_engine(tmp_path, source="ws", max_age_mult=2.0, n_candles=200):
+    # The staleness knob was folded into KlineCache; tests needing a short
+    # TTL inject their own KlineCache onto the engine.
+    del max_age_mult
     s = Settings(symbols=[SYM], timeframes=["1m", "5m"],
                  market_data_source=source)
     eng = TraderEngine(s, data_dir=tmp_path)
-    eng.kline_cache.max_age_mult = max_age_mult
     eng.client = FakeClient(n_candles)
     return eng
 
@@ -236,7 +238,10 @@ async def test_ws_mode_cache_miss_falls_back_to_rest(tmp_path):
 
 @pytest.mark.asyncio
 async def test_ws_mode_stale_candles_rejected_and_falls_back(tmp_path):
-    eng = make_engine(tmp_path, source="ws", max_age_mult=0.001)
+    # The staleness rule is KlineCache's own (hardcoded in the engine);
+    # inject a short-TTL cache to test the rejection path end to end.
+    eng = make_engine(tmp_path, source="ws")
+    eng.kline_cache = KlineCache(max_age_mult=0.001)
     # a series whose newest candle is ~200 minutes old
     for cd in mk_series(200, start=NOW_1M - 200 * 60_000):
         eng.kline_cache.put_ws(SYM, "1m", cd)

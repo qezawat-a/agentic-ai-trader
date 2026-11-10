@@ -73,24 +73,28 @@ def test_position_method_uses_the_position_endpoint_not_the_standalone_one():
 
 
 # ============================================================ 2. PARTIAL
-def test_partial_method_closes_a_configured_percentage_not_a_hardcoded_half():
-    """The old code always closed exactly 50%. The method makes it configurable."""
+def test_partial_method_parks_native_rung_orders_at_entry():
+    """Each rung is its own native tpsl/place_order with tpQty - not a close."""
     s = Settings()
     s.tpsl_method = "PARTIAL"
-    s.partial_close_pct = 30.0
+    s.partial_tp_ladder = "40@1,35@2,25@3"
     e = TraderEngine(s)
-    assert e.state.partial_close_pct == 30.0
-    assert "PARTIAL" in e.tpsl_method_report()
-    assert "30%" in e.tpsl_method_report()
+    report = e.tpsl_method_report()
+    assert "PARTIAL" in report
+    assert "40@1,35@2,25@3" in report
 
 
-def test_partial_close_pct_is_clamped_to_a_sane_range():
+def test_partial_ladder_spec_is_validated_before_it_is_stored():
     s = Settings()
     e = TraderEngine(s)
-    asyncio.run(e.command("partial close pct 0"))
-    assert e.state.partial_close_pct == 1.0, "0% would close nothing"
-    asyncio.run(e.command("partial close pct 100"))
-    assert e.state.partial_close_pct == 99.0, "100% is the Position method, not Partial"
+    out = asyncio.run(e.command("partial ladder 40@1,30@1"))
+    assert "Invalid ladder" in out, out
+    assert e.state.partial_tp_ladder == "40@1,35@2,25@3", \
+        "a bad spec must not overwrite the running ladder"
+    out = asyncio.run(e.command("partial ladder 50@2,50@4"))
+    assert e.state.partial_tp_ladder == "50@2,50@4"
+    out = asyncio.run(e.command("partial ladder off"))
+    assert e.state.partial_tp_ladder == ""
 
 
 def test_partial_tp_sl_sends_tpqty_and_slqty():
@@ -127,46 +131,84 @@ def test_partial_tp_sl_requires_a_price():
         asyncio.run(c.place_tp_sl_order("AKEUSDT", "P1", tp_qty="1000"))
 
 
-def test_engine_partial_path_uses_the_native_endpoint_when_method_is_partial():
-    """The engine must route through place_tp_sl_order, not a plain close."""
+def test_partial_rungs_go_through_the_native_endpoint_when_method_is_partial():
+    """The engine must route each rung through place_tp_sl_order (tpQty),
+    and the fallback must cover the runner on the position endpoint."""
     s = Settings()
     s.tpsl_method = "PARTIAL"
-    s.partial_close_pct = 50.0
+    s.partial_tp_ladder = "40@1,35@2,25@3"
     e = TraderEngine(s)
     sent: list[dict] = []
 
     class C:
-        async def place_tp_sl_order(self, **kw):
+        async def place_tp_sl_order(self, *a, **kw):
             sent.append(kw)
             return {"orderId": "T9"}
 
     e.client = C()  # type: ignore[assignment]
-    res = asyncio.run(e.place_partial_tp_sl(
-        "AKEUSDT", "P1", "LONG", 2000.0, 0.006, 0.004, AKE))
-    assert res == {"orderId": "T9"}
-    assert sent[0]["tpQty"] == "2000" and sent[0]["slQty"] == "2000"
-    assert sent[0]["tpPrice"] == "0.006000"
-    assert sent[0]["tpStopType"] == "MARK_PRICE"
+    from jrock.trader.tpsl import parse_partial_ladder
+    rungs = parse_partial_ladder(s.partial_tp_ladder)
+    asyncio.run(e._place_partial_rungs(
+        "AKEUSDT", "P1", "LONG", 0.005, 1000.0,
+        sl_dist=0.001, rungs=rungs, rules=AKE, trigger_type="MARK_PRICE"))
+    assert len(sent) == 3, sent
+    first = sent[0]
+    assert first["tp_qty"] == "400"      # 40% of 1000
+    assert first["tp_price"] == "0.006000"   # 1R = 0.001 above entry
+    assert first["tp_stop_type"] == "MARK_PRICE"
+    third = sent[2]
+    assert third["tp_qty"] == "250" and third["tp_price"] == "0.008000"
+
+
+def test_partial_ladder_too_small_falls_back_to_one_whole_position_tp():
+    """A position the exchange will not split still gets ONE plan, not none."""
+    s = Settings()
+    s.tpsl_method = "PARTIAL"
+    s.partial_tp_ladder = "40@1,35@2,25@3"
+    e = TraderEngine(s)
+    modified: list[dict] = []
+
+    class C:
+        async def place_tp_sl_order(self, *a, **kw):
+            # minTradeVolume is 1.0 and every rung is smaller -> all skipped
+            raise ValueError("qty below minTradeVolume")
+
+        async def modify_position_tp_sl_order(self, sym, pid, **kw):
+            modified.append(kw)
+            return {"ok": True}
+
+    e.client = C()  # type: ignore[assignment]
+    from jrock.trader.tpsl import parse_partial_ladder, PositionState
+    rungs = parse_partial_ladder(s.partial_tp_ladder)
+    e.positions["P1"] = PositionState(
+        position_id="P1", symbol="AKEUSDT", side="LONG", entry=0.005,
+        qty=0.5, leverage=10, sl=0.004, tp=0.0, liq=0.003)
+    asyncio.run(e._place_partial_rungs(
+        "AKEUSDT", "P1", "LONG", 0.005, 0.5,
+        sl_dist=0.001, rungs=rungs, rules=AKE, trigger_type="MARK_PRICE"))
+    assert modified, "the fallback whole-position TP must be attached"
+    assert modified[0]["tp_price"] == "0.008000"   # outermost rung (3R)
+    assert e.positions["P1"].tp == 0.008
 
 
 # ============================================================ 3. TRAILING
-def test_trailing_method_is_reported_as_software_not_exchange_enforced():
+def test_trailing_is_always_armed_and_reported_as_software():
     s = Settings()
-    s.tpsl_method = "TRAILING"
     e = TraderEngine(s)
     report = e.tpsl_method_report()
-    assert "TRAILING" in report
+    assert "trailing" in report.lower()
     assert "software" in report, (
         "a software ratchet must not be described as exchange-enforced")
     assert "manage loop" in report
 
 
-def test_trailing_method_is_settable_from_the_command_line():
+def test_trailing_method_is_refused_as_an_entry_method():
+    """TRAILING is always armed - only the NATIVE exit shape is a choice."""
     s = Settings()
     e = TraderEngine(s)
     out = asyncio.run(e.command("tpsl method TRAILING"))
-    assert e.state.tpsl_method == "TRAILING"
-    assert "TRAILING" in out
+    assert "PARTIAL" in out or "POSITION" in out
+    assert e.state.tpsl_method in ("POSITION", "PARTIAL")
 
 
 def test_unknown_method_is_refused():
@@ -205,45 +247,36 @@ def test_account_thresholds_do_not_fire_inside_the_band():
     assert d.trigger == ""
 
 
-def test_account_pct_thresholds_scale_with_equity():
-    cfg = AccountTpSlConfig(tp_pct=5.0)
-    # 5% of 1000 = 50, so 60 fires; 5% of 2000 = 100, so the same 60 does not.
-    assert account_tpsl_decision(total_pnl=60.0, equity=1000.0,
-                                 cfg=cfg).should_close_all
-    assert not account_tpsl_decision(total_pnl=60.0, equity=2000.0,
-                                     cfg=cfg).should_close_all
-
-
-def test_account_pct_is_inert_without_equity_but_usdt_still_works():
-    """A zero equity must not make a %-threshold fire on nothing."""
-    cfg = AccountTpSlConfig(tp_pct=5.0)
-    assert not account_tpsl_decision(total_pnl=1.0, equity=0.0,
-                                     cfg=cfg).should_close_all
-    cfg2 = AccountTpSlConfig(tp_usdt=1.0, tp_pct=5.0)
-    assert account_tpsl_decision(total_pnl=2.0, equity=0.0,
-                                 cfg=cfg2).should_close_all
-
-
 def test_total_unrealized_pnl_sums_the_exchange_field():
     positions = [{"unrealizedPNL": "12.5"}, {"unrealizedPNL": "-2.5"},
                  {"unrealizedPNL": None}, {"no_pnl": 1}]
     assert total_unrealized_pnl(positions) == 10.0
 
 
+def test_account_thresholds_arm_regardless_of_the_entry_method():
+    """ACCOUNT is always armed - a USDT threshold fires even with PARTIAL."""
+    s = Settings()
+    s.tpsl_method = "PARTIAL"
+    s.account_sl_usdt = 50.0
+    e = TraderEngine(s)
+    assert e.account_cfg().enabled
+    d = account_tpsl_decision(total_pnl=-60.0, equity=1000.0,
+                              cfg=e.account_cfg())
+    assert d.should_close_all and d.trigger == "sl"
+
+
 def test_account_method_is_reported_as_software():
     s = Settings()
-    s.tpsl_method = "ACCOUNT"
     s.account_tp_usdt = 100.0
     e = TraderEngine(s)
     report = e.tpsl_method_report()
-    assert "ACCOUNT" in report and "software" in report
+    assert "account TP/SL" in report and "software" in report
     assert "100" in report
 
 
 def test_account_method_closes_all_positions_when_triggered():
     """End to end: the manage loop must flatten the account."""
     s = Settings()
-    s.tpsl_method = "ACCOUNT"
     s.account_tp_usdt = 100.0
     e = TraderEngine(s)
     closed: list[str] = []
@@ -279,7 +312,6 @@ def test_account_method_closes_all_positions_when_triggered():
 
 def test_account_method_does_not_fire_below_the_threshold():
     s = Settings()
-    s.tpsl_method = "ACCOUNT"
     s.account_tp_usdt = 100.0
     e = TraderEngine(s)
     closed: list[str] = []
@@ -344,13 +376,18 @@ def test_close_all_positions_falls_back_to_per_position_close():
 
 
 # ============================================================ the four, together
-def test_all_four_methods_are_recognised():
+def test_native_method_choices_are_accepted_and_software_is_refused():
     s = Settings()
     e = TraderEngine(s)
-    for m in ("POSITION", "PARTIAL", "TRAILING", "ACCOUNT"):
+    for m in ("POSITION", "PARTIAL"):
         out = asyncio.run(e.command(f"tpsl method {m}"))
         assert e.state.tpsl_method == m
         assert m in out
+    for m in ("TRAILING", "ACCOUNT", "BANANA"):
+        out = asyncio.run(e.command(f"tpsl method {m}"))
+        assert "must be" in out or "Method must be" in out
+        assert e.state.tpsl_method in ("POSITION", "PARTIAL"), (
+            "a refused value must not be stored")
 
 
 def test_method_survives_a_restart(tmp_path, monkeypatch):
@@ -363,26 +400,26 @@ def test_method_survives_a_restart(tmp_path, monkeypatch):
     store = Store(data_dir=tmp_path / "data")
     e = TraderEngine(s, store=store)
     asyncio.run(e.command("tpsl method PARTIAL"))
-    asyncio.run(e.command("partial close pct 25"))
+    asyncio.run(e.command("partial ladder 50@2,50@4"))
+    asyncio.run(e.command("account tp usdt 120"))
     e._persist_if_changed()
 
     store2 = Store(data_dir=tmp_path / "data")
     e2 = TraderEngine(Settings(), store=store2)
     assert e2.state.tpsl_method == "PARTIAL"
-    assert e2.state.partial_close_pct == 25.0
+    assert e2.state.partial_tp_ladder == "50@2,50@4"
+    assert e2.state.account_tp_usdt == 120.0
 
 
-def test_account_pct_threshold_measures_full_equity_not_available():
-    """`available` excludes margin locked by open positions.
+def test_account_threshold_is_absolute_usdt_not_available():
+    """The threshold is an ACCOUNT-level USDT number.
 
-    available=1000 locked into margin=9000 is a 10,000 USDT account. A 50% TP
-    therefore needs +5,000 USDT; a +3,000 total PnL must NOT flatten. The old
-    `equity = available` code computed a 500 USDT limit and fired.
+    `available` excludes margin locked by open positions; the check reads the
+    exchange's unrealizedPNL total against the ABSOLUTE USDT threshold, so it
+    does not care how much of the account is locked in margin.
     """
     s = Settings()
-    s.tpsl_method = "ACCOUNT"
-    s.account_tp_pct = 50.0
-    s.account_tp_usdt = 0.0
+    s.account_tp_usdt = 100.0
     e = TraderEngine(s)
     closed: list[str] = []
 
@@ -394,7 +431,7 @@ def test_account_pct_threshold_measures_full_equity_not_available():
                      "unrealizedPNL": "3000.0"}]
 
         async def get_single_account(self):
-            return [{"marginCoin": "USDT", "available": "1000", "frozen": "0",
+            return [{"marginCoin": "USDT", "available": "101", "frozen": "0",
                      "margin": "9000", "crossUnrealizedPNL": "0",
                      "isolationUnrealizedPNL": "0"}]
 
@@ -418,44 +455,7 @@ def test_account_pct_threshold_measures_full_equity_not_available():
         await e.load_rules(["AKEUSDT"])
         return await e.manage_positions()
 
-    asyncio.run(go())
-    assert closed == [], "3,000 of 10,000 equity is 30%, below the 50% TP"
-
-
-def test_account_pct_threshold_still_fires_on_true_equity():
-    """The same account at +6,000 (60% of 10,000) must flatten."""
-    s = Settings()
-    s.tpsl_method = "ACCOUNT"
-    s.account_tp_pct = 50.0
-    s.account_tp_usdt = 0.0
-    e = TraderEngine(s)
-    closed: list[str] = []
-
-    class C:
-        async def get_pending_positions(self, sym=None):
-            return [{"positionId": "P1", "symbol": "AKEUSDT", "side": "LONG",
-                     "avgOpenPrice": "0.005", "qty": "1000", "leverage": "10",
-                     "liqPrice": "0.004", "markPrice": "0.0051",
-                     "unrealizedPNL": "6000.0"}]
-
-        async def get_single_account(self):
-            return [{"marginCoin": "USDT", "available": "1000", "frozen": "0",
-                     "margin": "9000", "crossUnrealizedPNL": "0",
-                     "isolationUnrealizedPNL": "0"}]
-
-        async def close_all_position(self):
-            closed.append("all")
-            return {"ok": True}
-
-        async def get_trading_pairs(self, symbols=None):
-            return [PAIR_ROW]
-
-    e.client = C()  # type: ignore[assignment]
-
-    async def go():
-        await e.load_rules(["AKEUSDT"])
-        return await e.manage_positions()
-
     actions = asyncio.run(go())
-    assert closed == ["all"]
+    assert closed == ["all"], "+3,000 PnL must cross a +100 USDT TP"
     assert actions[0]["action"] == "account_tp"
+    assert actions[0]["total_pnl"] == 3000.0

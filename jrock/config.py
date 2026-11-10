@@ -154,15 +154,6 @@ class Settings:
     #: every scan forever. With this on, the order is placed at the highest
     #: leverage that still leaves room for a stop.
     leverage_auto_reduce: bool = True
-    #: Which price the exchange compares a TP/SL trigger against.
-    #:   MARK_PRICE - the exchange mark price (Bitunix default, and what the
-    #:                engine has always sent)
-    #:   LAST_PRICE - the last traded price
-    #: This value is used for BOTH the local pre-flight validation and the
-    #: tpStopType/slStopType actually sent in the order body. A mismatch between
-    #: the two is exactly what produced 30029: the stop was checked against the
-    #: last price and rejected against the mark price.
-    tp_sl_trigger_type: str = "MARK_PRICE"
     #: Which unit the engine sizes an order in, per the official Bitunix help
     #: article "Explanation of the Order Units in Futures Trading":
     #:   QUANTITY - base-coin quantity (what place_order's `qty` field takes;
@@ -205,29 +196,35 @@ class Settings:
     margin_safety_pct: float = 2.0
 
     # ---------------------------------------------------------------- TP/SL methods
-    #: Which of the four documented Bitunix TP/SL methods the engine uses.
-    #: Per the official academy article "Bitunix Futures: 4 TP/SL Methods Guide",
-    #: the four are Position, Partial, Trailing and Account TP/SL.
-    #:   POSITION - one TP/SL closes the ENTIRE position (native endpoint)
-    #:   PARTIAL  - a defined % of the position closes at each trigger, staged
-    #:              exits (native endpoint, via tpQty/slQty)
-    #:   TRAILING - dynamic exit after a trend + retracement (software ratchet
-    #:              on top of the native position TP/SL)
-    #:   ACCOUNT  - closes ALL positions when total account PnL crosses a
-    #:              threshold (software; Bitunix exposes no API for it)
+    #: Which of the two NATIVE Bitunix TP/SL methods the engine uses at entry.
+    #: The other two documented methods are always armed and need no selector:
+    #:   TRAILING - the stop moves to breakeven at `TRADE_BREAKEVEN_PCT` ROI and
+    #:              then trails behind price from `TRADE_TRAILING_TRIGGER_ROI_PCT`
+    #:              ROI (software ratchet, runs in the manage loop)
+    #:   ACCOUNT  - closes ALL positions when total unrealized PnL crosses
+    #:              ACCOUNT_TP_USDT / ACCOUNT_SL_USDT (software, manage loop)
+    #: Only POSITION and PARTIAL exist as real endpoints, so only they are a
+    #: choice:
+    #:   POSITION - one TP/SL closes the ENTIRE position (tpsl/position/place_order)
+    #:   PARTIAL  - scale out in stages: every rung of PARTIAL_TP_LADDER is its
+    #:              own native tpsl/place_order with tpQty, parked at entry.
     tpsl_method: str = "POSITION"
-    #: PARTIAL: what fraction of the position to close at the partial trigger.
-    partial_close_pct: float = 50.0
-    #: PARTIAL: the ROI (%) at which the partial close fires.
-    partial_at_roi_pct: float = 50.0
+    #: PARTIAL ladder, "share@R" pairs: close share% of the position once price
+    #: runs R x the entry-to-stop distance. Example: "40@1,35@2,25@3" closes
+    #: 40% at 1R, 35% at 2R, 25% at 3R; the remainder rides the trailing stop.
+    partial_tp_ladder: str = "40@1,35@2,25@3"
     #: ACCOUNT: close every position when total unrealized PnL reaches these
-    #: USDT thresholds. 0 disables that side. Both 0 = the method is inert.
+    #: USDT thresholds. 0 disables that side. Both 0 = account TP/SL is off.
     account_tp_usdt: float = 0.0
     account_sl_usdt: float = 0.0
-    #: ACCOUNT: also close when total PnL crosses this % of account equity.
-    #: 0 disables. Useful when the account size changes.
-    account_tp_pct: float = 0.0
-    account_sl_pct: float = 0.0
+
+    # ---------------------------------------------------------------- self-repair
+    #: How often the self-repair loop runs (hours). 0 keeps the loop OFF; the
+    #: on-demand command still works.
+    self_heal_interval_hours: float = 6.0
+    #: Let the self-repair loop commit and push its own fixes to origin main
+    #: once the tests are green. 0 keeps it report-only (fixes stay uncommitted).
+    self_heal_auto_push: bool = True
 
     @property
     def data_dir(self) -> Path:
@@ -276,7 +273,6 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         thinking_level=level_from_env(),
         market_data_source=_market_data_source(),
         leverage_auto_reduce=_b("LEVERAGE_AUTO_REDUCE", True),
-        tp_sl_trigger_type=_tp_sl_trigger_type(),
         order_unit=_order_unit(),
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),
         max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
@@ -284,17 +280,24 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         margin_amount_pct=_f("MARGIN_AMOUNT_PCT", 10.0),
         taker_fee_rate=_f("TAKER_FEE_RATE", 0.0006),
         margin_safety_pct=_f("MARGIN_SAFETY_PCT", 2.0),
+        tpsl_method=_tpsl_method(),
+        partial_tp_ladder=os.getenv("PARTIAL_TP_LADDER", "40@1,35@2,25@3").strip(),
+        account_tp_usdt=_f("ACCOUNT_TP_USDT", 0.0),
+        account_sl_usdt=_f("ACCOUNT_SL_USDT", 0.0),
+        self_heal_interval_hours=_f("SELF_HEAL_INTERVAL_HOURS", 6.0),
+        self_heal_auto_push=_b("SELF_HEAL_AUTO_PUSH", True),
     )
 
 
-def _tp_sl_trigger_type() -> str:
-    """TP_SL_TRIGGER_TYPE=MARK_PRICE|LAST_PRICE, default MARK_PRICE.
+def _tpsl_method() -> str:
+    """TPSL_METHOD=POSITION|PARTIAL, default POSITION.
 
-    MARK_PRICE is the documented Bitunix default and the engine's historical
-    behaviour, so an unset or unrecognised value keeps it.
+    Trailing and Account TP/SL are always armed (they need no native endpoint
+    and no selector), so the only real choice is which NATIVE exit shape a new
+    position gets. Anything unrecognised falls back to POSITION.
     """
-    v = (os.getenv("TP_SL_TRIGGER_TYPE") or "MARK_PRICE").strip().upper()
-    return v if v in ("MARK_PRICE", "LAST_PRICE") else "MARK_PRICE"
+    v = (os.getenv("TPSL_METHOD") or "POSITION").strip().upper()
+    return v if v in ("POSITION", "PARTIAL") else "POSITION"
 
 
 def _order_unit() -> str:

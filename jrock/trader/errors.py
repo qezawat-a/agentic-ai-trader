@@ -109,9 +109,9 @@ ACTIONABLE_HINTS: dict[int, str] = {
     30023: "SL is on the wrong side of the mark price for this direction.",
     30024: "SL is on the wrong side of the liquidation price.",
     30025: "SL is on the wrong side of the liquidation price.",
-    30029: ("SL is above the mark price on a LONG. Raise TP_SL_MIN_STOP_TICKS "
+    30029: ("SL is above the mark price on a LONG. Raise MIN_STOP_TICKS "
             "or check the stop distance - the engine clamps this in clamp_sl()."),
-    30031: ("SL is below the mark price on a SHORT. Raise TP_SL_MIN_STOP_TICKS "
+    30031: ("SL is below the mark price on a SHORT. Raise MIN_STOP_TICKS "
             "or check the stop distance - the engine clamps this in clamp_sl()."),
     30033: "TP is on the wrong side of the mark price for this direction.",
     30038: "the TP/SL amount exceeds the position size.",

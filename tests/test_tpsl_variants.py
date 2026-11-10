@@ -137,27 +137,19 @@ def test_order_unit_never_changes_the_wire_field(rules):
 
 
 # ------------------------------------------------------- trigger type config
-def test_trigger_type_defaults_to_mark_price():
-    assert Settings().tp_sl_trigger_type == "MARK_PRICE"
+def test_trigger_type_is_fixed_to_mark_price():
+    """MARK_PRICE is hardcoded, not an env knob.
+
+    The exchange validates a TP/SL against the MARK price at the moment the
+    request lands (30029/30031), and the SAME value must go into the local
+    pre-flight validation and the wire. One constant, one meaning.
+    """
+    from jrock.trader.engine import TRIGGER_TYPE
+    assert TRIGGER_TYPE == "MARK_PRICE"
 
 
 def test_order_unit_defaults_to_quantity():
     assert Settings().order_unit == "QUANTITY"
-
-
-def test_trigger_type_reads_env(monkeypatch):
-    monkeypatch.setenv("TP_SL_TRIGGER_TYPE", "LAST_PRICE")
-    assert load_settings().tp_sl_trigger_type == "LAST_PRICE"
-
-
-def test_trigger_type_is_case_insensitive(monkeypatch):
-    monkeypatch.setenv("TP_SL_TRIGGER_TYPE", "last_price")
-    assert load_settings().tp_sl_trigger_type == "LAST_PRICE"
-
-
-def test_trigger_type_falls_back_on_garbage(monkeypatch):
-    monkeypatch.setenv("TP_SL_TRIGGER_TYPE", "INDEX_PRICE")
-    assert load_settings().tp_sl_trigger_type == "MARK_PRICE"
 
 
 def test_order_unit_reads_env(monkeypatch):

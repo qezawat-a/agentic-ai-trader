@@ -28,7 +28,7 @@ CASES: list[tuple[str, str | None]] = [
     ("what is my pnl", None),
     ("show me the status", None),
     ("why did the last order fail", None),
-    ("what does TAKER_FEE_RATE do", None),
+    ("what does TP_SL_MIN_STOP_TICKS do", None),
     ("explain TAKER_FEE_RATE", None),
     ("set leverage to 5x", "yes"),
     ("set risk to 2%", "no"),

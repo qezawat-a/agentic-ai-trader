@@ -45,9 +45,11 @@ class FakeClient:
 
 
 def make_engine(tmp_path, source="ws", max_age=5.0, price=100.0):
+    # The max-age knob was folded into PriceCache (hardcoded default); tests
+    # that need a short TTL drive the cache itself, engines here just run.
+    del max_age
     s = Settings(symbols=["BTCUSDT"], market_data_source=source)
     eng = TraderEngine(s, data_dir=tmp_path)
-    eng.price_cache.max_age = max_age
     eng.client = FakeClient(price)
     return eng
 
@@ -113,7 +115,10 @@ async def test_ws_mode_cache_miss_falls_back_to_rest(tmp_path):
 
 @pytest.mark.asyncio
 async def test_ws_mode_stale_price_rejected_and_falls_back(tmp_path):
-    eng = make_engine(tmp_path, source="ws", max_age=0.05, price=88.0)
+    # The TTL is PriceCache's own (hardcoded in the engine); inject a
+    # short-TTL cache to test the rejection path end to end.
+    eng = make_engine(tmp_path, source="ws", price=88.0)
+    eng.price_cache = PriceCache(max_age=0.05)
     eng.price_cache.put_ws("BTCUSDT", 777.0)
     time.sleep(0.12)
     px = await eng.get_price("BTCUSDT")

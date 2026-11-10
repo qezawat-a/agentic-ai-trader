@@ -88,10 +88,10 @@ def test_mid_management_reversal_closes():
     assert mid_management_action(st, 10, True, 80, 70) == "close_reversal"
 
 
-def test_mid_management_partial_at_roi():
+def test_mid_management_tightens_a_big_winner():
     st = PositionState("1", "BTCUSDT", "LONG", 100, 1, 10, 95, 110, 90)
-    assert mid_management_action(st, 60, False, 0, 70) == "partial_close"
-    st.partial_done = True
+    # the scale-out shares live in the native PARTIAL rungs now; a +60% ROI
+    # position is only tightened here
     assert mid_management_action(st, 60, False, 0, 70) == "tighten"
 
 

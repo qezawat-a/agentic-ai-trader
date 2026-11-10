@@ -13,6 +13,8 @@ Everything else is derived by the agent from signal strength:
 """
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
 
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
@@ -157,9 +159,75 @@ class PositionState:
     breakeven_done: bool = False
     trailing_active: bool = False
     trailing_stop: float | None = None
-    partial_done: bool = False
     opened_ts: float = 0.0
     peak_roi: float = 0.0
+
+
+# ------------------------------------------------------------ PARTIAL TP/SL
+# The PARTIAL method is the scale-out ladder from the official article
+# "Bitunix Futures Positions: Guide to Four TP/SL Methods": several triggers,
+# each closing a share of the position. Each rung is a NATIVE
+# /tpsl/place_order carrying tpQty, parked at entry - so the exchange enforces
+# every rung even if this engine is dead, and no manage-loop bookkeeping
+# (fired levels, backstop re-parking) exists at all. The stop is never
+# laddered: scaling out of a loser is just being wrong more slowly.
+
+@dataclass(frozen=True)
+class LadderRung:
+    """One rung of the partial ladder: `share` % of the position at `r` * risk."""
+
+    share: float
+    r: float
+
+
+def parse_partial_ladder(spec: str) -> list[LadderRung]:
+    """Parse the share@R ladder spec, e.g. "40@1,35@2,25@3".
+
+    One knob, one meaning: each pair is `share@R` - close `share`% of the
+    position when price runs R times the entry-to-stop distance. Rules
+    (mirroring the documented format exactly):
+      * share > 0 and share <= 100
+      * R > 0
+      * shares sum to <= 100; whatever is left is the runner
+      * R must increase left to right (rung 2 is farther than rung 1)
+    Empty/blank spec = no ladder (the caller falls back to the POSITION method
+    or to no TP at all when there is no signal-strength plan).
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        return []
+    rungs: list[LadderRung] = []
+    for part in raw.split(","):
+        part = part.strip()
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*@\s*(\d+(?:\.\d+)?)", part)
+        if not m:
+            raise PartialLadderError(
+                f'bad ladder rung "{part}" - expected "share@R", e.g. "30@1.5"')
+        share, r = float(m.group(1)), float(m.group(2))
+        if not (0 < share <= 100):
+            raise PartialLadderError(f"ladder share must be 0-100, got {share}")
+        if not (r > 0):
+            raise PartialLadderError(f"ladder R multiple must be > 0, got {r}")
+        rungs.append(LadderRung(share=share, r=r))
+    total = sum(x.share for x in rungs)
+    if total > 100.0001:
+        raise PartialLadderError(
+            f"ladder shares sum to {total:g}%, must be <= 100")
+    for prev, cur in zip(rungs, rungs[1:]):
+        if cur.r <= prev.r:
+            raise PartialLadderError(
+                f"ladder targets must increase: {prev.r}R then {cur.r}R")
+    return rungs
+
+
+class PartialLadderError(ValueError):
+    """The partial ladder spec is malformed."""
+
+
+def rung_target(side: str, entry: float, sl_dist: float, r: float) -> float:
+    """The absolute price of a rung at R × the entry-to-stop distance."""
+    is_long = side.upper() in ("LONG", "BUY")
+    return entry + sl_dist * r if is_long else entry - sl_dist * r
 
 
 def should_breakeven(state: PositionState, roi: float, breakeven_pct: float) -> bool:
@@ -187,13 +255,11 @@ def next_trailing_stop(state: PositionState, price: float, atr_value: float,
 
 
 def mid_management_action(state: PositionState, roi: float, reversal: bool,
-                          reversal_confidence: float, min_reversal_conf: float = 70.0,
-                          partial_at_roi: float = 50.0) -> str:
-    """Returns: "hold" | "partial_close" | "close_reversal" | "tighten"."""
+                          reversal_confidence: float,
+                          min_reversal_conf: float = 70.0) -> str:
+    """Returns: "hold" | "close_reversal" | "tighten"."""
     if reversal and reversal_confidence >= min_reversal_conf:
         return "close_reversal"
-    if not state.partial_done and roi >= partial_at_roi:
-        return "partial_close"
     if roi >= 30:
         return "tighten"
     return "hold"

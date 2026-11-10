@@ -381,6 +381,8 @@ def _b_why_failed(t: str) -> Intent:
 #: the canonical name. A question about a known setting is answered from the
 #: repo, never by the model.
 _SETTING_ALIASES: dict[str, tuple[str, ...]] = {
+    "MIN_STOP_TICKS": ("tp_sl_min_stop_ticks", "min_stop_ticks",
+                       "min stop ticks", "stop ticks", "min stop distance"),
     "TAKER_FEE_RATE": ("taker_fee_rate", "taker fee rate", "taker fee",
                        "fee rate", "trading fee"),
     "MARGIN_SAFETY_PCT": ("margin_safety_pct", "margin safety pct",
@@ -393,8 +395,9 @@ _SETTING_ALIASES: dict[str, tuple[str, ...]] = {
 def _b_what_is(t: str) -> Intent:
     """A question about a setting defined in THIS repo.
 
-    A question about a known setting is answered from the repo, never by the
-    model.
+    The engine once answered "I have no access to the engine" for
+    MIN_STOP_TICKS, which is fixed in jrock/trader/engine.py. A question about
+    a known setting is answered from the repo, never by the model.
     """
     low = t.lower()
     for canonical, aliases in _SETTING_ALIASES.items():
@@ -454,10 +457,10 @@ def _b_analysis(t: str) -> Intent:
 RULES: list[tuple[str, re.Pattern, object]] = [
     # --- questions about this repo's own settings (must beat everything)
     ("explain_setting", re.compile(
-        r"\b(what|whats|what's|explain|how)\b.*\b(taker_fee_rate|"
-        r"margin_safety_pct)\b", re.I), _b_what_is),
+        r"\b(what|whats|what's|explain|how)\b.*\b(min_stop_ticks|taker_fee_rate|"
+        r"margin_safety_pct|margin_amount_pct)\b", re.I), _b_what_is),
     ("explain_setting", re.compile(
-        r"\b(taker_fee_rate|margin_safety_pct)\b.*"
+        r"\b(min_stop_ticks|taker_fee_rate|margin_safety_pct|margin_amount_pct)\b.*"
         r"\b(do|does|mean|means|work|works|for)\b", re.I), _b_what_is),
 
     # --- why did it fail
@@ -709,8 +712,8 @@ RULES: list[tuple[str, re.Pattern, object]] = [
     # --- explain a setting, phrased as a question
     ("explain_setting", re.compile(
         r"\b(explain|what is|what'?s|how does|tell me about|what does)\b.*"
-        r"\b(taker fee|fee rate|trading fee|margin safety|safety pct)\b", re.I),
-     _b_what_is),
+        r"\b(taker fee|fee rate|trading fee|margin safety|safety pct|"
+        r"min stop ticks|stop ticks|min stop distance)\b", re.I), _b_what_is),
 
     # --- Persian (Farsi) conversational forms.
     #

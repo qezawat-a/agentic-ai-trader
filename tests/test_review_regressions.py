@@ -5,10 +5,11 @@ Each test pins ONE bug so it cannot come back:
 BUG-1  engine.py:813  `pick_tier` used but never imported -> NameError on the
                       preflight path whenever the configured leverage is above
                       every tier's cap (tier_for_leverage returns None).
-BUG-2  engine.py:1624 `partial_at_roi_pct` was never passed to
-                      `mid_management_action`, so the user's "partial at roi N"
-                      setting was silently ignored and the hardcoded 50% default
-                      was used instead.
+BUG-2  engine.py:1624 the user's mid-management threshold was ignored by
+                      `mid_management_action`. The scale-out moved into the
+                      native PARTIAL rungs, so the pin is now: mid-management
+                      only ever returns hold/close_reversal/tighten, and the
+                      engine forwards the configured reversal confidence.
 BUG-3  nlu.py         the "use N% of my balance per trade" rule ended with
                       `\\b` right after `%`; `%` is a non-word character, so the
                       boundary could never match and the rule was dead.
@@ -128,40 +129,27 @@ def test_preflight_does_not_raise_nameerror_above_every_tier():
 
 
 # --------------------------------------------------------------------- BUG-2
-def test_mid_management_action_honours_a_custom_partial_roi():
-    """BUG-2: the setting must actually change when the partial fires."""
+def test_mid_management_action_only_decides_reversal_or_tighten():
+    """The partial-close behaviour lives in the native PARTIAL rungs now;
+    mid-management only closes on a reversal and tightens a big winner."""
     st = PositionState(position_id="1", symbol="X", side="LONG", entry=1.0,
                        qty=1.0, leverage=10, sl=0.9, tp=1.2, liq=0.8)
-    # roi 25%: fires at a 20% threshold, holds at the 50% default
-    assert mid_management_action(st, 25.0, False, 0.0, 70.0, 20.0) == "partial_close"
-    assert mid_management_action(st, 25.0, False, 0.0, 70.0, 50.0) == "hold"
+    assert mid_management_action(st, 25.0, False, 0.0, 70.0) == "hold"
+    assert mid_management_action(st, 60.0, False, 0.0, 70.0) == "tighten"
+    assert mid_management_action(st, 25.0, True, 90.0, 70.0) == "close_reversal"
 
 
-def test_engine_passes_partial_at_roi_pct_into_mid_management():
-    """BUG-2: the engine must forward state.partial_at_roi_pct, not the default.
-
-    The call site is asserted directly because the surrounding management loop
-    needs a live exchange; this is the exact argument list that was wrong.
-    """
+def test_engine_mid_management_call_carries_the_reversal_threshold():
+    """The call site is asserted directly because the surrounding management
+    loop needs a live exchange; the reversal confidence must be forwarded."""
     import inspect
     import jrock.trader.engine as engine_mod
     src = inspect.getsource(engine_mod.TraderEngine.manage_positions)
     assert "mid_management_action(" in src
     call = src.split("mid_management_action(", 1)[1].split(")", 1)[0]
-    assert "partial_at_roi_pct" in call, (
-        "manage_positions must pass state.partial_at_roi_pct to "
+    assert "reversal_confidence" in call, (
+        "manage_positions must pass state.reversal_confidence to "
         "mid_management_action; without it the user's setting is ignored")
-
-
-def test_partial_at_roi_pct_is_a_live_setting():
-    e = _engine()
-    assert e.state.partial_at_roi_pct == 50.0
-
-    async def go():
-        return await e.command("partial at roi 20")
-
-    asyncio.run(go())
-    assert e.state.partial_at_roi_pct == 20.0
 
 
 # --------------------------------------------------------------------- BUG-3

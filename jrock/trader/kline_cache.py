@@ -5,8 +5,8 @@ WHY THIS IS NOT THE PRICE CACHE
 A price is a point: it is either fresh (seconds) or it is a lie. A candle is an
 interval: a 1m candle is *legitimately* up to 60s old, and a 1d candle is
 legitimately up to 24h old. So the staleness rule here is a MULTIPLE OF THE
-INTERVAL (`KLINE_MAX_AGE_SEC` is expressed as `max_age_mult * interval`), not a
-flat number of seconds.
+INTERVAL (`KlineCache(max_age_mult=...)`, hardcoded in the engine), not a flat
+number of seconds.
 
 THE FRAME HAS NO TIME FIELD
 ---------------------------

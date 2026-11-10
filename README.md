@@ -35,83 +35,44 @@ python -m jrock.cli --help-cmds
 
 ---
 
-## Web dashboard
+## Front-ends: CLI and Telegram
 
-`python -m jrock.web` serves the same agent in a browser instead of the terminal.
-Every line you submit goes through the same `JRockAgent.handle()` the CLI uses, so
-commands, natural language, and `yes`/`no` confirmations behave identically.
+The engine has two front-ends and no web UI. Both call the same
+`JRockAgent.handle()` router, so commands, natural language and `yes`/`no`
+confirmations behave identically in each.
 
 ```bash
-python -m jrock.web
-# J+Rock dashboard: http://127.0.0.1:8080/?token=...
+python -m jrock.cli                # the interactive terminal REPL
+python -m jrock.telegram_bot       # long polling in Telegram (TELEGRAM_BOT_TOKEN)
+python -m jrock.cli --once "/status"
 ```
 
-Open the printed URL. The page has quick buttons for read-only queries and a box
-for any command or question.
+The Telegram bot is a thin renderer over `jrock/state.py` `build_state()` - one
+read-only snapshot of the engine, account, positions and orders - plus the
+command router. It publishes `/status /positions /orders /pnl /engine /tpsl
+/help` to the Telegram Menu, generated from one list so the Menu sheet and
+`/help` cannot disagree. Long polling means no public URL, no TLS, no port.
 
-The dashboard is a 1:1 view of the engine, not a subset of it. It refreshes
-itself every 30 seconds (the same default as the engine's own report loop) and
-shows a **last updated** stamp, so a stale page is visible rather than silent.
+---
 
-| Panel | What it shows |
-|---|---|
-| Engine | engine / autotrade / scan / report / mid-management / reversal state, symbols, leverage, scan count, last error |
-| Account | equity, available, margin, unrealized and realized PnL, open position and order counts, API reachability |
-| Open positions | symbol, side, qty, entry, mark, liquidation price, leverage, ROI, unrealized PnL |
-| Open orders | symbol, side, type, qty, price, status |
-| Strategies & permissions | registered strategy count by category, and the agent's permission flags |
-| Readouts | the read/query commands, verbatim: `status`, `settings trade`, bare `margin amount`, `tpsl`, `pnl`, `trades_history`, `tpsl_history` |
-| Settings | every engine setting, editable in place (see below) |
-| Output | the result of the last command or question |
+## Self-repair
 
-### Dashboard endpoints
+`python -m jrock.self_heal --once` runs one repair cycle:
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/` | GET | the page (requires `?token=`) |
-| `/api/state` | GET | the structured snapshot the page polls every 30s |
-| `/api/command` | POST | any command or question, through `JRockAgent.handle()` |
-| `/api/autotrade` | POST | the autotrade toggle (needs `confirm: true` to turn ON) |
-| `/api/settings` | POST | write one engine setting |
-| `/api/margin` | POST | `margin add` / `margin reduce` on an isolated position |
-| `/api/toggle` | POST | flip scan / report / reversal / mid-management |
+1. `pytest -q tests`
+2. green - nothing to repair;
+3. red - the failing output and the relevant file tails go to the configured
+   model (`agent.chat`) with a strict "return JSON only" prompt asking for
+   exact-string replacements;
+4. a fix is applied only when its anchor matches exactly once; at most 5 files
+   per cycle;
+5. the suite is re-run: red again - every change is reverted; green - the
+   changed files are committed and pushed to `origin main`.
 
-All of them require the `X-Auth-Token` header (or `?token=`).
-
-### Settings you can change from the dashboard
-
-Every setting that used to be reachable only from the CLI or chat is a control
-here. The dashboard does not write engine state directly: it builds the exact
-command the CLI accepts and runs it through `engine.command()`, so validation,
-clamping and persistence are the engine's own.
-
-`margin amount` · `leverage` · `risk` · `max open positions` · `partial close pct`
-· `partial at roi` · `breakeven threshold pct` · `trailing trigger stop ROI pct`
-· `liq sl distance pct` · `min agreeing strategies` · `min confidence`
-· `tf min confidence` · `scans interval sec` · `report interval sec`
-· `reversal_confidence` · `account tp/sl usdt` · `account tp/sl pct`
-· `margin mode` · `position mode` · `tpsl method` · `symbols` · `timeframes`
-
-### Autotrade from the dashboard
-
-The autotrade button shows the current state and asks for confirmation before
-turning ON, because that is the switch that lets the engine place real orders.
-Turning it OFF never needs a confirmation. The engine still never resumes
-autotrade automatically after a restart - the dashboard surfaces the
-`autotrade_was_on` warning instead of silently re-arming it.
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `WEB_TOKEN` | *(random per start)* | Dashboard password. Sent as the `X-Auth-Token` header or `?token=` in the URL. Not an API key. |
-| `WEB_HOST` | `127.0.0.1` | Interface to listen on. Non-loopback addresses print a warning. |
-| `WEB_PORT` | `8080` | Port to listen on. |
-
-Set `WEB_TOKEN` in `.env` to keep the same password across restarts. Without it, a
-new random token is printed each time. Requests without a valid token get `401`.
-
-The dashboard binds to loopback by default. Do not expose it on a network interface
-without TLS and a reverse proxy in front. Autotrade and the engine loop are still
-never resumed automatically after a restart.
+`python -m jrock.self_heal --loop` repeats every `SELF_HEAL_INTERVAL_HOURS`
+(default 6, 0 = off). It never touches `.env`, `data/` or anything outside
+`jrock/` and `tests/`, never force-pushes, and pushes only on `main`.
+Runtime: `/selfheal once|loop|stop|status`.
 
 ---
 
@@ -140,11 +101,9 @@ never resumed automatically after a restart.
 | `/status` | engine + API + account summary |
 | `/symbols [SEARCH]` | tradable symbols with precision and min volume |
 | `/memory [query]` | memory stats, or search memory |
-| `/movers [MODE] [n]` | rank the universe from live tickers: `MOVERS` (biggest 24h move either way), `GAINERS`, `LOSERS`, `VOLUME` (deepest turnover). Ends with a paste-ready `symbols ...` line |
-| `/code_review [path]` | AST + regex review: syntax, long functions, bare except, eval, TODOs, plus an LLM pass over the flagged sources (read-only, never auto-applied) |
+| `/code_review [path]` | AST + regex review: syntax, long functions, bare except, eval, TODOs |
 | `/bug_fix [path]` | review + apply safe fixes (permission-gated) |
 | `/verify` | compileall + import check + pytest |
-| `/autofix` | self-fix loop: engine errors + pytest tail → one LLM patch pass through the permission gate → retest → commit + push only if tests pass |
 | `/simplify [path]` | over-complex functions, oversized files |
 | `/team_spawn <n> <task>` | spawn n scoped sub-agents |
 | `/check_ai` | end-to-end LLM key/model health |
@@ -169,6 +128,8 @@ engine on | engine off              status
 report on | report off              report interval sec 30
 trades_history | tpsl_history | pnl | positions history
 settings trade                      scan on | scan off
+tpsl method POSITION|PARTIAL        partial ladder 40@1,35@2,25@3
+account tp usdt 100                 account sl usdt 50
 mid management position trigger     reversal=true   reversal_confidence=70
 scans interval sec 30               breakeven threshold pct 0.6
 trailing trigger stop ROI pct 25    liq sl distance pct 50
@@ -251,9 +212,11 @@ jrock/
     permissions.py       permission model + audit log + diff gate
     memory.py            feedback / episodes / facts, BM25-ish recall
     model_selector.py    AutoSetModelByKey (list -> probe -> pick -> persist)
-    agent.py             tools, self-healing, all 22 commands
+    agent.py             tools, self-healing, the command router
     cli.py               interactive + --once + --startup
-    web.py               browser dashboard (aiohttp) over the same agent
+    state.py             read-only snapshot shared by the bot (build_state)
+    telegram_bot.py      Telegram front-end: long polling, same router
+    self_heal.py         pytest -> review -> exact-string fixes -> push
     trader/
       client.py          REST client, double-SHA256 signing, 36 endpoints
       ws.py              public/private WS, auto-reconnect, signed login
@@ -267,7 +230,7 @@ jrock/
       strategies/        16 strategies in 5 category modules
   docs/bitunix/          local copy of the official API docs
   soul/jrock.soul.md     the persona
-  tests/                 57 tests
+  tests/                 1058 tests
 ```
 
 ---
@@ -414,7 +377,7 @@ sentence means.
 | `set leverage to 5x` | `leverage 5` |
 | `set risk to 2%` | `risk 2.0` |
 | `why did the last order fail` | engine error log + the code's hint |
-| `what does TAKER_FEE_RATE do` | answered from `jrock/config.py` |
+| `what does TP_SL_MIN_STOP_TICKS do` | answered from `jrock/config.py` |
 
 **Safety.** Anything that moves money - opening or closing a position, changing
 leverage, risk, margin mode, position mode, autotrade, or the engine - is
@@ -431,10 +394,10 @@ be a guess with real money.
 **Free text still reaches the model.** A sentence the intent layer does not
 recognise falls through unchanged, so nothing that used to work stops working.
 
-**The engine answers about its own settings.** `TAKER_FEE_RATE` and
-`MARGIN_SAFETY_PCT` are defined in `jrock/config.py`; a question about them is
-answered from the repo, with the live value. The engine never claims it cannot
-see its own code.
+**The engine answers about its own settings.** `TP_SL_MIN_STOP_TICKS`,
+`TAKER_FEE_RATE` and `MARGIN_SAFETY_PCT` are defined in `jrock/config.py`; a
+question about them is answered from the repo, with the live value. The engine
+never claims it cannot see its own code.
 
 ## Empty model responses
 
@@ -528,7 +491,7 @@ through one accessor, `TraderEngine.get_price(symbol)`, which consults a
 
 | Situation | What happens |
 |---|---|
-| cached quote younger than the staleness limit (fixed at 5s) | returned, `source=ws`, **no REST call** |
+| cached quote younger than `PRICE_MAX_AGE_SEC` (default 5s) | returned, `source=ws`, **no REST call** |
 | no cached quote | REST fallback, counted as a `miss` |
 | cached quote older than the limit | **refused**, warning logged, REST fallback, counted as a `stale_rejection` |
 | WS disconnected | REST fallback; the engine keeps running, never blocks on the socket |
@@ -585,12 +548,12 @@ series by one every 500ms and corrupt every indicator.
 **Staleness is a multiple of the interval, not flat seconds.** A 1m candle is
 legitimately 60s old; a 1d candle is legitimately 24h old. A candle set is
 stale when the newest candle's open time is older than
-`2 x interval` (fixed).
+`KLINE_MAX_AGE_SEC * interval` (default 2x).
 
 | Situation | What happens |
 |---|---|
 | fresh, long-enough, WS-fed series | returned, `source=ws`, **no REST call** |
-| newest candle older than `2 x interval` | **refused**, warning, REST fallback, `stale_rejection` |
+| newest candle older than `KLINE_MAX_AGE_SEC * interval` | **refused**, warning, REST fallback, `stale_rejection` |
 | fewer candles than the caller needs | **refused**, REST fallback, `short_series` - a short series produces a wrong signal, which is worse than a slow one |
 | cache holds REST-seeded candles only | REST fallback (we cannot claim it is live) |
 | WS disconnected | REST fallback; the engine keeps running |
@@ -779,8 +742,12 @@ Configurable bounds (all default `0` = disabled, so behaviour is unchanged):
 | `MIN_MARGIN_USDT` | refuse orders whose margin is below this |
 | `MAX_MARGIN_USDT` | refuse orders whose margin is above this |
 | `MAX_NOTIONAL_USDT` | refuse orders whose notional is above this |
-| `TP_SL_TRIGGER_TYPE` | `MARK_PRICE` (default) or `LAST_PRICE` |
 | `ORDER_UNIT` | `QUANTITY` (default), `NOTIONAL` or `COST` |
+
+Anything else that protects a stop is fixed in code, not configurable: the
+trigger is always `MARK_PRICE`, a stop keeps a minimum gap of `MIN_STOP_TICKS`
+(3) price ticks from the mark, and the mark is re-read before every TP/SL
+write. One knob, one meaning.
 
 Verify against live data: `python scripts/verify_tpsl_side.py`
 
@@ -888,33 +855,91 @@ Verify: `python scripts/verify_api_contract.py`
 ## The 4 TP/SL methods
 
 These are the four from the official academy article *"Bitunix Futures
-Positions: Guide to Four TP/SL Methods"* — a different axis from the four
-order-type/trigger-type combinations above. `TPSL_METHOD` selects one.
+Positions: Guide to Four TP/SL Methods"*. Two of them choose the native exit
+shape a new position gets (`TPSL_METHOD`); the other two are always armed in
+the manage loop and have no selector - arming them is not a choice.
 
 | Method | What it does | Endpoint | Enforced by | Code |
 |---|---|---|---|---|
 | `POSITION` | one TP/SL closes the **entire** position | `POST /api/v1/futures/tpsl/position/place_order` | exchange | `client.py` `place_position_tp_sl_order` |
-| `PARTIAL` | a defined **%** closes at each trigger, the rest stays open | `POST /api/v1/futures/tpsl/place_order` (`tpQty`/`slQty`) | exchange | `engine.py` `place_partial_tp_sl` |
-| `TRAILING` | arms after a trend, then trails behind price | none — software | manage loop | `tpsl.py` `plan_tpsl` + `engine.py` `_manage_positions` |
-| `ACCOUNT` | closes **all** positions when total account PnL crosses a threshold | none — software | manage loop | `account_tpsl.py` `account_tpsl_decision` |
+| `PARTIAL` | each `share@R` rung is its own native TP with `tpQty`, parked at entry | `POST /api/v1/futures/tpsl/place_order` | exchange | `engine.py` `_place_partial_rungs` |
+| `TRAILING` | breakeven, then trails behind price - always on | none - software | manage loop | `tpsl.py` `next_trailing_stop` |
+| `ACCOUNT` | closes **all** positions when total PnL crosses a USDT threshold - always on | none - software | manage loop | `account_tpsl.py` `account_tpsl_decision` |
 
 **The honest caveat:** `POSITION` and `PARTIAL` are enforced by the exchange, so
 they survive the engine being down. `TRAILING` and `ACCOUNT` have no native
-endpoint — they are software and only fire while the manage loop is running.
-`/status` says which is active and whether it needs the loop.
+endpoint - they are software and only fire while the manage loop is running.
 
 `PARTIAL` is the reason `place_tp_sl_order` takes `tpQty`/`slQty`: the position
 endpoint has **no quantity field at all**, so it can only ever close the whole
 position. A staged exit is only possible through the standalone endpoint.
 
 ```
-tpsl method PARTIAL          # select the method
-partial close pct 25         # PARTIAL: close 25% at the trigger
-partial at roi 50            # PARTIAL: trigger at 50% ROI
-account tp usdt 100          # ACCOUNT: close all at +100 USDT total
-account sl usdt 50           # ACCOUNT: close all at -50 USDT total
-account tp pct 5             # ACCOUNT: ...or at +5% of available equity
+tpsl method PARTIAL            # select the native exit shape
+partial ladder 40@1,35@2,25@3  # PARTIAL: 40% at 1R, 35% at 2R, 25% at 3R
+partial ladder off             # no rungs: falls back to POSITION
+account tp usdt 100            # ACCOUNT: close all at +100 USDT total
+account sl usdt 50             # ACCOUNT: close all at -50 USDT total
 ```
+
+---
+
+## The PARTIAL ladder - native staged exits
+
+Every rung is its own native `/tpsl/place_order` with `tpQty`, sent once at
+entry and parked on the exchange. If the engine dies, the rungs still fill.
+
+```
+PARTIAL_TP_LADDER=40@1,35@2,25@3
+```
+
+| Rung | Trigger | Closes |
+|---|---|---|
+| 1 | price at 1R | 40% of the position |
+| 2 | price at 2R | 35% |
+| 3 | price at 3R | 25% |
+
+`R` is the entry-to-stop distance captured at entry, so the targets do not move
+when the stop does. Shares must sum to `<= 100` and R must increase left to
+right; a bad spec is rejected (`Invalid ladder: ... Nothing changed.`) and the
+running ladder stays untouched. A rung the exchange refuses as too small is
+merged into the next one; if every rung is below `minTradeVolume` the engine
+falls back to one whole-position TP at the outermost rung target, so a position
+is never left with only a stop.
+
+### Rules enforced in code, not just documented
+
+- **Shares are of the ORIGINAL position**, never of what is left. A 1000-unit
+  position closing 40/35/25 closes 400/350/250 and leaves nothing behind.
+- **Increasing triggers.** Out-of-order rungs are refused rather than sorted -
+  silently reordering a spec hides a typo.
+- **Parked at entry, one pass.** The rungs are sent with the entry, not
+  re-derived on every scan, so a restart cannot duplicate them.
+
+### Commands
+
+```
+/tpsl                          # method + ladder + account thresholds
+tpsl method PARTIAL            # select the native exit shape
+partial ladder 40@1,35@2,25@3  # set it (validated; a bad spec changes nothing)
+partial ladder off             # no rungs
+account tp usdt 100            # ACCOUNT TP threshold
+account sl usdt 50             # ACCOUNT SL threshold
+```
+
+### What each rung sends
+
+```
+POST /api/v1/futures/tpsl/place_order
+{"symbol": "BTCUSDT", "positionId": "...", "tpPrice": "...",
+ "tpStopType": "MARK_PRICE", "tpOrderType": "MARKET", "tpQty": "..."}
+```
+
+**Caveat, stated plainly:** the rung ORDERS are exchange-enforced, but the
+trailing stop and the account thresholds are software. If the engine is down,
+the rungs and the stop still work; the ratchet does not.
+
+Verify: `tests/test_four_tpsl_methods.py` pins the wire format.
 
 ---
 
@@ -960,13 +985,12 @@ no-op, so historical behaviour is unchanged.
 
 ### Which price the trigger is compared against
 
-`TP_SL_TRIGGER_TYPE` selects it, read in exactly one place —
-`engine.py:375` `get_trigger_price()`. Both the local pre-flight validation and
-the `tpStopType`/`slStopType` sent on the wire read that same setting, so they
-cannot drift apart. Default `MARK_PRICE` (the documented Bitunix default and
-the engine's historical behaviour).
-
-Verify: `python scripts/verify_tpsl_variants.py`
+`MARK_PRICE`, fixed in code (`engine.py` `TRIGGER_TYPE`) and read in exactly
+one place - `get_trigger_price()`. Both the local pre-flight validation and the
+`tpStopType`/`slStopType` sent on the wire read that same constant, so they
+cannot drift apart. It is not an env knob: the exchange validates a TP/SL
+against the mark at the moment the request lands (30029/30031), and a LAST_PRICE
+setting only moved the mismatch to the user.
 
 ---
 

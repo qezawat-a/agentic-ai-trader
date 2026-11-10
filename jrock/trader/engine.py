@@ -30,11 +30,11 @@ from .errors import BitunixAPIError
 from .indicators import atr, to_candles
 from .kline_cache import REST_KLINE_MAX, KlineCache
 from .order_builder import (OrderValidationError, build_order_body,
-                            debug_order_enabled, log_order_body)
+                            log_order_body)
 from .price_cache import PriceCache
-from .risk import (MIN_STOP_TICKS, PairRules, Tier, TpSlSideError, clamp_sl,
-                   clamp_tp, fee_for_notional, format_price, format_qty,
-                   margin_budget, margin_required,
+from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
+                   fee_for_notional, format_price, format_qty, margin_budget,
+                   margin_required,
                    max_leverage_for_stop, max_notional_for_balance,
                    max_notional_for_margin,
                    pick_tier,
@@ -42,14 +42,28 @@ from .risk import (MIN_STOP_TICKS, PairRules, Tier, TpSlSideError, clamp_sl,
                    position_size_by_risk,
                    qty_from_notional, qty_from_unit, required_cost, roi_pct,
                    round_price, round_step, spendable_balance,
-                   tier_for_leverage, tier_leverage_violation, tick_size,
+                   tier_for_leverage, tier_leverage_violation,
                    unit_from_qty, validate_tpsl_side)
 from .strategies import build_strategies
-from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
-                   plan_tpsl, should_breakeven, should_trail)
+from .tpsl import (PartialLadderError, PositionState, LadderRung,
+                   mid_management_action, next_trailing_stop,
+                   parse_partial_ladder, plan_tpsl, rung_target,
+                   should_breakeven, should_trail)
 from .ws import MarketDataFeed, PrivateFeed, WSConfig
 
 log = logging.getLogger("jrock.engine")
+
+#: Which price the exchange compares a TP/SL trigger against. MARK_PRICE is the
+#: documented Bitunix default and the engine's historical behaviour; the SAME
+#: value goes into the local pre-flight validation and into tpStopType/slStopType
+#: in the order body, so the two can never disagree (that mismatch is what
+#: produced 30029).
+TRIGGER_TYPE = "MARK_PRICE"
+
+#: Minimum distance a stop must keep from the mark/entry price, in ticks
+#: (1 tick = 10^-quotePrecision). Prevents rounding from collapsing a stop onto
+#: the mark price, which the exchange rejects with 30029/30031.
+MIN_STOP_TICKS = 3
 
 
 @dataclass
@@ -84,13 +98,15 @@ class EngineState:
     scans: int = 0
     errors: list[str] = field(default_factory=list)
     # --- the four documented TP/SL methods (see account_tpsl.py / tpsl.py)
+    # POSITION and PARTIAL are the native exit shapes at entry; TRAILING
+    # (breakeven + ratchet) and ACCOUNT (thresholds below) are always armed in
+    # the manage loop and need no selector.
     tpsl_method: str = "POSITION"
-    partial_close_pct: float = 50.0
-    partial_at_roi_pct: float = 50.0
+    #: PARTIAL ladder spec, "share@R" pairs, e.g. "40@1,35@2,25@3".
+    partial_tp_ladder: str = "40@1,35@2,25@3"
+    # --- ACCOUNT TP/SL thresholds (USDT). 0 disables a side.
     account_tp_usdt: float = 0.0
     account_sl_usdt: float = 0.0
-    account_tp_pct: float = 0.0
-    account_sl_pct: float = 0.0
 
 
 class TraderEngine:
@@ -117,12 +133,9 @@ class TraderEngine:
             scan_interval=settings.scan_interval,
             report_interval=settings.report_interval,
             tpsl_method=(settings.tpsl_method or "POSITION").upper(),
-            partial_close_pct=settings.partial_close_pct,
-            partial_at_roi_pct=settings.partial_at_roi_pct,
+            partial_tp_ladder=settings.partial_tp_ladder,
             account_tp_usdt=settings.account_tp_usdt,
             account_sl_usdt=settings.account_sl_usdt,
-            account_tp_pct=settings.account_tp_pct,
-            account_sl_pct=settings.account_sl_pct,
         )
         self.client = BitunixClient(BitunixConfig(
             api_key=settings.bitunix_api_key,
@@ -142,7 +155,9 @@ class TraderEngine:
         self.last_aggregates: dict[str, Aggregate] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
-        # --- market data: one cache, one optional WS feed, one REST counter
+        # --- market data: one cache, one optional WS feed, one REST counter.
+        # Freshness/cap rules are fixed internals (a 1m candle is legitimately
+        # 60s old; the cap bounds memory) - not user-facing knobs.
         self.price_cache = PriceCache()
         self.kline_cache = KlineCache()
         self.feed: MarketDataFeed | None = None
@@ -186,8 +201,8 @@ class TraderEngine:
         "trailing_trigger_roi_pct", "liq_sl_distance_pct",
         "min_agreeing", "timeframes", "min_confidence", "tf_min_confidence",
         "scans",
-        "tpsl_method", "partial_close_pct", "partial_at_roi_pct",
-        "account_tp_usdt", "account_sl_usdt", "account_tp_pct", "account_sl_pct",
+        "tpsl_method", "partial_tp_ladder",
+        "account_tp_usdt", "account_sl_usdt",
     )
 
     def _state_snapshot(self) -> dict[str, Any]:
@@ -222,16 +237,16 @@ class TraderEngine:
         self.autotrade_was_on = bool(saved.get("autotrade"))
         self.engine_was_on = bool(saved.get("engine_on"))
 
-        # positions
+        # positions - tolerant: an older store may carry fields this build no
+        # longer has (ladder bookkeeping was removed); they are just dropped.
+        import dataclasses
+        known = {f.name for f in dataclasses.fields(PositionState)}
         raw_pos = self.store.section("positions")
         for pid, body in raw_pos.items():
             try:
-                # Older stores may carry ladder-era fields the trimmed
-                # PositionState no longer declares - ignore unknown keys.
-                fields = {f for f in PositionState.__dataclass_fields__}
                 self.positions[pid] = PositionState(
-                    **{k: v for k, v in body.items() if k in fields})
-            except (TypeError, ValueError):
+                    **{k: v for k, v in body.items() if k in known})
+            except TypeError:
                 continue
 
         # counters
@@ -459,19 +474,13 @@ class TraderEngine:
     async def get_trigger_price(self, symbol: str, last: float = 0.0) -> float:
         """The price the exchange compares a TP/SL trigger against.
 
-        Controlled by TP_SL_TRIGGER_TYPE:
-            MARK_PRICE (default) - the exchange mark price
-            LAST_PRICE           - the last traded price
-
+        TRIGGER_TYPE is fixed to MARK_PRICE (the documented Bitunix default).
         This is the SINGLE place the choice is made. Both the local pre-flight
         validation and the tpStopType/slStopType sent in the order body read
-        this same setting, so they can never disagree - a disagreement is
+        the same constant, so they can never disagree - a disagreement is
         exactly what produced 30029 (checked against last, rejected against
         mark).
         """
-        if (self.s.tp_sl_trigger_type or "MARK_PRICE").upper() == "LAST_PRICE":
-            px = last if last > 0 else await self.get_price(symbol)
-            return px
         return await self.get_mark_price(symbol)
 
     @staticmethod
@@ -566,7 +575,6 @@ class TraderEngine:
                 "liq": st.liq, "breakeven_done": st.breakeven_done,
                 "trailing_active": st.trailing_active,
                 "trailing_stop": st.trailing_stop,
-                "partial_done": st.partial_done,
                 "opened_ts": st.opened_ts, "peak_roi": st.peak_roi,
             }
         if body == self.store.section("positions"):
@@ -1195,7 +1203,7 @@ class TraderEngine:
         # The trigger type is read ONCE and used for both the local validation
         # below and the tpStopType/slStopType sent on the wire. Reading it twice
         # is how the two can drift apart.
-        trigger_type = (self.s.tp_sl_trigger_type or "MARK_PRICE").upper()
+        trigger_type = TRIGGER_TYPE
 
         # --- re-read the mark price immediately before sending and re-clamp.
         # The plan above was built from a mark read several round-trips ago
@@ -1213,14 +1221,32 @@ class TraderEngine:
         plan.tp = clamp_tp(side=side, tp=plan.tp, entry=price, mark=mark,
                            rules=rules, min_ticks=MIN_STOP_TICKS)
 
-        # With the PARTIAL method the position carries NO whole-position TP:
-        # the position TP/SL endpoint has no quantity field and would close
-        # 100% at the trigger, flattening the remainder when only the partial
-        # slice should exit. The engine manages st.tp in memory and the manage
-        # loop places the partial TP on the standalone /tpsl/place_order
-        # endpoint (tpQty), where a quantity is actually possible.
-        tp_for_order = plan.tp \
-            if (self.state.tpsl_method or "").upper() != "PARTIAL" else None
+        # --- which TP goes on the entry order.
+        #
+        # With the PARTIAL method the rungs ARE the take-profit plan: each rung
+        # becomes its own native tpsl/place_order carrying tpQty (parked right
+        # after the fill, see `_place_partial_rungs`). Attaching plan.tp as a
+        # whole-position native TP here would flatten the entire remainder the
+        # moment it is touched, so with PARTIAL the entry order carries the
+        # STOP only.
+        partial_method = (self.state.tpsl_method or "POSITION").upper() == "PARTIAL"
+        if partial_method:
+            try:
+                rungs = parse_partial_ladder(self.state.partial_tp_ladder)
+            except PartialLadderError as e:
+                plan.notes = (plan.notes + "; " if plan.notes else "") + (
+                    f"PARTIAL ladder invalid ({e}); whole-position TP attached")
+                log.warning("partial ladder %r invalid: %s - using the "
+                            "whole-position TP", self.state.partial_tp_ladder, e)
+                partial_method = False
+            else:
+                if not rungs:
+                    partial_method = False
+                else:
+                    plan.notes = (plan.notes + "; " if plan.notes else "") + (
+                        "PARTIAL ladder: no whole-position TP attached at entry "
+                        f"({len(rungs)} rungs own the exits)")
+        tp_for_order = None if partial_method else plan.tp
 
         if not self._tpsl_side_ok(sym, side, price, mark, plan.sl, tp_for_order, rules):
             return {"ok": False,
@@ -1264,18 +1290,25 @@ class TraderEngine:
         for p in positions:
             if p.get("symbol") == sym:
                 pid = str(p.get("positionId"))
+                fill_entry = float(p.get("avgOpenPrice") or price)
+                fill_qty = float(p.get("qty") or qty)
                 self.positions[pid] = PositionState(
                     position_id=pid, symbol=sym, side=side,
-                    entry=float(p.get("avgOpenPrice") or price),
-                    qty=float(p.get("qty") or qty),
+                    entry=fill_entry,
+                    qty=fill_qty,
                     leverage=int(p.get("leverage") or self.state.leverage),
-                    # PARTIAL method: st.tp stays a plan-level number (the
-                    # partial SL/TP endpoint reads it from here) - no
-                    # whole-position TP is re-attached by the manage loop.
-                    sl=plan.sl, tp=plan.tp,
+                    sl=plan.sl, tp=(0.0 if partial_method else plan.tp),
                     liq=float(p.get("liqPrice") or plan.liq),
                     opened_ts=time.time(),
                 )
+                # With the PARTIAL method the rungs are parked at entry as
+                # native exchange-enforced TP orders (tpQty each), so the
+                # exits survive even if this engine dies.
+                if partial_method:
+                    await self._place_partial_rungs(
+                        sym, pid, side, fill_entry, fill_qty,
+                        sl_dist=abs(fill_entry - plan.sl),
+                        rungs=rungs, rules=rules, trigger_type=trigger_type)
                 break
         self.persist_positions()
 
@@ -1292,42 +1325,96 @@ class TraderEngine:
             self._log_trade({"event": "close", "ts": time.time(),
                              "symbol": symbol, "position_id": position_id, "result": res})
             if position_id:
-                self.positions.pop(str(position_id), None)
+                st = self.positions.pop(str(position_id), None)
             self.persist_positions()
             return {"ok": True, "result": res}
         except BitunixAPIError as e:
             return {"ok": False, "reason": str(e), "hint": e.hint}
 
     # ================================================================ management
-    async def place_partial_tp_sl(self, sym: str, position_id: str, side: str,
-                                  qty: float, tp: float, sl: float,
-                                  rules: PairRules) -> dict:
-        """PARTIAL TP/SL (method 2 of 4) via the native standalone endpoint.
+    async def _place_partial_rungs(self, sym: str, pid: str, side: str,
+                                   entry: float, qty: float, *,
+                                   sl_dist: float, rungs: list[LadderRung],
+                                   rules: PairRules, trigger_type: str) -> None:
+        """PARTIAL TP/SL (method 2 of 4): park each rung as a NATIVE order.
 
-        The position TP/SL endpoint has NO quantity field - it can only close
-        the whole position. The standalone `/tpsl/place_order` endpoint takes
-        `tpQty`/`slQty`, which is what makes a staged exit possible: a defined
-        portion closes at the trigger and the remainder stays open.
+        Every rung becomes its own `/tpsl/place_order` with `tpQty` at height
+        `r × sl_dist` from the entry, placed the moment the position exists.
+        The exchange then enforces the whole scale-out plan on its own - the
+        engine does not fire rungs, re-park them, or need a backstop order,
+        because every exit lives server-side.
 
-        Official requirements enforced here: `symbol` + `positionId` required,
-        at least one of tpPrice/slPrice, and at least one of tpQty/slQty.
+        A rung smaller than the exchange's minimum order volume cannot exist
+        as its own order; it is MERGED into the next rung (fewer prices, same
+        shares). If the position is too small to split at all, ONE
+        whole-position TP at the outermost rung is attached through the
+        position endpoint instead - a plan is preserved, not nothing.
         """
-        trigger_type = (self.s.tp_sl_trigger_type or "MARK_PRICE").upper()
-        body: dict[str, Any] = {
-            "symbol": sym, "positionId": str(position_id),
-            "tpStopType": trigger_type, "slStopType": trigger_type,
-            "tpOrderType": "MARKET", "slOrderType": "MARKET",
-        }
-        if tp and tp > 0:
-            body["tpPrice"] = format_price(tp, rules)
-            body["tpQty"] = format_qty(qty, rules)
-        if sl and sl > 0:
-            body["slPrice"] = format_price(sl, rules)
-            body["slQty"] = format_qty(qty, rules)
-        if "tpPrice" not in body and "slPrice" not in body:
-            raise ValueError(
-                f"partial TP/SL for {sym}: no valid tp/sl price to attach")
-        return await self.client.place_tp_sl_order(**body)
+        if not rungs or qty <= 0 or sl_dist <= 0:
+            return
+        is_long = side.upper() in ("LONG", "BUY")
+        min_qty = float(rules.min_trade_volume or 0)
+        placed = []
+        skipped = []
+        allocated = 0.0
+        carry_share = 0.0
+
+        for rung in rungs:
+            share = rung.share + carry_share
+            step_qty = round_step(qty * share / 100.0, rules.base_precision)
+            too_small = min_qty > 0 and step_qty < min_qty
+            if too_small or allocated + step_qty > qty:
+                skipped.append({"share": share, "r": rung.r,
+                                "reason": "below minTradeVolume - merged into "
+                                          "the next rung" if too_small else
+                                          "would over-allocate the position"})
+                carry_share = share
+                continue
+            target = rung_target(side, entry, sl_dist, rung.r)
+            try:
+                res = await self.client.place_tp_sl_order(
+                    sym, pid,
+                    tp_price=format_price(target, rules),
+                    tp_qty=format_qty(step_qty, rules),
+                    tp_order_type="MARKET", tp_stop_type=trigger_type)
+                allocated += step_qty
+                placed.append({"share": share, "r": rung.r, "qty": step_qty,
+                               "price": target,
+                               "order_id": str((res or {}).get("orderId") or "")})
+                carry_share = 0.0
+            except (BitunixAPIError, ValueError) as e:
+                skipped.append({"share": share, "r": rung.r, "reason": str(e)})
+                carry_share = share
+
+        runner_qty = max(0.0, qty - allocated)
+        self._log_tpsl({
+            "event": "partial_rungs_placed", "ts": time.time(),
+            "symbol": sym, "position_id": pid, "side": side,
+            "entry": entry, "sl_dist": round(sl_dist, 12),
+            "placed": placed, "skipped": skipped,
+            "runner_qty": round(runner_qty, 12),
+        })
+        if placed:
+            return
+
+        # Nothing could be placed (position too small to split): fall back to
+        # ONE whole-position TP at the outermost rung so the trade is not left
+        # with no take-profit at all.
+        outer = max(r.r for r in rungs)
+        fallback = rung_target(side, entry, sl_dist, outer)
+        st = self.positions.get(pid)
+        if st is not None:
+            st.tp = fallback
+        try:
+            await self.client.modify_position_tp_sl_order(
+                sym, pid, tp_price=format_price(fallback, rules),
+                sl_price=format_price(st.sl, rules) if st and st.sl else None,
+                tp_stop_type=trigger_type, sl_stop_type=trigger_type)
+            self._log_tpsl({"event": "partial_rungs_fallback_tp", "ts": time.time(),
+                            "symbol": sym, "position_id": pid,
+                            "tp": fallback, "r": outer})
+        except (BitunixAPIError, ValueError) as e:
+            self.state.errors.append(f"partial fallback TP {sym}: {e}")
 
     async def close_all_positions(self) -> dict:
         """Close every open position - the ACCOUNT TP/SL action.
@@ -1360,31 +1447,34 @@ class TraderEngine:
                 "closed": closed, "failed": failed}
 
     def tpsl_method_report(self) -> str:
-        """One honest line about which of the four TP/SL methods is active.
+        """One honest line about the four documented TP/SL methods.
 
         The four are the ones the official academy article defines: Position,
-        Partial, Trailing and Account TP/SL. Position and Partial are enforced
-        by the exchange; Trailing and Account are software and only run while
-        the manage loop is up - which this line says out loud.
+        Partial, Trailing and Account TP/SL. The entry method picks the native
+        exit shape (Position = one whole-position TP/SL; Partial = the
+        share@R rungs, each its own native tpQty order at entry). Trailing and
+        Account are software and always armed - they only run while the manage
+        loop is up, which this text says out loud.
         """
         m = (self.state.tpsl_method or "POSITION").upper()
-        if m == "PARTIAL":
-            return (f"TP/SL method: PARTIAL (native, closes "
-                    f"{self.state.partial_close_pct:g}% at "
-                    f"{self.state.partial_at_roi_pct:g}% ROI; exchange-enforced)")
-        if m == "TRAILING":
-            return (f"TP/SL method: TRAILING (software ratchet, arms at "
-                    f"{self.state.trailing_trigger_roi_pct:g}% ROI; "
-                    f"needs the manage loop running)")
-        if m == "ACCOUNT":
-            cfg = AccountTpSlConfig(
-                tp_usdt=self.state.account_tp_usdt,
-                sl_usdt=self.state.account_sl_usdt,
-                tp_pct=self.state.account_tp_pct, sl_pct=self.state.account_sl_pct)
-            return (f"TP/SL method: ACCOUNT ({cfg.describe()}; software - "
-                    f"needs the manage loop running)")
-        return ("TP/SL method: POSITION (native, closes the whole position; "
-                "exchange-enforced)")
+        native = (
+            f"TP/SL method: PARTIAL (native rungs at entry: "
+            f"{self.state.partial_tp_ladder!r}; exchange-enforced)"
+            if m == "PARTIAL" else
+            "TP/SL method: POSITION (native, one TP/SL closes the whole "
+            "position; exchange-enforced)")
+        return (
+            f"{native}\n"
+            f"trailing: breakeven at {self.state.breakeven_pct:g}% ROI, "
+            f"ratchet from {self.state.trailing_trigger_roi_pct:g}% ROI "
+            f"(software; needs the manage loop)\n"
+            f"account TP/SL: {self.account_cfg().describe()} "
+            f"(software; needs the manage loop)")
+
+    def account_cfg(self) -> "AccountTpSlConfig":
+        """The ACCOUNT TP/SL thresholds from the live state."""
+        return AccountTpSlConfig(tp_usdt=self.state.account_tp_usdt,
+                                 sl_usdt=self.state.account_sl_usdt)
 
     async def _manage_loop(self) -> None:
         while not self._stop.is_set():
@@ -1417,20 +1507,6 @@ class TraderEngine:
             return False
         return True
 
-    def _modify_tp_price(self, st: PositionState, rules: PairRules) -> float | None:
-        """The TP price a `modify_position_tp_sl_order` may carry.
-
-        The modify endpoint is the POSITION endpoint: it has no quantity
-        field, so any TP sent there closes the WHOLE position at the trigger.
-        Under the PARTIAL method the partial slice exits via the standalone
-        /tpsl/place_order endpoint instead - re-sending st.tp here would
-        flatten the remainder before that ever fires. PARTIAL therefore
-        modifies the STOP only.
-        """
-        if (self.state.tpsl_method or "").upper() == "PARTIAL":
-            return None
-        return format_price(st.tp, rules) if st.tp else None
-
     async def manage_positions(self) -> list[dict]:
         actions: list[dict] = []
         positions = await self.open_positions()
@@ -1438,18 +1514,16 @@ class TraderEngine:
 
         for pid in list(self.positions):
             if pid not in live_ids:
-                # The position vanished (stop filled, manual close, ...):
-                # stop tracking it. The exchange already owns the cleanup.
+                # the position vanished (stop filled, manual close, ...) and
+                # its management state is obsolete
                 self.positions.pop(pid, None)
 
-        # --- ACCOUNT TP/SL (method 4 of 4). The whole futures account is the
-        # control unit: when TOTAL unrealized PnL crosses the configured
-        # threshold, every position closes. Bitunix exposes no API for this, so
-        # it is enforced here in software - which means it only fires while
-        # this loop is running. That limitation is stated in /status, not hidden.
-        acct_cfg = AccountTpSlConfig(
-            tp_usdt=self.state.account_tp_usdt, sl_usdt=self.state.account_sl_usdt,
-            tp_pct=self.state.account_tp_pct, sl_pct=self.state.account_sl_pct)
+        # --- ACCOUNT TP/SL: the whole futures account is the control unit.
+        # When TOTAL unrealized PnL crosses the configured threshold, every
+        # position closes. Bitunix exposes no API for this, so it is enforced
+        # here in software - which means it only fires while this loop is
+        # running. That limitation is stated in /status, not hidden.
+        acct_cfg = self.account_cfg()
         if acct_cfg.enabled and positions:
             total_pnl = total_unrealized_pnl(positions)
             equity = 0.0
@@ -1510,7 +1584,7 @@ class TraderEngine:
                 mark = price
                 log.warning("no trigger price for %s - validating the managed "
                             "TP/SL against the last price %s", sym, price)
-            trigger_type = (self.s.tp_sl_trigger_type or "MARK_PRICE").upper()
+            trigger_type = TRIGGER_TYPE
             rules = self.rules.get(sym)
             if rules is None:
                 await self.load_rules([sym])
@@ -1522,10 +1596,10 @@ class TraderEngine:
 
             # Reconcile the size with the exchange before acting on it.
             # Something outside this list can shrink a position between two
-            # passes: the stop filling, a manual close. Acting on a stale qty
-            # would send a close bigger than the position (rejected) or keep
-            # managing dust that is already gone. The exchange is the source
-            # of truth for SIZE.
+            # passes: the stop filling, a native rung TP triggering, a manual
+            # close. Acting on a stale qty would send a modify/re-close bigger
+            # than the position (rejected) or keep managing dust that
+            # is already gone. The exchange is the source of truth for SIZE.
             live_qty = abs(float(p.get("qty") or 0))
             if live_qty > 0 and st.qty > 0:
                 man_prec = max(0, int(rules.base_precision))
@@ -1537,7 +1611,9 @@ class TraderEngine:
                                     "exchange_qty": live_qty})
                     st.qty = live_qty
 
-            # 1) breakeven
+            # 1) breakeven - always armed: move SL to entry once ROI passes
+            # the threshold, with no ladder gating (the ladder machinery is
+            # gone; TRAILING and ACCOUNT are also always armed below).
             if should_breakeven(st, roi, self.state.breakeven_pct):
                 sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
                               rules=rules, min_ticks=MIN_STOP_TICKS,
@@ -1545,7 +1621,7 @@ class TraderEngine:
                 if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
                     try:
                         await self.client.modify_position_tp_sl_order(
-                            sym, pid, tp_price=self._modify_tp_price(st, rules),
+                            sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
                             sl_price=format_price(sl, rules),
                             tp_stop_type=trigger_type, sl_stop_type=trigger_type)
                         st.breakeven_done = True
@@ -1573,7 +1649,7 @@ class TraderEngine:
                     if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
                         try:
                             await self.client.modify_position_tp_sl_order(
-                                sym, pid, tp_price=self._modify_tp_price(st, rules),
+                                sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
                                 sl_price=format_price(sl, rules),
                                 tp_stop_type=trigger_type, sl_stop_type=trigger_type)
                             st.trailing_stop = sl
@@ -1593,51 +1669,11 @@ class TraderEngine:
             rev_conf = agg.confidence if agg else 0.0
             action = mid_management_action(
                 st, roi, reversal and self.state.reversal, rev_conf,
-                self.state.reversal_confidence,
-                self.state.partial_at_roi_pct)
+                self.state.reversal_confidence)
             if action == "close_reversal":
                 res = await self.close_position(symbol=sym, position_id=pid)
                 actions.append({"action": "close_reversal", "symbol": sym,
                                 "roi": round(roi, 2), "result": res})
-            elif action == "partial_close" and not st.partial_done:
-                # PARTIAL TP/SL (method 2 of 4): close a DEFINED % of the
-                # position, leaving the rest open. When the engine is set to the
-                # PARTIAL method this goes through the native standalone TP/SL
-                # endpoint, which takes tpQty/slQty - the position endpoint has
-                # no quantity field and can only ever close the whole position.
-                pct = max(1.0, min(99.0, self.state.partial_close_pct))
-                part = round_step(st.qty * pct / 100.0,
-                                  self.rules.get(sym, PairRules(sym)).base_precision)
-                if part > 0:
-                    try:
-                        if self.state.tpsl_method == "PARTIAL":
-                            res = await self.place_partial_tp_sl(
-                                sym, pid, side, part, st.tp, st.sl, rules)
-                            actions.append({"action": "partial_tpsl", "symbol": sym,
-                                            "qty": part, "pct": pct,
-                                            "roi": round(roi, 2), "result": res})
-                            self._log_tpsl({"event": "partial_tpsl", "ts": time.time(),
-                                            "symbol": sym, "position_id": pid,
-                                            "qty": part, "pct": pct,
-                                            "roi": round(roi, 2)})
-                        else:
-                            close_body = build_order_body(
-                                symbol=sym, qty=part,
-                                side="SELL" if side.upper() == "LONG" else "BUY",
-                                orderType="MARKET", reduceOnly=True,
-                                rules=self.rules.get(sym),
-                                known_symbols=set(self.rules) or None,
-                                **await self._trade_side_fields("CLOSE", position_id=pid),
-                            )
-                            await self.client.place_order(**close_body)
-                            actions.append({"action": "partial_close", "symbol": sym,
-                                            "qty": part, "roi": round(roi, 2)})
-                            self._log_trade({"event": "partial_close", "ts": time.time(),
-                                             "symbol": sym, "qty": part,
-                                             "roi": round(roi, 2)})
-                        st.partial_done = True
-                    except (BitunixAPIError, OrderValidationError, ValueError) as e:
-                        self.state.errors.append(f"partial {sym}: {e}")
         # Management state (breakeven_done / trailing_stop / peak_roi) must hit
         # the disk even if the process is killed a moment later.
         self.persist_positions()
@@ -1767,6 +1803,7 @@ class TraderEngine:
             f"min_conf={s.min_confidence} tf_min_conf={s.tf_min_confidence}",
             f"scan_interval={s.scan_interval}s report_interval={s.report_interval}s "
             f"reversal={s.reversal} reversal_conf={s.reversal_confidence}",
+            f"min_stop_ticks={MIN_STOP_TICKS} "
             f"taker_fee={self.s.taker_fee_rate * 100:g}% "
             f"margin_safety={self.s.margin_safety_pct:g}%",
             f"scans={s.scans} errors={len(s.errors)}",
@@ -1785,9 +1822,10 @@ class TraderEngine:
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
         "margin amount", "margin add", "margin reduce",
         "leverage", "risk ",
-        # the four documented TP/SL methods
-        "tpsl method", "partial close pct", "partial at roi",
-        "account tp usdt", "account sl usdt", "account tp pct", "account sl pct",
+        # the PARTIAL method's knobs (POSITION has none; TRAILING/ACCOUNT are
+        # always armed with their own Readouts)
+        "tpsl method", "partial ladder",
+        "account tp usdt", "account sl usdt",
     )
 
     def looks_like_command(self, line: str) -> bool:
@@ -1824,8 +1862,7 @@ class TraderEngine:
         "leverage", "risk", "max open positions", "scans interval",
         "report interval", "breakeven threshold", "trailing trigger",
         "liq sl distance", "min agreeing", "min confidence",
-        "tf min confidence", "partial close pct", "partial at roi",
-        "account tp usdt", "account sl usdt", "account tp pct", "account sl pct",
+        "tf min confidence", "account tp usdt", "account sl usdt",
         "margin amount",
     )
 
@@ -1840,7 +1877,7 @@ class TraderEngine:
         if not rest:
             # Bare prefixes that are complete commands on their own.
             return p in ("status", "pnl", "p&l", "settings",
-                         "margin amount",
+                         "margin amount", "partial ladder",
                          "trades_history", "tpsl_history", "trades history",
                          "tpsl history", "symbols", "positions history",
                          "engine on", "engine off", "scan on", "scan off",
@@ -1860,8 +1897,12 @@ class TraderEngine:
             return rest.replace(":", "").strip().upper().replace(" ", "_") in (
                 "HEDGE", "ONE_WAY")
         if p == "tpsl method":
-            return rest.split()[-1].upper() in ("POSITION", "PARTIAL",
-                                                "TRAILING", "ACCOUNT")
+            return rest.split()[-1].upper() in ("POSITION", "PARTIAL")
+        if p == "partial ladder":
+            # "partial ladder" with no rest is a read; a setter needs a spec
+            # like "40@1,35@2" (digits) or one of the reset keywords.
+            return (bool(re.search(r"\d", rest))
+                    or rest.split()[0].lower() in ("off", "none"))
         if p == "close position":
             return bool(re.search(r"[A-Za-z]{2,10}USDT", rest, re.I))
         if p in ("margin add", "margin reduce"):
@@ -2068,29 +2109,17 @@ class TraderEngine:
                 return f"Leverage = {s.leverage}x (applied on next entry)."
             except (ValueError, IndexError):
                 return "Usage: leverage 10"
-        # ------------------------------------------------ the 4 TP/SL methods
+        # --------------------------------------------------- the TP/SL methods
         if low.startswith("tpsl method"):
             try:
                 m = arg("tpsl method").split()[-1].upper()
             except IndexError:
-                return "Usage: tpsl method POSITION|PARTIAL|TRAILING|ACCOUNT"
-            if m not in ("POSITION", "PARTIAL", "TRAILING", "ACCOUNT"):
-                return "Method must be POSITION | PARTIAL | TRAILING | ACCOUNT"
+                return "Usage: tpsl method POSITION|PARTIAL"
+            if m not in ("POSITION", "PARTIAL"):
+                return "Method must be POSITION or PARTIAL (TRAILING/ACCOUNT " \
+                       "are always armed; see `settings`)."
             s.tpsl_method = m
             return self.tpsl_method_report()
-        if low.startswith("partial close pct"):
-            try:
-                s.partial_close_pct = max(1.0, min(99.0,
-                                                   float(arg("partial close pct").split()[-1])))
-                return f"Partial close = {s.partial_close_pct:g}% of the position."
-            except (ValueError, IndexError):
-                return "Usage: partial close pct 50"
-        if low.startswith("partial at roi"):
-            try:
-                s.partial_at_roi_pct = float(arg("partial at roi").split()[-1])
-                return f"Partial close fires at {s.partial_at_roi_pct:g}% ROI."
-            except (ValueError, IndexError):
-                return "Usage: partial at roi 50"
         if low.startswith("account tp usdt"):
             try:
                 s.account_tp_usdt = float(arg("account tp usdt").split()[-1])
@@ -2103,18 +2132,23 @@ class TraderEngine:
                 return f"Account SL = -{s.account_sl_usdt:g} USDT (0 disables)."
             except (ValueError, IndexError):
                 return "Usage: account sl usdt 50"
-        if low.startswith("account tp pct"):
+        # ---------------------------------------------- the PARTIAL rung ladder
+        if low.startswith("partial ladder"):
+            rest = raw[len("partial ladder"):].strip()
+            if not rest:
+                return self.tpsl_method_report()
+            low_rest = rest.lower()
+            if low_rest in ("off", "none", "disable", "clear"):
+                s.partial_tp_ladder = ""
+                return ("PARTIAL ladder OFF - one whole-position TP rides with "
+                        "the stop instead.\n" + self.tpsl_method_report())
             try:
-                s.account_tp_pct = float(arg("account tp pct").split()[-1])
-                return f"Account TP = +{s.account_tp_pct:g}% of equity (0 disables)."
-            except (ValueError, IndexError):
-                return "Usage: account tp pct 5"
-        if low.startswith("account sl pct"):
-            try:
-                s.account_sl_pct = float(arg("account sl pct").split()[-1])
-                return f"Account SL = -{s.account_sl_pct:g}% of equity (0 disables)."
-            except (ValueError, IndexError):
-                return "Usage: account sl pct 3"
+                parse_partial_ladder(rest)
+            except PartialLadderError as e:
+                return f"Invalid ladder: {e}\nNothing changed."
+            s.partial_tp_ladder = rest
+            return "PARTIAL ladder set (exchange-enforced rungs).\n" \
+                + self.tpsl_method_report()
         if low.startswith("risk"):
             try:
                 s.risk_pct = float(arg("risk").split()[-1])

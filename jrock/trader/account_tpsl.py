@@ -42,13 +42,10 @@ class AccountTpSlConfig:
 
     tp_usdt: float = 0.0
     sl_usdt: float = 0.0
-    tp_pct: float = 0.0
-    sl_pct: float = 0.0
 
     @property
     def enabled(self) -> bool:
-        return any(v > 0 for v in (self.tp_usdt, self.sl_usdt,
-                                   self.tp_pct, self.sl_pct))
+        return any(v > 0 for v in (self.tp_usdt, self.sl_usdt))
 
     def describe(self) -> str:
         if not self.enabled:
@@ -58,10 +55,6 @@ class AccountTpSlConfig:
             bits.append(f"TP +{self.tp_usdt:g} USDT")
         if self.sl_usdt > 0:
             bits.append(f"SL -{self.sl_usdt:g} USDT")
-        if self.tp_pct > 0:
-            bits.append(f"TP +{self.tp_pct:g}% equity")
-        if self.sl_pct > 0:
-            bits.append(f"SL -{self.sl_pct:g}% equity")
         return "account TP/SL: " + ", ".join(bits)
 
 
@@ -72,7 +65,7 @@ class AccountTpSlDecision:
     trigger: str          # "" | "tp" | "sl"
     total_pnl: float
     equity: float
-    threshold: float      # the USDT threshold that was crossed (0 if pct-driven)
+    threshold: float      # the USDT threshold that was crossed
     reason: str = ""
 
     @property
@@ -84,12 +77,8 @@ def account_tpsl_decision(*, total_pnl: float, equity: float,
                           cfg: AccountTpSlConfig) -> AccountTpSlDecision:
     """Decide whether the whole account should be flattened.
 
-    Both a USDT threshold and a %-of-equity threshold can be active; whichever
-    is crossed first wins. The USDT check is evaluated first so the reported
-    threshold is the concrete number the user configured.
-
-    A non-positive equity disables the %-based checks (we cannot compute a
-    percentage of nothing) but leaves the USDT checks working.
+    Only USDT thresholds exist (one knob, one meaning); equity is carried
+    through for reporting.
     """
     if not cfg.enabled:
         return AccountTpSlDecision("", total_pnl, equity, 0.0, "account TP/SL off")
@@ -100,13 +89,6 @@ def account_tpsl_decision(*, total_pnl: float, equity: float,
             "tp", total_pnl, equity, cfg.tp_usdt,
             f"account TP hit: total PnL {total_pnl:+.2f} USDT >= "
             f"{cfg.tp_usdt:g} USDT - closing all positions")
-    if cfg.tp_pct > 0 and equity > 0:
-        limit = equity * cfg.tp_pct / 100.0
-        if total_pnl >= limit:
-            return AccountTpSlDecision(
-                "tp", total_pnl, equity, limit,
-                f"account TP hit: total PnL {total_pnl:+.2f} USDT >= "
-                f"{cfg.tp_pct:g}% of equity ({limit:.2f} USDT) - closing all positions")
 
     # --- stop loss
     if cfg.sl_usdt > 0 and total_pnl <= -cfg.sl_usdt:
@@ -114,13 +96,6 @@ def account_tpsl_decision(*, total_pnl: float, equity: float,
             "sl", total_pnl, equity, cfg.sl_usdt,
             f"account SL hit: total PnL {total_pnl:+.2f} USDT <= "
             f"-{cfg.sl_usdt:g} USDT - closing all positions")
-    if cfg.sl_pct > 0 and equity > 0:
-        limit = -equity * cfg.sl_pct / 100.0
-        if total_pnl <= limit:
-            return AccountTpSlDecision(
-                "sl", total_pnl, equity, abs(limit),
-                f"account SL hit: total PnL {total_pnl:+.2f} USDT <= "
-                f"-{cfg.sl_pct:g}% of equity ({limit:.2f} USDT) - closing all positions")
 
     return AccountTpSlDecision("", total_pnl, equity, 0.0, "within account thresholds")
 

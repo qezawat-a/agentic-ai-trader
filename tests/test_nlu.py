@@ -63,8 +63,9 @@ def _run(coro):
     # status
     ("show me the status", "status"),
     ("what is the engine status", "status"),
-    # tpsl / ladder
+    # tpsl
     ("show me the tp/sl", "tpsl"),
+    ("show me the tpsl", "tpsl"),
     # price / funding / symbols
     ("what is the price of BTCUSDT", "price BTCUSDT"),
     ("show me the funding rate", "funding"),
@@ -226,16 +227,16 @@ def test_place_order_from_a_sentence_is_refused_not_guessed(tmp_path):
 # 4. The engine answers about its OWN settings, from the repo
 # ==========================================================================
 
-def test_taker_fee_rate_is_explained_from_the_repo(tmp_path):
-    """A question about a known setting is answered from the repo itself."""
+def test_min_stop_ticks_is_explained_from_the_repo(tmp_path):
+    """The engine once said it had no access to the engine. It does."""
     a = _agent(tmp_path)
-    out = _run(a.handle("what does TAKER_FEE_RATE do"))
+    out = _run(a.handle("what does MIN_STOP_TICKS do"))
     assert "no access" not in out.lower()
-    assert "TAKER_FEE_RATE" in out
-    assert "jrock/config.py" in out
-    assert "fee" in out.lower()
-    # it must state the ACTUAL configured value
-    assert str(a.s.taker_fee_rate) in out
+    assert "MIN_STOP_TICKS" in out
+    assert "tick" in out.lower()
+    # it must state the ACTUAL fixed value
+    from jrock.trader.engine import MIN_STOP_TICKS
+    assert str(MIN_STOP_TICKS) in out
 
 
 def test_taker_fee_rate_is_explained(tmp_path):
@@ -285,8 +286,7 @@ def test_why_failed_with_no_errors_says_so(tmp_path):
     "max open positions 5",
     "leverage 10", "risk 1.0",
     "margin mode ISOLATION", "position mode HEDGE",
-    "tpsl method PARTIAL", "partial close pct 50", "partial at roi 50",
-    "ladder", "ladder off", "ladder breakeven 2", "ladder runner trail",
+    "tpsl method PARTIAL", "partial ladder 40@1,35@2", "partial ladder off",
     "account tp usdt 100", "account sl usdt 50",
     "scans interval sec 30", "report interval sec 45",
     "timeframes 1m,3m,5m,15m",
