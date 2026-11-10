@@ -429,15 +429,23 @@ def _failure(base_url: str, probes: list[ModelProbe], listed: int, free_count: i
 
 
 def persist_model(env_path: Path | str, model: str) -> None:
-    """Write MODEL=... into .env, preserving everything else."""
+    """Write MODEL=... into .env, preserving everything else.
+
+    The value goes through ``_env_value`` so a model id containing a space,
+    a quote or a newline cannot corrupt the file or make python-dotenv report
+    "could not parse statement" on the next start.
+    """
+    from .settings_store import _env_value
+
     p = Path(env_path)
     lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    rendered = f"MODEL={_env_value(model)}"
     found = False
     for i, ln in enumerate(lines):
         if ln.strip().startswith("MODEL="):
-            lines[i] = f"MODEL={model}"
+            lines[i] = rendered
             found = True
             break
     if not found:
-        lines.append(f"MODEL={model}")
+        lines.append(rendered)
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")

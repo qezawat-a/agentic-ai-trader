@@ -40,6 +40,34 @@ API_BASE = "https://api.telegram.org"
 #: Telegram's hard limit for one message body.
 MAX_MESSAGE = 4000
 
+#: The command list published with ``setMyCommands``. Telegram renders these
+#: behind the Menu button in the BOTTOM-LEFT corner of the chat, so the operator
+#: sees what the bot can do without typing ``/help`` first. Order matters: it is
+#: the order Telegram displays them in.
+COMMANDS: list[tuple[str, str]] = [
+    ("status", "engine + account + positions"),
+    ("positions", "open positions"),
+    ("orders", "pending orders"),
+    ("pnl", "account and PnL"),
+    ("engine", "engine flags"),
+    ("ladder", "TP ladder state"),
+    ("help", "this message"),
+]
+
+#: A persistent reply keyboard, also bottom-left. ``setMyCommands`` only shows
+#: the commands in the Menu sheet; this puts the four most-used ones one tap
+#: away, permanently, without the operator opening anything.
+REPLY_KEYBOARD: dict[str, Any] = {
+    "keyboard": [
+        [{"text": "/status"}, {"text": "/positions"}],
+        [{"text": "/orders"}, {"text": "/pnl"}],
+        [{"text": "/ladder"}, {"text": "/help"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+    "input_field_placeholder": "J+Rock - tap a command or type",
+}
+
 
 class TelegramError(RuntimeError):
     """The Bot API refused a call. Carries the description Telegram sent."""
@@ -78,17 +106,36 @@ class TelegramBot:
     async def get_me(self) -> dict:
         return await self.call("getMe")
 
-    async def send(self, chat_id: int | str, text: str,
-                   *, markdown: bool = False) -> Any:
-        for chunk in _split(text, MAX_MESSAGE):
-            await self.call("sendMessage", chat_id=chat_id, text=chunk,
-                            parse_mode="HTML" if markdown else None,
-                            disable_web_page_preview=True)
-        return True
-
     async def poll(self, offset: int | None, timeout: int = 30) -> list[dict]:
         return await self.call("getUpdates", offset=offset, timeout=timeout,
                                allowed_updates=["message"])
+
+    async def set_my_commands(self, commands: list[tuple[str, str]]) -> Any:
+        """Publish the command list Telegram shows in the bottom-left Menu.
+
+        This is what makes the commands appear WITHOUT the operator typing
+        ``/help`` first: Telegram renders them behind the Menu button that sits
+        in the bottom-left corner of the chat, and the client caches them, so
+        they are there on the next time the chat is opened.
+        """
+        return await self.call(
+            "setMyCommands",
+            commands=[{"command": c, "description": d} for c, d in commands])
+
+    async def send(self, chat_id: int | str, text: str,
+                   *, markdown: bool = False, keyboard: bool = True) -> Any:
+        for i, chunk in enumerate(_split(text, MAX_MESSAGE)):
+            params: dict[str, Any] = {
+                "chat_id": chat_id, "text": chunk,
+                "parse_mode": "HTML" if markdown else None,
+                "disable_web_page_preview": True,
+            }
+            # The reply keyboard rides on the LAST chunk only, so a long report
+            # does not stack one keyboard per message.
+            if keyboard and i == len(_split(text, MAX_MESSAGE)) - 1:
+                params["reply_markup"] = REPLY_KEYBOARD
+            await self.call("sendMessage", **params)
+        return True
 
 
 # ------------------------------------------------------------------- rendering
@@ -198,18 +245,78 @@ def render_summary(state: dict) -> str:
     ])
 
 
-HELP = (
-    "<b>J+Rock bot</b>\n"
-    "/status   engine + account + positions\n"
-    "/positions  open positions\n"
-    "/orders   pending orders\n"
-    "/pnl      account and PnL\n"
-    "/engine   engine flags\n"
-    "/ladder   TP ladder state\n"
-    "/help     this message\n\n"
-    "Any other text is passed to the engine command router, so the same "
-    "phrases the CLI accepts also work here."
-)
+#: Topics the Menu exposes one level deep: ``/help engine`` etc. These are
+#: exactly the keys the CLI router accepts after ``/help``, so the two surfaces
+#: (Telegram menu and CLI help) stay aligned.
+HELP_TOPICS: dict[str, str] = {
+    "engine": "engine + account + positions (same as /status)",
+    "positions": "open positions",
+    "orders": "pending orders",
+    "pnl": "account and PnL",
+    "ladder": "TP ladder state",
+}
+
+
+def _strip_code(text: str) -> str:
+    """Strip one layer of Telegram/CLI code fence around a command.
+
+    ``/help engine`` rendered as a code block arrives as
+    `````/help engine````` or `` ` ``` /help engine ``` ``` ` `` - the router
+    split on whitespace and took the backticks with the command, so it fell
+    through to the agent. Stripping a fencing layer (backticks, or the triple
+    `` ``` `` band) makes the same tap work whether Telegram renders it as a
+    button or as a code snippet.
+    """
+    s = text.strip()
+    # Triple fence first, then a single backtick. Each is stripped at most
+    # once, and only when it actually wraps the whole string - a bare
+    # ``/help`` must not lose a character.
+    for wrap in ("```", "`"):
+        if len(s) > 2 * len(wrap) and s.startswith(wrap) and s.endswith(wrap):
+            s = s[len(wrap): -len(wrap)].strip()
+    return s
+
+
+def _split_command(text: str) -> tuple[str, str]:
+    """Return (command, rest) for a Telegram message.
+
+    Handles ``/status``, ``/status@Bot``, ``/status extra args`` and code
+    fenced variants (``` /status ```) - everything a real operator taps in a
+    chat. Unknown text is returned as ("", text) so the caller can fall back
+    to the engine router, which is exactly what the CLI accepts.
+    """
+    s = _strip_code(text)
+    if not s.startswith("/"):
+        return "", text
+    first, _, rest = s.partition(" ")
+    cmd = first.lstrip("/").lower().split("@")[0]
+    return cmd, rest.strip()
+
+
+def render_help() -> str:
+    """The help text, generated from ``COMMANDS`` and ``HELP_TOPICS``.
+
+    Built from the same lists that are published to Telegram, so the Menu sheet
+    and this message can never disagree about what the bot accepts. ``/help
+    <topic>`` opens one of the topic pages below; ``/help`` alone lists both
+    the commands and the topics.
+    """
+    width = max(len(c) for c, _ in COMMANDS) + 2
+    lines = [f"/{c.ljust(width)}{d}" for c, d in COMMANDS]
+    topics = "  ".join(f"/{t}" for t in HELP_TOPICS)
+    return (
+        "<b>J+Rock bot</b>\n"
+        + "\n".join(lines)
+        + f"\n\ntopics: {topics}\n"
+          "(e.g. <code>/help engine</code> for one page)\n\n"
+          "Any other text is passed to the engine command router, so the same "
+          "phrases the CLI accepts also work here."
+    )
+
+
+#: Kept as a module constant for callers that imported it before ``render_help``
+#: existed; it is now derived rather than hand-maintained.
+HELP = render_help()
 
 
 # ------------------------------------------------------------------ the bot app
@@ -227,12 +334,31 @@ class JRockTelegramApp:
         return await build_state(self.agent)
 
     async def handle(self, chat_id: int | str, text: str) -> None:
-        cmd = text.strip().split()[0].lower().lstrip("/") if text.strip() else ""
-        cmd = cmd.split("@")[0]          # "/status@MyBot" in groups
+        cmd, rest = _split_command(text)
 
+        # Every reply carries the persistent keyboard, so the commands stay in
+        # the bottom-left corner of the chat without the operator asking for
+        # them. `/start` and `/help` are the entry points that matter most.
         try:
             if cmd in ("start", "help"):
-                await self.bot.send(chat_id, HELP, markdown=True)
+                # `/help engine` is a real page, not a fall-through to the
+                # engine router: the operator tapped a topic and expects help
+                # about it, not a status dump.
+                topic = rest.lower().split()[0] if rest else ""
+                if topic in HELP_TOPICS:
+                    await self.bot.send(
+                        chat_id,
+                        f"<b>/help {topic}</b>\n{_e(HELP_TOPICS[topic])}\n\n"
+                        f"run <code>/{topic}</code> to see it now",
+                        markdown=True)
+                elif topic:
+                    await self.bot.send(
+                        chat_id,
+                        f"<b>no help page for {_e(topic)}</b>\n"
+                        f"topics: {_e('  '.join('/' + t for t in HELP_TOPICS))}",
+                        markdown=True)
+                else:
+                    await self.bot.send(chat_id, render_help(), markdown=True)
             elif cmd in ("status", "s"):
                 await self.bot.send(chat_id, render_summary(await self.state()),
                                     markdown=True)
@@ -240,14 +366,11 @@ class JRockTelegramApp:
                 await self.bot.send(chat_id, render_positions(await self.state()),
                                     markdown=True)
             elif cmd == "orders":
-                # Two sources on purpose: the dashboard readout gives the
-                # structured rows, and the agent command is what the operator
-                # would type in the CLI. Prefer the structured one.
-                st = await self.state()
-                if st.get("orders"):
-                    await self.bot.send(chat_id, render_orders(st), markdown=True)
-                else:
-                    await self.bot.send(chat_id, render_orders(st), markdown=True)
+                # One source: the dashboard readout, which is already normalised
+                # through order_rows(). The previous if/else had identical
+                # branches, so it only looked like it chose between two.
+                await self.bot.send(chat_id, render_orders(await self.state()),
+                                    markdown=True)
             elif cmd == "pnl":
                 await self.bot.send(chat_id, render_pnl(await self.state()),
                                     markdown=True)
@@ -258,6 +381,10 @@ class JRockTelegramApp:
                 out = await self.agent.handle(cmd)
                 await self.bot.send(chat_id, _as_html(out), markdown=True)
             else:
+                # Bare text, or a command this front-end does not own: hand the
+                # ORIGINAL text to the engine router, which is the same surface
+                # the CLI exposes. `rest` is deliberately not used here - the
+                # router needs the whole line ("turn the engine on").
                 out = await self.agent.handle(text)
                 await self.bot.send(chat_id, _as_html(out), markdown=True)
         except TelegramError as e:
@@ -274,6 +401,16 @@ class JRockTelegramApp:
     async def run(self, *, once: bool = False) -> None:
         me = await self.bot.get_me()
         log.info("connected as @%s", me.get("username"))
+        # Publish the command list once at startup. Telegram caches it per bot,
+        # so this is what makes the Menu button in the bottom-left corner show
+        # the commands on the operator's next visit - no /help needed first.
+        try:
+            await self.bot.set_my_commands(COMMANDS)
+            log.info("published %d commands to the Menu", len(COMMANDS))
+        except TelegramError as e:
+            # A failed menu publish must not stop the bot: the commands still
+            # work when typed, and the reply keyboard still appears.
+            log.warning("setMyCommands failed (menu will be empty): %s", e)
         print(f"Telegram bot @{me.get('username')} is listening "
               f"(chat id is shown per message; Ctrl+C to stop)", flush=True)
         offset: int | None = None
