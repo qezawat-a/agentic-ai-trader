@@ -1165,7 +1165,27 @@ class TraderEngine:
                            liq=plan.liq)
         plan.tp = clamp_tp(side=side, tp=plan.tp, entry=price, mark=mark,
                            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
-        if not self._tpsl_side_ok(sym, side, price, mark, plan.sl, plan.tp, rules):
+
+        # --- the ladder owns every take-profit exit.
+        #
+        # `plan_tpsl` knows nothing about the ladder: it picks a single TP at
+        # ~1.8R from the signal strength. Attaching that to the entry order
+        # creates a WHOLE-POSITION native TP (the position endpoint has no
+        # quantity field), which sits just above the first rung and flattens
+        # the entire remainder the moment it is touched - so rungs 2 and 3
+        # never fire and the ladder degenerates into one staged exit.
+        #
+        # With a ladder active the entry order therefore carries the STOP only.
+        # Each rung is closed by the manage loop's reduce-only market order,
+        # which is the only mechanism that can close a *slice*.
+        ladder_at_entry = self._ladder_or_none()
+        tp_for_order = None if ladder_at_entry is not None else plan.tp
+        if ladder_at_entry is not None:
+            plan.notes = (plan.notes + "; " if plan.notes else "") + (
+                "TP ladder active: no whole-position TP attached at entry "
+                f"({len(ladder_at_entry.levels)} rungs own the exits)")
+
+        if not self._tpsl_side_ok(sym, side, price, mark, plan.sl, tp_for_order, rules):
             return {"ok": False,
                     "reason": "TP/SL would be rejected by the exchange after the "
                               "mark price moved; order not sent"}
@@ -1174,7 +1194,7 @@ class TraderEngine:
             body = build_order_body(
                 symbol=sym, qty=qty, side=order_side, tradeSide="OPEN",
                 orderType="MARKET", reduceOnly=False,
-                tpPrice=plan.tp, tpStopType=trigger_type, tpOrderType="MARKET",
+                tpPrice=tp_for_order, tpStopType=trigger_type, tpOrderType="MARKET",
                 slPrice=plan.sl, slStopType=trigger_type, slOrderType="MARKET",
                 rules=rules, known_symbols=set(self.rules) or None,
                 mark_price=mark, entry_price=price,
@@ -1211,7 +1231,13 @@ class TraderEngine:
                     entry=float(p.get("avgOpenPrice") or price),
                     qty=float(p.get("qty") or qty),
                     leverage=int(p.get("leverage") or self.state.leverage),
-                    sl=plan.sl, tp=plan.tp, liq=float(p.get("liqPrice") or plan.liq),
+                    # With a ladder active the position carries NO take-profit:
+                    # every rung is a reduce-only slice closed by the manage
+                    # loop. Storing plan.tp here would let the next breakeven /
+                    # trailing `modify_position_tp_sl_order` re-attach a
+                    # whole-position TP and flatten the remainder again.
+                    sl=plan.sl, tp=(0.0 if ladder_at_entry is not None else plan.tp),
+                    liq=float(p.get("liqPrice") or plan.liq),
                     opened_ts=time.time(),
                     # The ladder measures every close_pct against THIS number.
                     # Captured once at entry: measuring against the live
