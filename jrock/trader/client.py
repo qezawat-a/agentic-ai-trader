@@ -49,6 +49,18 @@ def _nonce(n: int = 32) -> str:
 _ROW_LIST_KEYS = ("orderList", "rows", "list", "items")
 
 
+def _wire_bool(v: bool | None) -> str | None:
+    """Render an optional boolean for the wire: ``true``/``false`` strings.
+
+    The query-string params and JSON bodies both use the lowercase JSON
+    spelling (docs: ``boolean, default: false``). Python's ``True`` would
+    urlencode as ``True`` which the server does not read as true.
+    """
+    if v is None:
+        return None
+    return "true" if v else "false"
+
+
 def order_rows(data: Any) -> list[dict]:
     """Normalise an exchange ``data`` payload into a list of row dicts.
 
@@ -309,19 +321,16 @@ class BitunixClient:
     async def get_funding_rate_batch(self, symbols: str = "") -> Any:
         """Funding rates for many symbols.
 
-        Official: `symbols` is OPTIONAL - omitting it returns every symbol.
-
-        VERIFIED LIVE 2026-11-07: this endpoint IGNORES the `symbols` filter.
-        `?symbols=BTCUSDT,ETHUSDT`, `?symbol=BTCUSDT` and no parameter at all
-        all return the same 931 rows. So the caller must filter the response
-        itself; `filter_funding_rows` does that. Sending the parameter is
-        harmless and kept for forward compatibility, but do not rely on it.
+        VERIFIED 2026-11-10 against the official doc page: the request carries
+        NO parameters at all - there is no Request Parameters table, and the
+        old `symbols` filter was removed from the docs. The server ignores it
+        anyway (live: `?symbols=BTCUSDT,ETHUSDT`, `?symbol=BTCUSDT` and no
+        parameter all return the same 931 rows). `symbols` is therefore
+        ACCEPTED here for caller convenience but never SENT; filtering
+        happens client-side via `filter_funding_rows`.
         """
-        params: dict[str, Any] = {}
-        if symbols:
-            params["symbols"] = symbols
         return await self.request("GET", "/api/v1/futures/market/funding_rate/batch",
-                                  params=params, signed=False)
+                                  signed=False)
 
     async def get_funding_rate_history(self, symbol: str,
                                        start_time: int | None = None,
@@ -451,18 +460,37 @@ class BitunixClient:
 
     # ============================================================ POSITION
     async def get_pending_positions(self, symbol: str | None = None,
-                                    position_id: str | None = None) -> Any:
+                                    position_id: str | None = None,
+                                    sub_account_id: int | None = None,
+                                    include_sub_accounts: bool | None = None) -> Any:
+        """Open positions.
+
+        Official params (all optional): `symbol`, `positionId`, `subAccountId`,
+        `includeSubAccounts` (boolean). A sub-account query needs `subAccountId`;
+        without it the response is the main account's own positions. Booleans
+        are sent as ``true``/``false`` strings - the wire format is boolean.
+        """
         return await self.request("GET", "/api/v1/futures/position/get_pending_positions",
-                                  params={"symbol": symbol, "positionId": position_id})
+                                  params={"symbol": symbol, "positionId": position_id,
+                                          "subAccountId": sub_account_id,
+                                          "includeSubAccounts": _wire_bool(include_sub_accounts)})
 
     async def get_history_positions(self, symbol: str | None = None, skip: int = 0,
                                     limit: int = 20,
                                     start_time: int | None = None,
-                                    end_time: int | None = None) -> Any:
-        """Closed positions. Official paging params are `skip`/`limit`."""
+                                    end_time: int | None = None,
+                                    position_id: str | None = None,
+                                    sub_account_id: int | None = None) -> Any:
+        """Closed positions. Official paging params are `skip`/`limit`.
+
+        `positionId` and `subAccountId` are the remaining optional filters; both
+        can be used with or without a symbol filter.
+        """
         return await self.request("GET", "/api/v1/futures/position/get_history_positions",
                                   params={"symbol": symbol, "skip": skip, "limit": limit,
-                                          "startTime": start_time, "endTime": end_time})
+                                          "startTime": start_time, "endTime": end_time,
+                                          "positionId": position_id,
+                                          "subAccountId": sub_account_id})
 
     async def get_position_tiers(self, symbol: str) -> Any:
         return await self.request("GET", "/api/v1/futures/position/get_position_tiers",
@@ -508,18 +536,36 @@ class BitunixClient:
         return await self.request("POST", "/api/v1/futures/trade/batch_order",
                                   body={"symbol": symbol, "orderList": order_list})
 
-    async def cancel_orders(self, symbol: str, order_list: list[dict]) -> Any:
+    async def cancel_orders(self, symbol: str, order_list: list[dict] | None = None,
+                            order_id: str | None = None,
+                            client_id: str | None = None) -> Any:
         """Cancel a batch of orders.
 
         Official: BOTH `symbol` and `orderList` are required. The old signature
         sent only orderList, so every call was missing a required parameter.
+
+        `orderId`/`clientId` are the remaining optional fields - the docs say
+        "Either orderId or clientId is required" as the order identifier inside
+        the request, so a single-order cancel may send just those instead of an
+        orderList entry. When `orderList` is omitted, at least one of them
+        becomes mandatory.
         """
         if not symbol:
             raise ValueError("cancel_orders requires symbol (official: required)")
-        if not order_list:
+        if not order_list and not order_id and not client_id:
+            raise ValueError(
+                "cancel_orders requires an orderList, or orderId/clientId "
+                "(official: either orderId or clientId identifies the order)")
+        if order_list is not None and not order_list:
             raise ValueError("cancel_orders requires a non-empty orderList")
-        return await self.request("POST", "/api/v1/futures/trade/cancel_orders",
-                                  body={"symbol": symbol, "orderList": order_list})
+        body: dict[str, Any] = {"symbol": symbol}
+        if order_id:
+            body["orderId"] = str(order_id)
+        if client_id:
+            body["clientId"] = str(client_id)
+        if order_list:
+            body["orderList"] = order_list
+        return await self.request("POST", "/api/v1/futures/trade/cancel_orders", body=body)
 
     async def cancel_all_orders(self, symbol: str | None = None) -> Any:
         return await self.request("POST", "/api/v1/futures/trade/cancel_all_orders",
@@ -541,12 +587,16 @@ class BitunixClient:
         return await self.request("POST", "/api/v1/futures/trade/modify_order", body=kwargs)
 
     async def get_pending_orders(self, symbol: str | None = None, skip: int = 0,
-                                 limit: int = 20) -> list[dict]:
+                                 limit: int = 20, order_id: str | None = None,
+                                 client_id: str | None = None, status: str | None = None,
+                                 start_time: int | None = None,
+                                 end_time: int | None = None) -> list[dict]:
         """Pending orders, as a LIST of order rows.
 
         Official paging params are `skip`/`limit` (max 100), NOT
         `page`/`pageSize` - the live server ignores the latter and returns the
-        default page.
+        default page. Remaining optional filters: `orderId`, `clientId`,
+        `status` (``NEW`` | ``PART_FILLED``), `startTime`, `endTime`.
 
         The exchange wraps the rows in an envelope: ``data`` is
         ``{"orderList": [...], "total": N}``, NOT a bare list. ``request()``
@@ -558,16 +608,38 @@ class BitunixClient:
         boundary means every caller gets the same shape the tests stub.
         """
         data = await self.request("GET", "/api/v1/futures/trade/get_pending_orders",
-                                  params={"symbol": symbol, "skip": skip, "limit": limit})
+                                  params={"symbol": symbol, "skip": skip, "limit": limit,
+                                          "orderId": order_id, "clientId": client_id,
+                                          "status": status, "startTime": start_time,
+                                          "endTime": end_time})
         return order_rows(data)
 
     async def get_history_orders(self, symbol: str | None = None, skip: int = 0,
                                  limit: int = 20, start_time: int | None = None,
-                                 end_time: int | None = None) -> Any:
-        """Order history. Official paging params are `skip`/`limit`."""
+                                 end_time: int | None = None,
+                                 order_id: str | None = None,
+                                 client_id: str | None = None,
+                                 status: str | None = None,
+                                 order_type: str | None = None,
+                                 sub_account_id: int | None = None,
+                                 query_canceled: bool | None = None) -> Any:
+        """Order history. Official paging params are `skip`/`limit`.
+
+        Remaining optional filters: `orderId`, `clientId`, `status` (``FILLED``
+        | ``CANCELED`` | ``PART_FILLED_CANCELED`` | ``EXPIRED``), `type`
+        (``LIMIT`` | ``MARKET``, default all), `subAccountId` and
+        `queryCanceled` (boolean, default false - true returns canceled orders
+        only). `status` and `type` are upper-cased; `queryCanceled` goes on the
+        wire as ``true``/``false``.
+        """
         return await self.request("GET", "/api/v1/futures/trade/get_history_orders",
                                   params={"symbol": symbol, "skip": skip, "limit": limit,
-                                          "startTime": start_time, "endTime": end_time})
+                                          "startTime": start_time, "endTime": end_time,
+                                          "orderId": order_id, "clientId": client_id,
+                                          "status": status.upper() if status else None,
+                                          "type": order_type.upper() if order_type else None,
+                                          "subAccountId": sub_account_id,
+                                          "queryCanceled": _wire_bool(query_canceled)})
 
     async def get_order_detail(self, order_id: str | None = None,
                                client_id: str | None = None) -> Any:
@@ -576,11 +648,18 @@ class BitunixClient:
 
     async def get_history_trades(self, symbol: str | None = None, skip: int = 0,
                                  limit: int = 20, start_time: int | None = None,
-                                 end_time: int | None = None) -> Any:
-        """Trade history. Official paging params are `skip`/`limit`."""
+                                 end_time: int | None = None,
+                                 order_id: str | None = None,
+                                 position_id: str | None = None) -> Any:
+        """Trade history. Official paging params are `skip`/`limit`.
+
+        `orderId` and `positionId` are the remaining optional filters, usable
+        alone or with a symbol/time window.
+        """
         return await self.request("GET", "/api/v1/futures/trade/get_history_trades",
                                   params={"symbol": symbol, "skip": skip, "limit": limit,
-                                          "startTime": start_time, "endTime": end_time})
+                                          "startTime": start_time, "endTime": end_time,
+                                          "orderId": order_id, "positionId": position_id})
 
     async def close_all_position(self, symbol: str | None = None) -> Any:
         return await self.request("POST", "/api/v1/futures/trade/close_all_position",

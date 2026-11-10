@@ -79,8 +79,11 @@ _add(Endpoint("get_funding_rate", "GET", "/api/v1/futures/market/funding_rate", 
               "10 req/sec/ip", "Current funding rate", [_p("symbol", "string", True)],
               "funding_rate.md"))
 _add(Endpoint("get_funding_rate_batch", "GET", "/api/v1/futures/market/funding_rate/batch", False,
-              "10 req/sec/ip", "Funding rates for many symbols (server ignores `symbols`; filter locally)",
-              [_p("symbols", "string", False)], "funding_rate_batch.md"))
+              "10 req/sec/ip",
+              "Funding rates for every symbol - NO request parameters "
+              "(the old `symbols` filter is gone from the docs and ignored "
+              "by the server; filter locally, e.g. filter_funding_rows)",
+              [], "funding_rate_batch.md"))
 _add(Endpoint("get_funding_rate_history", "GET",
               "/api/v1/futures/market/get_funding_rate_history",
               False, "10 req/sec/ip", "Funding rate history (note the get_ prefix)",
@@ -171,8 +174,14 @@ _add(Endpoint("batch_order", "POST", "/api/v1/futures/trade/batch_order", True,
               [_p("symbol", "string", True), _p("orderList", "array", True)],
               "batch_order.md"))
 _add(Endpoint("cancel_orders", "POST", "/api/v1/futures/trade/cancel_orders", True,
-              "10 req/sec/uid", "Cancel specific orders (symbol REQUIRED; orderId or clientId per item)",
-              [_p("symbol", "string", True), _p("orderList", "array", True)],
+              "10 req/sec/uid",
+              "Cancel specific orders (symbol required; orderList, or orderId/"
+              "clientId for a single-order cancel)",
+              [_p("symbol", "string", True), _p("orderList", "array", True),
+               _p("orderId", "string", False,
+                  "Either orderId or clientId is required; orderId prevails"),
+               _p("clientId", "string", False,
+                  "Either orderId or clientId is required; orderId prevails")],
               "cancel_orders.md"))
 _add(Endpoint("cancel_all_orders", "POST", "/api/v1/futures/trade/cancel_all_orders", True,
               "20 req/sec/uid", "Cancel all open orders",

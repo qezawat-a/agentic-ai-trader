@@ -538,6 +538,122 @@ def test_api_reference_cancel_orders_requires_symbol():
 
     names = {p.name: p for p in ar.ENDPOINTS["cancel_orders"].params}
     assert names["symbol"].required and names["orderList"].required
+    # optional single-order form: "Either orderId or clientId is required"
+    assert not names["orderId"].required and not names["clientId"].required
+
+
+def test_api_reference_funding_rate_batch_has_no_request_params():
+    """2026-11-10: the official page has no Request Parameters table - the
+    old `symbols` filter is gone from the docs, so it must not be sent."""
+    from jrock.trader import api_reference as ar
+
+    assert ar.ENDPOINTS["get_funding_rate_batch"].params == []
+
+
+# ==================================================== every documented param
+# The 2026-11-10 parameter-coverage pass: one test per endpoint whose optional
+# parameters were missing from the client, proving the fields reach the wire
+# and that unset ones are omitted (request() drops None/"").
+
+
+def test_pending_positions_sends_subaccount_and_includesubaccounts():
+    from jrock.trader.client import url_query_string
+
+    c, calls = _client()
+    asyncio.run(c.get_pending_positions(sub_account_id=7, include_sub_accounts=True))
+    params = calls[0]["params"]
+    assert params["subAccountId"] == 7
+    assert params["includeSubAccounts"] == "true"
+    asyncio.run(c.get_pending_positions(symbol="BTCUSDT"))
+    # the spy sits before request()'s central None-filter, so the unset
+    # params are asserted on the REAL wire form - url_query_string()
+    wire = url_query_string(calls[1]["params"])
+    assert "subAccountId" not in wire and "includeSubAccounts" not in wire
+
+
+def test_history_positions_sends_positionid_and_subaccountid():
+    c, calls = _client()
+    asyncio.run(c.get_history_positions(symbol="BTCUSDT", position_id="42",
+                                        sub_account_id=9))
+    params = calls[0]["params"]
+    assert params["positionId"] == "42" and params["subAccountId"] == 9
+
+
+def test_cancel_orders_orderlist_form_is_unchanged():
+    c, calls = _client()
+    asyncio.run(c.cancel_orders("BTCUSDT", [{"orderId": "1"}]))
+    assert calls[0]["body"] == {"symbol": "BTCUSDT",
+                                "orderList": [{"orderId": "1"}]}
+
+
+def test_cancel_orders_single_order_form_sends_orderid_and_clientid():
+    c, calls = _client()
+    asyncio.run(c.cancel_orders("BTCUSDT", order_id="1"))
+    assert calls[0]["body"] == {"symbol": "BTCUSDT", "orderId": "1"}
+    asyncio.run(c.cancel_orders("BTCUSDT", client_id="c1"))
+    assert calls[1]["body"] == {"symbol": "BTCUSDT", "clientId": "c1"}
+
+
+def test_cancel_orders_refuses_an_empty_call():
+    c, _ = _client()
+    with pytest.raises(ValueError):
+        asyncio.run(c.cancel_orders("BTCUSDT"))
+    with pytest.raises(ValueError):
+        asyncio.run(c.cancel_orders("BTCUSDT", []))
+
+
+def test_pending_orders_sends_the_optional_filters():
+    c, calls = _client()
+    asyncio.run(c.get_pending_orders(symbol="BTCUSDT", order_id="1",
+                                     client_id="c", status="NEW",
+                                     start_time=100, end_time=200))
+    params = calls[0]["params"]
+    assert params["orderId"] == "1" and params["clientId"] == "c"
+    assert params["status"] == "NEW"
+    assert params["startTime"] == 100 and params["endTime"] == 200
+
+
+def test_history_orders_sends_status_type_subaccount_and_querycanceled():
+    from jrock.trader.client import url_query_string
+
+    c, calls = _client()
+    asyncio.run(c.get_history_orders(symbol="BTCUSDT", status="filled",
+                                     order_type="limit", sub_account_id=3,
+                                     query_canceled=True))
+    params = calls[0]["params"]
+    assert params["status"] == "FILLED"
+    assert params["type"] == "LIMIT"
+    assert params["subAccountId"] == 3
+    assert params["queryCanceled"] == "true"
+    asyncio.run(c.get_history_orders(symbol="BTCUSDT", query_canceled=False))
+    assert calls[1]["params"]["queryCanceled"] == "false"
+    asyncio.run(c.get_history_orders(symbol="BTCUSDT"))
+    wire = url_query_string(calls[2]["params"])
+    assert "queryCanceled" not in wire
+
+
+def test_history_trades_sends_orderid_and_positionid():
+    c, calls = _client()
+    asyncio.run(c.get_history_trades(symbol="BTCUSDT", order_id="9",
+                                     position_id="10"))
+    params = calls[0]["params"]
+    assert params["orderId"] == "9" and params["positionId"] == "10"
+
+
+def test_funding_rate_batch_sends_no_parameters_anymore():
+    """The docs removed `symbols`; the request must be parameter-less."""
+    c, calls = _client()
+    asyncio.run(c.get_funding_rate_batch("BTCUSDT,ETHUSDT"))
+    assert calls[0]["params"] is None
+    assert calls[0]["path"] == "/api/v1/futures/market/funding_rate/batch"
+
+
+def test_wire_bool_renders_lowercase_json():
+    from jrock.trader.client import _wire_bool
+
+    assert _wire_bool(True) == "true"
+    assert _wire_bool(False) == "false"
+    assert _wire_bool(None) is None
 
 
 def test_api_reference_modify_order_requires_qty():

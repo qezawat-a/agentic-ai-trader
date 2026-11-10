@@ -2,7 +2,7 @@
 
 Source: https://www.bitunix.com/api-docs/futures/
 
-Generated: 2026-11-07T07:09:11Z
+Generated: 2026-11-10T16:59:35Z
 
 **54 pages** — 39 REST endpoints, 10 WebSocket channels, 5 guides.
 
@@ -68,12 +68,12 @@ Generated: 2026-11-07T07:09:11Z
 ### Change log
 
 - Source: https://www.bitunix.com/api-docs/futures/log/change_log.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 
 ### Adjust position margin
 
 - Source: https://www.bitunix.com/api-docs/futures/account/adjust_position_margin.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/account/adjust_position_margin`
 - rate limit: 5 req/sec/uid
 
@@ -88,7 +88,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Change leverage
 
 - Source: https://www.bitunix.com/api-docs/futures/account/change_leverage.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/account/change_leverage`
 - rate limit: 10 req/sec/uid
 
@@ -107,7 +107,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Change margin mode
 
 - Source: https://www.bitunix.com/api-docs/futures/account/change_margin_mode.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/account/change_margin_mode`
 - rate limit: 10 req/sec/uid
 
@@ -126,7 +126,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Change position mode
 
 - Source: https://www.bitunix.com/api-docs/futures/account/change_position_mode.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/account/change_position_mode`
 - rate limit: 10 req/sec/uid
 
@@ -141,7 +141,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get leverage and margin mode
 
 - Source: https://www.bitunix.com/api-docs/futures/account/get_leverage_and_margin_mode.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/account/get_leverage_margin_mode`
 - rate limit: 10 req/sec/uid
 
@@ -160,7 +160,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get position mode
 
 - Source: https://www.bitunix.com/api-docs/futures/account/get_position_mode.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/account/position_mode`
 - rate limit: 20 req/sec/uid
 
@@ -174,7 +174,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get single account
 
 - Source: https://www.bitunix.com/api-docs/futures/account/get_single_account.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/account`
 - rate limit: 10 req/sec/uid
 
@@ -197,7 +197,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get trading settings
 
 - Source: https://www.bitunix.com/api-docs/futures/account/get_trading_settings.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/account/trading_settings`
 - rate limit: 20 req/sec/uid
 
@@ -220,17 +220,17 @@ Generated: 2026-11-07T07:09:11Z
 ### Introduction
 
 - Source: https://www.bitunix.com/api-docs/futures/common/introduction.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 
 ### Sign
 
 - Source: https://www.bitunix.com/api-docs/futures/common/sign.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 
 ### Asset query
 
 - Source: https://www.bitunix.com/api-docs/futures/copyTrading/asset/asset_query.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/cp/asset/query`
 - rate limit: 10 req/sec/uid
 
@@ -242,7 +242,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Transfer asset from main account to sub account
 
 - Source: https://www.bitunix.com/api-docs/futures/copyTrading/asset/transfer_asset_from_main_account_to_sub_account.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/cp/asset/transfer-to-sub-account`
 - rate limit: 10 req/sec/uid
 
@@ -254,7 +254,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Transfer asset from subaccount to main account
 
 - Source: https://www.bitunix.com/api-docs/futures/copyTrading/asset/transfer_asset_from_subaccount_to_main_account.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/cp/asset/transfer-to-main-account`
 - rate limit: 10 req/sec/uid
 
@@ -266,12 +266,12 @@ Generated: 2026-11-07T07:09:11Z
 ### Error code
 
 - Source: https://www.bitunix.com/api-docs/futures/ErrorCode/error_code.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 
 ### Get depth
 
 - Source: https://www.bitunix.com/api-docs/futures/market/get_depth.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/market/depth`
 - rate limit: 10 req/sec/ip
 
@@ -290,7 +290,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get funding rate batch
 
 - Source: https://www.bitunix.com/api-docs/futures/market/get_funding_rate_batch.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/market/funding_rate/batch`
 - rate limit: 10 req/sec/ip
 
@@ -309,7 +309,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get funding rate history
 
 - Source: https://www.bitunix.com/api-docs/futures/market/get_funding_rate_history.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/market/get_funding_rate_history`
 - rate limit: 10 req/sec/ip
 
@@ -329,7 +329,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get funding rate
 
 - Source: https://www.bitunix.com/api-docs/futures/market/get_funding_rate.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/market/funding_rate`
 - rate limit: 10 req/sec/ip
 
@@ -352,7 +352,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get kline
 
 - Source: https://www.bitunix.com/api-docs/futures/market/get_kline.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/market/kline`
 - rate limit: 10 req/sec/ip
 
@@ -377,7 +377,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get tickers
 
 - Source: https://www.bitunix.com/api-docs/futures/market/get_tickers.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/market/tickers`
 - rate limit: 10 req/sec/ip
 
@@ -400,7 +400,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get trading pairs
 
 - Source: https://www.bitunix.com/api-docs/futures/market/get_trading_pairs.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/market/trading_pairs`
 - rate limit: 10 req/sec/ip
 
@@ -435,7 +435,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get history positions
 
 - Source: https://www.bitunix.com/api-docs/futures/position/get_history_positions.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/position/get_history_positions`
 - rate limit: 10 req/sec/uid
 
@@ -474,7 +474,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get pending positions
 
 - Source: https://www.bitunix.com/api-docs/futures/position/get_pending_positions.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/position/get_pending_positions`
 - rate limit: 10 req/sec/uid
 
@@ -510,7 +510,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get position tiers
 
 - Source: https://www.bitunix.com/api-docs/futures/position/get_position_tiers.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/position/get_position_tiers`
 - rate limit: 10 req/sec/ip
 
@@ -530,7 +530,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Cancel tp sl order
 
 - Source: https://www.bitunix.com/api-docs/futures/tp_sl/cancel_tp_sl_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/tpsl/cancel_order`
 
 | param | type | required |
@@ -545,7 +545,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get history tp sl order
 
 - Source: https://www.bitunix.com/api-docs/futures/tp_sl/get_history_tp_sl_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/tpsl/get_history_orders`
 - rate limit: 10 req/sec/uid
 
@@ -585,7 +585,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get pending tp sl order
 
 - Source: https://www.bitunix.com/api-docs/futures/tp_sl/get_pending_tp_sl_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/tpsl/get_pending_orders`
 - rate limit: 10 req/sec/uid
 
@@ -619,7 +619,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Modify position tp sl order
 
 - Source: https://www.bitunix.com/api-docs/futures/tp_sl/modify_position_tp_sl_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/tpsl/position/modify_order`
 
 | param | type | required |
@@ -638,7 +638,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Modify tp sl order
 
 - Source: https://www.bitunix.com/api-docs/futures/tp_sl/modify_tp_sl_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/tpsl/modify_order`
 
 | param | type | required |
@@ -662,7 +662,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Place position tp sl order
 
 - Source: https://www.bitunix.com/api-docs/futures/tp_sl/place_position_tp_sl_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/tpsl/position/place_order`
 
 | param | type | required |
@@ -681,7 +681,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Place tp sl order
 
 - Source: https://www.bitunix.com/api-docs/futures/tp_sl/place_tp_sl_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/tpsl/place_order`
 
 | param | type | required |
@@ -706,7 +706,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Batch order
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/batch_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/trade/batch_order`
 - rate limit: 2 req/sec/uid
 
@@ -745,7 +745,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Cancel all orders
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/cancel_all_orders.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/trade/cancel_all_orders`
 - rate limit: 20 req/sec/uid
 
@@ -767,7 +767,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Cancel orders
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/cancel_orders.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/trade/cancel_orders`
 - rate limit: 10 req/sec/uid
 
@@ -792,7 +792,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Close all position
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/close_all_position.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/trade/close_all_position`
 - rate limit: 1 req/sec/uid
 
@@ -803,7 +803,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Flash close position
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/flash_close_position.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/trade/flash_close_position`
 - rate limit: 5 req/sec/uid
 
@@ -818,7 +818,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get history orders
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/get_history_orders.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/trade/get_history_orders`
 - rate limit: 10 req/sec/uid
 
@@ -871,7 +871,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get history trades
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/get_history_trades.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/trade/get_history_trades`
 - rate limit: 10 req/sec/uid
 
@@ -910,7 +910,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get order detail
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/get_order_detail.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/trade/get_order_detail`
 - rate limit: 10 req/sec/uid
 
@@ -951,7 +951,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Get pending orders
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/get_pending_orders.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `GET /api/v1/futures/trade/get_pending_orders`
 - rate limit: 10 req/sec/uid
 
@@ -1000,7 +1000,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Modify order
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/modify_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/trade/modify_order`
 - rate limit: 20 req/sec/uid
 
@@ -1027,7 +1027,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Place order
 
 - Source: https://www.bitunix.com/api-docs/futures/trade/place_order.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - `POST /api/v1/futures/trade/place_order`
 - rate limit: 20 req/sec/uid
 
@@ -1060,7 +1060,7 @@ Generated: 2026-11-07T07:09:11Z
 ### WebSocket
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/prepare/WebSocket.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 
 | param | type | required |
 |---|---|---|
@@ -1084,7 +1084,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Balance Channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/private/Balance%20Channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `balance`
 
 | response field | type |
@@ -1105,7 +1105,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Order Channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/private/Order%20Channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `order`
 
 | response field | type |
@@ -1143,7 +1143,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Position Channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/private/Position%20Channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `position`
 
 | response field | type |
@@ -1169,7 +1169,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Tp Sl Channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/private/Tp%20Sl%20Channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `tpsl`
 
 | response field | type |
@@ -1201,7 +1201,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Depth channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/public/depth%20channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `depth_book1`
 
 | param | type | required |
@@ -1223,7 +1223,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Kline channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/public/kline%20channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `market_kline_1min`
 
 | param | type | required |
@@ -1249,7 +1249,7 @@ Generated: 2026-11-07T07:09:11Z
 ### MarketPrice Channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/public/MarketPrice%20Channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `price`
 
 | param | type | required |
@@ -1274,7 +1274,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Ticker Channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/public/Ticker%20Channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `ticker`
 
 | param | type | required |
@@ -1302,7 +1302,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Tickers Channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/public/Tickers%20Channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `tickers`
 
 | param | type | required |
@@ -1333,7 +1333,7 @@ Generated: 2026-11-07T07:09:11Z
 ### Trade Channel
 
 - Source: https://www.bitunix.com/api-docs/futures/websocket/public/Trade%20Channel.html
-- Fetched: 2026-11-07T07:09:11Z
+- Fetched: 2026-11-10T16:59:35Z
 - channel: `trade`
 
 | param | type | required |

@@ -49,13 +49,20 @@ def load_contract() -> dict:
         return json.load(fh)
 
 
-def _dict_keys(node: ast.AST) -> set[str]:
-    """String keys of a dict literal, plus keys set via d[k] = v in a block."""
+def _dict_literal_keys(node: ast.AST) -> set[str]:
+    """Every string dict-literal key reachable inside `node`.
+
+    Handles the plain `body = {...}` literal AND the conditional form
+    `body={"symbol": s} if symbol else {}` that cancel_all_orders and
+    close_all_position use: a coverage check wants the union of both
+    branches - what the key CAN be set to - not just the unconditional one.
+    """
     keys: set[str] = set()
-    if isinstance(node, ast.Dict):
-        for k in node.keys:
-            if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                keys.add(k.value)
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Dict):
+            for k in sub.keys:
+                if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    keys.add(k.value)
     return keys
 
 
@@ -70,7 +77,7 @@ def _assigned_keys(fn: ast.AST, var: str) -> set[str]:
         if isinstance(sub, ast.Assign):
             for t in sub.targets:
                 if isinstance(t, ast.Name) and t.id == var:
-                    keys |= _dict_keys(sub.value)
+                    keys |= _dict_literal_keys(sub.value)
                 if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
                     if t.value.id == var and isinstance(t.slice, ast.Constant):
                         if isinstance(t.slice.value, str):
@@ -79,7 +86,7 @@ def _assigned_keys(fn: ast.AST, var: str) -> set[str]:
         if isinstance(sub, ast.AnnAssign):
             t = sub.target
             if isinstance(t, ast.Name) and t.id == var and sub.value is not None:
-                keys |= _dict_keys(sub.value)
+                keys |= _dict_literal_keys(sub.value)
     return keys
 
 
@@ -114,12 +121,15 @@ def parse_client_calls() -> list[dict]:
             body: set[str] = set()
             for kw in node.keywords:
                 if kw.arg == "params":
-                    params |= _dict_keys(kw.value)
+                    if isinstance(kw.value, ast.Name):
+                        params |= _assigned_keys(fn, kw.value.id)
+                    else:
+                        params |= _dict_literal_keys(kw.value)
                 if kw.arg == "body":
                     if isinstance(kw.value, ast.Name):
                         body |= _assigned_keys(fn, kw.value.id)
                     else:
-                        body |= _dict_keys(kw.value)
+                        body |= _dict_literal_keys(kw.value)
 
             calls.append(
                 {
@@ -158,17 +168,22 @@ def parse_validated_passthroughs() -> dict[str, set[str]]:
                         consts[t.id] = vals
 
     out: dict[str, set[str]] = {}
+    kwargs_paths: set[str] = set()
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         # find the request() path this function calls
-        path = None
+        path: str | None = None
         for sub in ast.walk(fn):
             if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
                 if sub.func.attr == "request" and len(sub.args) >= 2:
                     p = sub.args[1]
                     if isinstance(p, ast.Constant) and isinstance(p.value, str):
                         path = p.value
+        # a **kwargs forwarding method exposes EVERY documented parameter to
+        # the caller, so optional coverage is complete by construction
+        if fn.args.kwarg is not None and fn.args.kwarg.arg == "kwargs" and path:
+            kwargs_paths.add(path)
         if not path:
             continue
         # find which constant it iterates over for validation. The check is
@@ -182,7 +197,37 @@ def parse_validated_passthroughs() -> dict[str, set[str]]:
                 iters.extend(g.iter for g in sub.generators)
             for it in iters:
                 if isinstance(it, ast.Attribute) and it.attr in consts:
-                    out[path] = consts[it.attr]
+                    out[path] = consts[it.attr]  # type: ignore[possibly-undefined]
+    for path in kwargs_paths:
+        out.setdefault(path, set())
+    return out
+
+
+def parse_client_kwargs_paths() -> set[str]:
+    """Paths served by a `def f(**kwargs)` forwarding method.
+
+    Such a method passes the caller's dict to `request()` verbatim, so every
+    documented optional parameter is reachable even though the AST cannot see
+    the keys. `place_order` and `modify_order` are the two here.
+    """
+    with open(CLIENT, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename=CLIENT)
+
+    out: set[str] = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not (fn.args.kwarg is not None and fn.args.kwarg.arg == "kwargs"):
+            continue
+        path = None
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+                if sub.func.attr == "request" and len(sub.args) >= 2:
+                    p = sub.args[1]
+                    if isinstance(p, ast.Constant) and isinstance(p.value, str):
+                        path = p.value
+        if path:
+            out.add(path)
     return out
 
 
@@ -210,7 +255,9 @@ def audit() -> dict:
     contract = load_contract()
     calls = parse_client_calls()
     passthrough = parse_validated_passthroughs()
-
+    # paths covered by a validated **kwargs passthrough (documented optional
+    # set is reachable by construction)
+    kwargs_only = parse_client_kwargs_paths()
     by_path: dict[str, list[dict]] = {}
     for c in calls:
         by_path.setdefault(c["path"], []).append(c)
@@ -247,21 +294,28 @@ def audit() -> dict:
 
         c = impl[0]
         sent = set(c["params"]) | set(c["body"])
-        # a **kwargs passthrough validates its required set from a constant
+        # a **kwargs passthrough validates its required set from a constant.
+        # It also exposes every documented OPTIONAL parameter (the caller can
+        # pass any of them), so optional coverage for such endpoints is the
+        # whole documented set.
         validated = passthrough.get(path)
         if validated:
             sent |= validated
+        if path in kwargs_only:
+            sent |= doc_req_top | doc_opt_top
 
         missing_req = sorted(doc_req_top - sent)
         extra = sorted(sent - doc_req_top - doc_opt_top)
-        # params the docs list as optional and the engine does not send
-        unsent_opt = sorted(doc_opt_top - sent)
-
+        # params the docs list as optional and the engine cannot send
+        unsent_opt = sorted(doc_opt_top - sent
+                            - KNOWN_OMISSIONS.get(path, set()))
         status = "OK"
         if missing_req:
             status = "MISSING-REQUIRED"
         elif extra:
             status = "EXTRA-PARAM"
+        elif unsent_opt:
+            status = "UNSUPPORTED-PARAM"
 
         results.append(
             {
@@ -276,14 +330,15 @@ def audit() -> dict:
                 "sent": sorted(sent),
                 "missing_required": missing_req,
                 "extra": extra,
-                "unsent_optional": unsent_opt,
+                "unsupported_optional": unsent_opt,
             }
         )
 
     implemented = [r for r in results if r["status"] not in ("MISSING", "OUT-OF-SCOPE")]
     missing = [r for r in results if r["status"] == "MISSING"]
     oos = [r for r in results if r["status"] == "OUT-OF-SCOPE"]
-    bad = [r for r in results if r["status"] in ("MISSING-REQUIRED", "EXTRA-PARAM")]
+    bad = [r for r in results if r["status"] in ("MISSING-REQUIRED", "EXTRA-PARAM",
+                                                 "UNSUPPORTED-PARAM")]
 
     return {
         "contract_endpoints": len([e for e in contract["endpoints"] if e["kind"] == "rest"]),
@@ -324,6 +379,9 @@ def main() -> int:
                 print(f"    MISSING REQUIRED: {r['missing_required']}")
             if r.get("extra"):
                 print(f"    UNDOCUMENTED EXTRA: {r['extra']}")
+            if r.get("unsupported_optional"):
+                print(f"    DOCUMENTED PARAMS WITH NO ROUTE THROUGH CODE: "
+                      f"{r['unsupported_optional']}")
             print()
 
     if args.strict and (rep["missing"] or rep["mismatched"]):

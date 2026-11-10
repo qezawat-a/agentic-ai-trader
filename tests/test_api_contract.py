@@ -110,7 +110,37 @@ def test_checker_reports_no_missing_and_no_mismatch():
     assert rep["missing"] == 0, [r["path"] for r in rep["results"]
                                  if r["status"] == "MISSING"]
     assert rep["mismatched"] == 0, [r for r in rep["results"]
-                                    if r["status"] in ("MISSING-REQUIRED", "EXTRA-PARAM")]
+                                    if r["status"] in ("MISSING-REQUIRED",
+                                                       "EXTRA-PARAM",
+                                                       "UNSUPPORTED-PARAM")]
+
+
+def test_checker_reports_full_optional_parameter_coverage():
+    """Every documented parameter - required AND optional - must have a route
+    through code. The 2026-11-10 pass found six endpoints whose optional
+    filters (subAccountId, queryCanceled, orderId, ...) existed only in the
+    docs; they are implemented now, and this pins that they never rot away."""
+    rep = checker.audit()
+    bad = [(r["path"], r["unsupported_optional"]) for r in rep["results"]
+           if r["status"] == "UNSUPPORTED-PARAM"]
+    assert not bad, f"documented params unreachable from code: {bad}"
+
+
+def test_checker_treats_kwargs_passthrough_as_full_coverage():
+    """place_order/modify_order forward **kwargs verbatim, so every documented
+    optional param is reachable by construction and must not be reported."""
+    rep = checker.audit()
+    by = {r["path"]: r for r in rep["results"]}
+    for path in ("/api/v1/futures/trade/place_order",
+                 "/api/v1/futures/trade/modify_order"):
+        assert by[path]["status"] == "OK", (path, by[path])
+        assert not by[path].get("unsupported_optional"), path
+
+
+def test_client_kwargs_passthrough_paths_are_detected():
+    paths = checker.parse_client_kwargs_paths()
+    assert "/api/v1/futures/trade/place_order" in paths
+    assert "/api/v1/futures/trade/modify_order" in paths
 
 
 def test_checker_implements_every_in_scope_endpoint():
@@ -152,6 +182,38 @@ def test_checker_fails_on_a_deliberately_broken_parameter(tmp_path):
     assert out.returncode == 1, "the checker did not fail on a broken param"
     assert "MISSING-REQUIRED" in out.stdout
     assert "symbol" in out.stdout
+
+
+def test_checker_fails_when_a_documented_optional_param_is_unreachable(tmp_path):
+    """Optional params are coverage-checked too: renaming a documented
+    optional field away from the client must fail the build."""
+    src = open(CLIENT, encoding="utf-8").read()
+    broken = src.replace(
+        '"orderId": order_id, "positionId": position_id})',
+        '"orderId": order_id, "positionX": position_id})')
+    assert broken != src, "the anchor text moved; update this test"
+
+    fake_root = tmp_path / "repo"
+    (fake_root / "jrock" / "trader").mkdir(parents=True)
+    (fake_root / "docs").mkdir()
+    (fake_root / "jrock" / "trader" / "client.py").write_text(broken)
+    (fake_root / "docs" / "bitunix_api_contract.json").write_text(
+        open(CONTRACT, encoding="utf-8").read())
+
+    script = open(CHECKER, encoding="utf-8").read()
+    script = script.replace(
+        'ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))',
+        f'ROOT = {str(fake_root)!r}')
+    path = tmp_path / "checker.py"
+    path.write_text(script)
+
+    out = subprocess.run([sys.executable, str(path), "--strict"],
+                         capture_output=True, text=True)
+    assert out.returncode == 1, "the checker did not fail on an unreachable optional param"
+    # a rename shows up twice: undocumented extra (positionX) and the
+    # documented param with no route through code (positionId)
+    assert "DOCUMENTED PARAMS WITH NO ROUTE THROUGH CODE" in out.stdout
+    assert "positionId" in out.stdout
 
 
 def test_checker_parses_the_client_without_network():

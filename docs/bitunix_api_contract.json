@@ -1,6 +1,6 @@
 {
   "source": "https://www.bitunix.com/api-docs/futures/",
-  "generated_at": "2026-11-07T07:09:11Z",
+  "generated_at": "2026-11-10T16:59:35Z",
   "endpoint_count": 54,
   "endpoints": [
     {
@@ -14,7 +14,7 @@
       "request_params": [],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/log/change_log.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.account.adjust_position_margin",
@@ -58,7 +58,7 @@
       ],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/account/adjust_position_margin.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.account.change_leverage",
@@ -106,7 +106,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/account/change_leverage.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.account.change_margin_mode",
@@ -154,7 +154,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/account/change_margin_mode.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.account.change_position_mode",
@@ -180,7 +180,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/account/change_position_mode.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.account.get_leverage_and_margin_mode",
@@ -227,7 +227,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/account/get_leverage_and_margin_mode.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.account.get_position_mode",
@@ -261,7 +261,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/account/get_position_mode.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.account.get_single_account",
@@ -327,7 +327,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/account/get_single_account.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.account.get_trading_settings",
@@ -393,7 +393,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/account/get_trading_settings.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.common.introduction",
@@ -406,7 +406,7 @@
       "request_params": [],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/common/introduction.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.common.sign",
@@ -419,7 +419,7 @@
       "request_params": [],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/common/sign.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.copyTrading.asset.asset_query",
@@ -443,7 +443,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/copyTrading/asset/asset_query.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.copyTrading.asset.transfer_asset_from_main_account_to_sub_account",
@@ -469,7 +469,7 @@
       ],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/copyTrading/asset/transfer_asset_from_main_account_to_sub_account.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.copyTrading.asset.transfer_asset_from_subaccount_to_main_account",
@@ -495,7 +495,7 @@
       ],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/copyTrading/asset/transfer_asset_from_subaccount_to_main_account.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.ErrorCode.error_code",
@@ -508,7 +508,7 @@
       "request_params": [],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/ErrorCode/error_code.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.market.get_depth",
@@ -555,7 +555,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/market/get_depth.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.market.get_funding_rate_batch",
@@ -614,7 +614,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/market/get_funding_rate_batch.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.market.get_funding_rate_history",
@@ -668,7 +668,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/market/get_funding_rate_history.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.market.get_funding_rate",
@@ -734,7 +734,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/market/get_funding_rate.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.market.get_kline",
@@ -814,7 +814,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/market/get_kline.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.market.get_tickers",
@@ -880,7 +880,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/market/get_tickers.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.market.get_trading_pairs",
@@ -1006,7 +1006,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/market/get_trading_pairs.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.position.get_history_positions",
@@ -1158,7 +1158,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/position/get_history_positions.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.position.get_pending_positions",
@@ -1292,7 +1292,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/position/get_pending_positions.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.position.get_position_tiers",
@@ -1343,7 +1343,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/position/get_position_tiers.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.tp_sl.cancel_tp_sl_order",
@@ -1375,7 +1375,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/tp_sl/cancel_tp_sl_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.tp_sl.get_history_tp_sl_order",
@@ -1532,7 +1532,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/tp_sl/get_history_tp_sl_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.tp_sl.get_pending_tp_sl_order",
@@ -1658,7 +1658,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/tp_sl/get_pending_tp_sl_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.tp_sl.modify_position_tp_sl_order",
@@ -1714,7 +1714,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/tp_sl/modify_position_tp_sl_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.tp_sl.modify_tp_sl_order",
@@ -1800,7 +1800,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/tp_sl/modify_tp_sl_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.tp_sl.place_position_tp_sl_order",
@@ -1856,7 +1856,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/tp_sl/place_position_tp_sl_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.tp_sl.place_tp_sl_order",
@@ -1948,7 +1948,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/tp_sl/place_tp_sl_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.batch_order",
@@ -2112,7 +2112,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/batch_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.cancel_all_orders",
@@ -2173,7 +2173,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/cancel_all_orders.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.cancel_orders",
@@ -2252,7 +2252,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/cancel_orders.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.close_all_position",
@@ -2272,7 +2272,7 @@
       ],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/close_all_position.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.flash_close_position",
@@ -2298,7 +2298,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/flash_close_position.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.get_history_orders",
@@ -2524,7 +2524,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/get_history_orders.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.get_history_trades",
@@ -2676,7 +2676,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/get_history_trades.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.get_order_detail",
@@ -2833,7 +2833,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/get_order_detail.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.get_pending_orders",
@@ -3036,7 +3036,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/get_pending_orders.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.modify_order",
@@ -3133,7 +3133,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/modify_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.trade.place_order",
@@ -3266,7 +3266,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/trade/place_order.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.prepare.WebSocket",
@@ -3376,7 +3376,7 @@
       ],
       "response_fields": [],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/prepare/WebSocket.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.private.Balance%20Channel",
@@ -3450,7 +3450,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/private/Balance%20Channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.private.Order%20Channel",
@@ -3609,7 +3609,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/private/Order%20Channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.private.Position%20Channel",
@@ -3708,7 +3708,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/private/Position%20Channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.private.Tp%20Sl%20Channel",
@@ -3837,7 +3837,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/private/Tp%20Sl%20Channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.public.depth%20channel",
@@ -3906,7 +3906,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/public/depth%20channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.public.kline%20channel",
@@ -3995,7 +3995,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/public/kline%20channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.public.MarketPrice%20Channel",
@@ -4079,7 +4079,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/public/MarketPrice%20Channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.public.Ticker%20Channel",
@@ -4178,7 +4178,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/public/Ticker%20Channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.public.Tickers%20Channel",
@@ -4292,7 +4292,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/public/Tickers%20Channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     },
     {
       "id": ".api-docs.futures.websocket.public.Trade%20Channel",
@@ -4371,7 +4371,7 @@
         }
       ],
       "source_url": "https://www.bitunix.com/api-docs/futures/websocket/public/Trade%20Channel.html",
-      "fetched_at": "2026-11-07T07:09:11Z"
+      "fetched_at": "2026-11-10T16:59:35Z"
     }
   ]
 }
