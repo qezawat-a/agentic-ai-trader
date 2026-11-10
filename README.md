@@ -301,11 +301,11 @@ transmitting a malformed request:
 | `symbol` | must exist in the live `trading_pairs` list (else: closest matches) |
 | `side` | `BUY` \| `SELL` (case-normalized) |
 | `orderType` | `LIMIT` \| `MARKET` (case-normalized) |
-| `tradeSide` | `OPEN` \| `CLOSE` (case-normalized) |
+| `tradeSide` | `OPEN` \| `CLOSE` (case-normalized). **Omitted in one-way mode** — the docs say it is "only required in hedge-mode" |
 | `effect` | `GTC` \| `IOC` \| `FOK` \| `POST_ONLY`, LIMIT only |
 | `qty` | string, `>= minTradeVolume`, `<= maxMarketOrderVolume`, formatted to `basePrecision` |
 | `price` | string, required for LIMIT, **absent** for MARKET, formatted to `quotePrecision` |
-| `positionId` | required when `tradeSide == CLOSE` |
+| `positionId` | required when `tradeSide == CLOSE`; never sent without `tradeSide` |
 | `reduceOnly` | boolean |
 | `tpPrice`/`slPrice` | strings formatted to `quotePrecision` |
 | `clientId` | alphanumeric, ≤ 32 chars |

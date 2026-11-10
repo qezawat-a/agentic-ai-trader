@@ -371,3 +371,212 @@ def test_funding_history_sends_limit_not_page():
     params = calls[0]["params"]
     assert params["limit"] == 25
     assert "page" not in params and "pageSize" not in params
+
+
+# ==================================================== 2026-11-10 second audit
+# Live probes against fapi.bitunix.com returned {"code":404} for every path
+# below, and the official pages do not contain them. They were removed rather
+# than kept as "maybe it works" wrappers.
+REMOVED_PATHS = (
+    "/api/v1/futures/market/ticker",
+    "/api/v1/futures/market/time",
+    "/api/v1/futures/market/change_log",
+    "/api/v1/futures/account/accounts",
+    "/api/v1/futures/copyTrading/asset/query",
+)
+
+
+def test_removed_404_endpoints_are_gone_from_the_client():
+    for name in ("get_ticker", "get_accounts", "change_log"):
+        assert not hasattr(BitunixClient, name), f"{name} calls a 404 endpoint"
+
+
+def test_no_removed_path_survives_in_the_client():
+    import inspect
+
+    src = inspect.getsource(__import__("jrock.trader.client", fromlist=["x"]))
+    for path in REMOVED_PATHS:
+        assert f'"{path}"' not in src, f"invented endpoint {path} is still in the client"
+
+
+def test_removed_endpoints_are_gone_from_the_api_reference():
+    from jrock.trader import api_reference as ar
+
+    assert "change_log" not in ar.ENDPOINTS
+    assert "get_accounts" not in ar.ENDPOINTS
+    assert "get_ticker" not in ar.ENDPOINTS
+    for ep in ar.ENDPOINTS.values():
+        assert ep.path not in REMOVED_PATHS, f"{ep.name} points at a 404 path"
+
+
+def test_asset_query_uses_the_official_copy_trading_path():
+    """Official: GET /api/v1/cp/asset/query, no parameters."""
+    c, calls = _client()
+    asyncio.run(c.asset_query())
+    assert calls[0]["path"] == "/api/v1/cp/asset/query"
+    assert not calls[0]["params"]
+
+    from jrock.trader import api_reference as ar
+
+    ep = ar.ENDPOINTS["asset_query"]
+    assert ep.path == "/api/v1/cp/asset/query"
+    assert ep.params == []
+
+
+def test_sync_time_uses_the_documented_ws_ping(monkeypatch):
+    """There is no REST server-time endpoint; the public WS ping is the clock.
+
+    The live socket sends the `connect` ack BEFORE the pong, so the first
+    frame is the ack - sync_time must handle that, not read one frame and give
+    up (a silent no-op is exactly the bug this replaced).
+    """
+    import json
+    import time
+    import websockets
+
+    from jrock.trader.client import BitunixConfig
+
+    c = BitunixClient(BitunixConfig())
+    sent: list[str] = []
+    server_seconds = 1_800_000_000
+    server_ms = server_seconds * 1000
+
+    class FakeWS:
+        def __init__(self):
+            self.frames = [
+                json.dumps({"op": "connect", "ts": server_ms,
+                            "data": {"result": True}}),
+                json.dumps({"op": "ping", "pong": server_seconds,
+                            "ping": server_seconds + 1}),
+            ]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def send(self, raw):
+            sent.append(raw)
+
+        async def recv(self):
+            return self.frames.pop(0)
+
+    def fake_connect(url, **kw):
+        assert url == "wss://fapi.bitunix.com/public/"
+        return FakeWS()
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    offset = asyncio.run(c.sync_time())
+
+    assert json.loads(sent[0])["op"] == "ping"
+    expected = server_ms - time.time() * 1000
+    assert abs(offset - expected) < 10_000, "offset must track the server clock"
+
+
+def test_sync_time_never_raises_and_keeps_the_old_offset(monkeypatch):
+    import websockets
+
+    from jrock.trader.client import BitunixConfig
+
+    c = BitunixClient(BitunixConfig())
+    c._time_offset_ms = 1234
+
+    def boom(url, **kw):
+        raise OSError("no route to host")
+
+    monkeypatch.setattr(websockets, "connect", boom)
+    assert asyncio.run(c.sync_time()) == 1234
+
+
+# ==================================================== api reference contract
+def test_api_reference_ws_channel_names_are_the_wire_names():
+    from jrock.trader import api_reference as ar
+
+    public = set(ar.WS_CHANNELS["public"])
+    assert {"price", "ticker", "tickers", "trade", "depth_books"} <= public
+    assert not {c for c in public if c.startswith("market_")
+                and c != "market_kline_<interval>"}
+    assert set(ar.WS_CHANNELS["private"]) == {"balance", "order", "position", "tpsl"}
+
+
+def test_api_reference_signature_rule_does_not_say_urlencode():
+    from jrock.trader import api_reference as ar
+
+    assert "sorted+urlencoded" not in ar.SIGNATURE_RULE
+    assert "key+value" in ar.SIGNATURE_RULE
+    assert "NO '='" in ar.SIGNATURE_RULE
+
+
+def test_api_reference_ws_login_orders_nonce_before_timestamp():
+    """Official samples: sha256(nonce + timestamp + apiKey), then + secretKey.
+
+    (The login *payload* lists apiKey/timestamp/nonce; the SIGNATURE preimage
+    order is nonce, timestamp, apiKey - the old reference had the sign order
+    wrong and no note about seconds.)
+    """
+    from jrock.trader import api_reference as ar
+
+    sign_line = next(ln for ln in ar.WS_LOGIN_RULE.splitlines() if "sha256(sha256" in ln)
+    assert sign_line.index("nonce") < sign_line.index("timestamp") < sign_line.index("apiKey")
+    assert "SECONDS" in ar.WS_LOGIN_RULE
+
+
+def test_api_reference_uses_skip_limit_for_every_paged_endpoint():
+    from jrock.trader import api_reference as ar
+
+    for name in ("get_pending_orders", "get_history_orders",
+                 "get_history_trades", "get_history_positions",
+                 "get_pending_tp_sl_order", "get_history_tp_sl_order"):
+        names = {p.name for p in ar.ENDPOINTS[name].params}
+        assert {"skip", "limit"} <= names, name
+        assert not {"page", "pageSize"} & names, name
+
+
+def test_api_reference_cancel_orders_requires_symbol():
+    from jrock.trader import api_reference as ar
+
+    names = {p.name: p for p in ar.ENDPOINTS["cancel_orders"].params}
+    assert names["symbol"].required and names["orderList"].required
+
+
+def test_api_reference_modify_order_requires_qty():
+    from jrock.trader import api_reference as ar
+
+    names = {p.name: p for p in ar.ENDPOINTS["modify_order"].params}
+    assert names["qty"].required, "qty is required by the docs"
+    assert not names["price"].required, "price is only required for LIMIT"
+    assert not names["orderId"].required and not names["clientId"].required
+
+
+def test_api_reference_rate_limits_match_the_docs():
+    from jrock.trader import api_reference as ar
+
+    assert ar.ENDPOINTS["flash_close_position"].rate_limit == "5 req/sec/uid"
+    assert ar.ENDPOINTS["close_all_position"].rate_limit == "1 req/sec/uid"
+    assert ar.ENDPOINTS["cancel_orders"].rate_limit == "10 req/sec/uid"
+    assert ar.ENDPOINTS["place_order"].rate_limit == "20 req/sec/uid"
+
+
+def test_api_reference_place_order_mentions_hedge_only_tradeside():
+    from jrock.trader import api_reference as ar
+
+    names = {p.name: p for p in ar.ENDPOINTS["place_order"].params}
+    assert "hedge" in names["tradeSide"].description.lower()
+
+
+# ==================================================== account equity
+def test_account_equity_sums_locked_margin_and_unrealized():
+    from jrock.account import account_equity
+
+    rows = [{"available": "100", "frozen": "5", "margin": "50",
+             "crossUnrealizedPNL": "10", "isolationUnrealizedPNL": "-2"}]
+    assert account_equity(rows) == 163.0
+
+
+def test_account_equity_accepts_a_single_row_dict_and_sums_coins():
+    from jrock.account import account_equity
+
+    assert account_equity({"available": "1", "margin": "2"}) == 3.0
+    assert account_equity([{"available": "1"}, {"available": "2"}]) == 3.0
+    assert account_equity(None) == 0.0

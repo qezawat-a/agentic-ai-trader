@@ -233,9 +233,12 @@ def test_paging_uses_skip_and_limit_not_page():
 
 
 def test_place_order_declares_the_official_required_set():
+    """tradeSide is documented as "Only required in hedge-mode", so it is not
+    part of the unconditional set: one-way accounts omit it (see build_order_body).
+    """
     from jrock.trader.client import BitunixClient
     assert set(BitunixClient.PLACE_ORDER_REQUIRED) == {
-        "symbol", "qty", "side", "tradeSide", "orderType"}
+        "symbol", "qty", "side", "orderType"}
 
 
 def test_modify_order_declares_the_official_required_set():

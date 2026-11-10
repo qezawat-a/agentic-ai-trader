@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..account import account_equity
 from ..config import Settings
 from ..store import Store
 from .account_tpsl import (AccountTpSlConfig, account_tpsl_decision,
@@ -138,7 +139,13 @@ class TraderEngine:
             api_key=settings.bitunix_api_key,
             api_secret=settings.bitunix_api_secret,
             base_url=settings.bitunix_base_url,
+            ws_public=settings.bitunix_ws_public,
         ))
+        # The exchange's real position mode, cached. `state.position_mode` is only
+        # the bot's intent: a rejected change_position_mode leaves them different,
+        # and the order body must follow what the exchange actually reports.
+        self._position_mode: str = ""
+        self._position_mode_ts: float = 0.0
         self.strategies = build_strategies()
         self.rules: dict[str, PairRules] = {}
         self.tiers: dict[str, list[Tier]] = {}
@@ -492,6 +499,64 @@ class TraderEngine:
         if side.upper() in ("LONG", "BUY"):
             return last * (1 - scope)
         return last * (1 + scope)
+
+    # ---------------------------------------------------------- position mode
+    POSITION_MODE_TTL = 300.0     # a successful read is good for 5 minutes
+    POSITION_MODE_FAIL_TTL = 30.0  # don't hammer a failing endpoint per order
+
+    async def account_position_mode(self) -> str:
+        """The exchange's real position mode: 'HEDGE', 'ONE_WAY', or ''.
+
+        `state.position_mode` is only what this bot *asked for* - a rejected
+        `change_position_mode` leaves the two different, and getting it wrong
+        changes the order body. So the exchange is the authority here, cached so
+        that placing an order does not cost a REST round trip.
+
+        '' means "unknown" (endpoint unreachable / unexpected payload) and the
+        caller must keep sending the hedge-mode fields, i.e. today's behaviour.
+        A failed read is cached for a shorter time so it recovers quickly.
+        """
+        now = time.time()
+        ttl = (self.POSITION_MODE_TTL if self._position_mode
+               else self.POSITION_MODE_FAIL_TTL)
+        if self._position_mode_ts and (now - self._position_mode_ts) < ttl:
+            return self._position_mode
+        try:
+            res = await self.client.get_position_mode()
+            data = res[0] if isinstance(res, list) and res else res
+            data = data if isinstance(data, dict) else {}
+            mode = str(data.get("positionMode") or "").strip().upper()
+            self._position_mode = mode if mode in ("HEDGE", "ONE_WAY") else ""
+        except Exception:  # noqa: BLE001 - unknown mode must not block trading
+            self._position_mode = ""
+        self._position_mode_ts = now
+        return self._position_mode
+
+    def _remember_position_mode(self, mode: str) -> None:
+        """Record a mode we just set, so the next order does not re-read it."""
+        mode = (mode or "").strip().upper()
+        if mode in ("HEDGE", "ONE_WAY"):
+            self._position_mode = mode
+            self._position_mode_ts = time.time()
+
+    async def _trade_side_fields(self, hedge_side: str,
+                                 position_id: str | None = None) -> dict:
+        """tradeSide/positionId, but only where the docs define them.
+
+        Official place_order: tradeSide is "Only required in hedge-mode", and
+        positionId only when tradeSide is CLOSE. In one-way mode both are
+        omitted; the position is identified by symbol + reduceOnly. The explicit
+        `tradeSide: None` matters: build_order_body's own default is "OPEN", so
+        merely not passing the keyword would still send it. Unknown mode keeps
+        the fields (never silently change a live order path we cannot verify).
+        """
+        mode = await self.account_position_mode()
+        if mode == "ONE_WAY":
+            return {"tradeSide": None}
+        fields: dict = {"tradeSide": hedge_side}
+        if position_id is not None:
+            fields["positionId"] = position_id
+        return fields
 
     def persist_positions(self) -> None:
         """Mirror the in-memory position-management state to the store.
@@ -1192,13 +1257,14 @@ class TraderEngine:
 
         try:
             body = build_order_body(
-                symbol=sym, qty=qty, side=order_side, tradeSide="OPEN",
+                symbol=sym, qty=qty, side=order_side,
                 orderType="MARKET", reduceOnly=False,
                 tpPrice=tp_for_order, tpStopType=trigger_type, tpOrderType="MARKET",
                 slPrice=plan.sl, slStopType=trigger_type, slOrderType="MARKET",
                 rules=rules, known_symbols=set(self.rules) or None,
                 mark_price=mark, entry_price=price,
                 min_stop_ticks=self.s.tpsl_min_stop_ticks,
+                **await self._trade_side_fields("OPEN"),
             )
         except OrderValidationError as e:
             self.state.errors.append(f"order validation {sym}: {e}")
@@ -1408,9 +1474,10 @@ class TraderEngine:
         close_side = "SELL" if st.side.upper() in ("LONG", "BUY") else "BUY"
         try:
             body = build_order_body(
-                symbol=sym, qty=qty, side=close_side, tradeSide="CLOSE",
-                positionId=pid, orderType="MARKET", reduceOnly=True,
+                symbol=sym, qty=qty, side=close_side,
+                orderType="MARKET", reduceOnly=True,
                 rules=rules, known_symbols=set(self.rules) or None,
+                **await self._trade_side_fields("CLOSE", position_id=pid),
             )
             await self.client.place_order(**body)
         except (BitunixAPIError, OrderValidationError, ValueError) as e:
@@ -1564,9 +1631,10 @@ class TraderEngine:
             total_pnl = total_unrealized_pnl(positions)
             equity = 0.0
             try:
-                acct = await self.client.get_single_account()
-                a = acct[0] if isinstance(acct, list) and acct else (acct or {})
-                equity = float(a.get("available", 0) or 0)
+                # Total account equity, NOT just `available`: `available` already
+                # excludes the margin locked by open positions, so using it alone
+                # makes an x%-of-equity threshold fire far too early.
+                equity = account_equity(await self.client.get_single_account())
             except (BitunixAPIError, TypeError, ValueError):
                 equity = 0.0
             decision = account_tpsl_decision(total_pnl=total_pnl, equity=equity,
@@ -1803,10 +1871,10 @@ class TraderEngine:
                             close_body = build_order_body(
                                 symbol=sym, qty=part,
                                 side="SELL" if side.upper() == "LONG" else "BUY",
-                                tradeSide="CLOSE", positionId=pid,
                                 orderType="MARKET", reduceOnly=True,
                                 rules=self.rules.get(sym),
                                 known_symbols=set(self.rules) or None,
+                                **await self._trade_side_fields("CLOSE", position_id=pid),
                             )
                             await self.client.place_order(**close_body)
                             actions.append({"action": "partial_close", "symbol": sym,
@@ -2229,7 +2297,12 @@ class TraderEngine:
                 try:
                     await self.client.change_position_mode(val)
                 except BitunixAPIError as e:
+                    # The bot's intent changed, the exchange's did not. Drop the
+                    # cache so the next order re-reads the real mode.
+                    self._position_mode = ""
+                    self._position_mode_ts = 0.0
                     return f"Position mode set locally to {val}, exchange said: {e}"
+                self._remember_position_mode(val)
                 return f"Position mode = {val}."
             return "Usage: Position mode HEDGE|ONE_WAY"
         if low.startswith("symbols") or low.startswith("symbol "):

@@ -72,6 +72,25 @@ class MarginAccount:
         )
 
 
+def account_equity(data: Any) -> float:
+    """Total equity from a `GET /api/v1/futures/account` response.
+
+    The endpoint returns a LIST of margin-coin rows. Each row's equity is
+    `available + frozen + margin + crossUnrealizedPNL + isolationUnrealizedPNL`
+    (see `MarginAccount.equity`); rows are summed so the helper stays correct if
+    more than one margin coin is ever returned.
+
+    Why it matters: `available` alone excludes the margin locked by open
+    positions, so a percentage-of-equity threshold computed from it fires far
+    too early. Account TP/SL must measure the whole account.
+
+    Accepts a list, a single row dict, or None; never raises.
+    """
+    rows = data if isinstance(data, list) else [data]
+    return sum(MarginAccount.from_api(r).equity for r in rows
+               if isinstance(r, dict))
+
+
 @dataclass
 class BalanceReport:
     accounts: list[MarginAccount] = field(default_factory=list)

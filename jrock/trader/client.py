@@ -108,6 +108,9 @@ class BitunixConfig:
     api_key: str = ""
     api_secret: str = ""
     base_url: str = "https://fapi.bitunix.com"
+    # Used only by sync_time(): the public socket is the only documented way to
+    # read the exchange clock (there is no REST server-time endpoint).
+    ws_public: str = "wss://fapi.bitunix.com/public/"
     language: str = "en-US"
     timeout: float = 20.0
     max_retries: int = 3
@@ -234,29 +237,56 @@ class BitunixClient:
         raise BitunixAPIError(10001, f"Network error after {self.cfg.max_retries} attempts: {last_err}")
 
     async def sync_time(self) -> int:
-        """Align local clock with the exchange (error 10011 guard)."""
-        await self.start()
-        assert self._session is not None
+        """Align the local clock with the exchange (error 10011 guard).
+
+        There is NO REST server-time endpoint on fapi (every candidate path
+        returns `{"code":404}`, verified live 2026-11-07). The documented clock
+        source is the public WebSocket:
+
+            -> {"op": "ping", "ping": <unix SECONDS>}
+            <- {"op": "ping", "pong": <echo>, "ping": <server unix SECONDS>}
+
+        The socket also greets every connection with
+        `{"op":"connect","ts":<server ms>,"data":{"result":true}}` BEFORE it
+        answers the ping, so the first frame received is normally the ack. Both
+        frames carry the server clock (`ts` in milliseconds, the pong's `ping`
+        in seconds); whichever arrives first is used.
+
+        Never raises: this runs on the error-retry path, so a socket failure
+        must leave the previous offset in place rather than break the request.
+        """
+        try:
+            import websockets
+        except Exception:  # pragma: no cover - websockets is a hard requirement
+            return self._time_offset_ms
         t0 = time.time() * 1000
-        async with self._session.get(f"{self.cfg.base_url}/api/v1/futures/market/time") as r:
-            if r.status == 200:
-                d = await r.json()
-                server = d.get("data")
-                if isinstance(server, dict):
-                    server = server.get("serverTime") or server.get("time")
-                if server:
-                    t1 = time.time() * 1000
-                    self._time_offset_ms = int(float(server) - (t0 + t1) / 2)
+        deadline = time.monotonic() + 5.0
+        server_ms: float | None = None
+        try:
+            async with websockets.connect(self.cfg.ws_public,
+                                          open_timeout=5, close_timeout=2) as ws:
+                await ws.send(json.dumps({"op": "ping", "ping": int(t0 // 1000)}))
+                while server_ms is None:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=left))
+                    if msg.get("ping"):
+                        server_ms = float(msg["ping"]) * 1000   # pong: SECONDS
+                    elif msg.get("ts"):
+                        server_ms = float(msg["ts"])            # ack/push: MILLISECONDS
+        except Exception:  # noqa: BLE001 - best effort, keep the old offset
+            return self._time_offset_ms
+        t1 = time.time() * 1000
+        if server_ms is None:
+            return self._time_offset_ms
+        self._time_offset_ms = int(server_ms - (t0 + t1) / 2)
         return self._time_offset_ms
 
     # ============================================================ MARKET (public)
     async def get_tickers(self, symbols: str | None = None) -> Any:
         return await self.request("GET", "/api/v1/futures/market/tickers",
                                   params={"symbols": symbols}, signed=False)
-
-    async def get_ticker(self, symbol: str) -> Any:
-        return await self.request("GET", "/api/v1/futures/market/ticker",
-                                  params={"symbol": symbol}, signed=False)
 
     async def get_depth(self, symbol: str, limit: int = 15) -> Any:
         return await self.request("GET", "/api/v1/futures/market/depth",
@@ -334,9 +364,6 @@ class BitunixClient:
         return [r for r in (rows or [])
                 if str(r.get("symbol", "")).upper() in want]
 
-    async def get_accounts(self) -> Any:
-        return await self.request("GET", "/api/v1/futures/account/accounts")
-
     async def change_leverage(self, symbol: str, leverage: int, margin_coin: str = "USDT") -> Any:
         return await self.request("POST", "/api/v1/futures/account/change_leverage",
                                   body={"symbol": symbol, "leverage": int(leverage),
@@ -412,9 +439,15 @@ class BitunixClient:
         return await self.request("POST", "/api/v1/futures/account/adjust_position_margin",
                                   body=body)
 
-    async def asset_query(self, margin_coin: str = "USDT") -> Any:
-        return await self.request("GET", "/api/v1/futures/copyTrading/asset/query",
-                                  params={"marginCoin": margin_coin})
+    async def asset_query(self) -> Any:
+        """Copy-trading asset query.
+
+        Official: GET /api/v1/cp/asset/query - NO request parameters.
+        The old `/api/v1/futures/copyTrading/asset/query` (with a `marginCoin`
+        parameter) is not a real endpoint; it returns `{"code":404}` live.
+        Response: {"available": "...", "maxTransfer": "..."}.
+        """
+        return await self.request("GET", "/api/v1/cp/asset/query")
 
     # ============================================================ POSITION
     async def get_pending_positions(self, symbol: str | None = None,
@@ -438,16 +471,18 @@ class BitunixClient:
     # ============================================================ TRADE
     # Official required params for place_order, from the docs. Validated here so
     # a malformed order is refused locally instead of costing a round trip.
-    PLACE_ORDER_REQUIRED = ("symbol", "qty", "side", "tradeSide", "orderType")
+    # tradeSide is NOT in the set: the docs say it is "only required in
+    # hedge-mode", so one-way accounts omit it (see build_order_body).
+    PLACE_ORDER_REQUIRED = ("symbol", "qty", "side", "orderType")
     MODIFY_ORDER_REQUIRED = ("qty", "price")
 
     async def place_order(self, **kwargs) -> Any:
         """Place an order.
 
-        Official required: symbol, qty, side, tradeSide, orderType.
-        Optional: price, positionId, effect, clientId, reduceOnly, and the
-        tp*/sl* family. The body is passed through verbatim, but the required
-        set is checked first.
+        Official required: symbol, qty, side, orderType. tradeSide is required
+        only in hedge mode. Optional: price, positionId, effect, clientId,
+        reduceOnly, and the tp*/sl* family. The body is passed through verbatim,
+        but the required set is checked first.
         """
         missing = [k for k in self.PLACE_ORDER_REQUIRED if not kwargs.get(k)]
         if missing:
@@ -719,9 +754,6 @@ class BitunixClient:
                                           "skip": skip, "limit": limit})
 
     # ============================================================ misc
-    async def change_log(self) -> Any:
-        return await self.request("GET", "/api/v1/futures/market/change_log", signed=False)
-
     async def ping(self) -> bool:
         try:
             await self.get_tickers()

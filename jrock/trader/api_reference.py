@@ -60,16 +60,13 @@ def _add(ep: Endpoint) -> None:
 
 # ------------------------------------------------------------------ market
 _add(Endpoint("get_tickers", "GET", "/api/v1/futures/market/tickers", False,
-              "10 req/sec/ip", "All tickers or a symbol list",
+              "10 req/sec/ip", "All tickers or a symbol list (includes markPrice)",
               [_p("symbols", "string", False, "BTCUSDT,ETHUSDT")], "get_tickers.md"))
-_add(Endpoint("get_ticker", "GET", "/api/v1/futures/market/ticker", False,
-              "10 req/sec/ip", "Single ticker",
-              [_p("symbol", "string", True)], "get_tickers.md"))
 _add(Endpoint("get_depth", "GET", "/api/v1/futures/market/depth", False,
               "10 req/sec/ip", "Order book depth",
               [_p("symbol", "string", True), _p("limit", "int", False, "default 15")], "get_depth.md"))
 _add(Endpoint("get_kline", "GET", "/api/v1/futures/market/kline", False,
-              "10 req/sec/ip", "Klines (closed candles only)",
+              "10 req/sec/ip", "Klines (closed candles only; startTime is NOT supported)",
               [_p("symbol", "string", True), _p("interval", "string", True,
                                                 "1m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M"),
                _p("limit", "int", False, "default 100, max 200"),
@@ -82,7 +79,7 @@ _add(Endpoint("get_funding_rate", "GET", "/api/v1/futures/market/funding_rate", 
               "10 req/sec/ip", "Current funding rate", [_p("symbol", "string", True)],
               "funding_rate.md"))
 _add(Endpoint("get_funding_rate_batch", "GET", "/api/v1/futures/market/funding_rate/batch", False,
-              "10 req/sec/ip", "Funding rates for many symbols",
+              "10 req/sec/ip", "Funding rates for many symbols (server ignores `symbols`; filter locally)",
               [_p("symbols", "string", False)], "funding_rate_batch.md"))
 _add(Endpoint("get_funding_rate_history", "GET",
               "/api/v1/futures/market/get_funding_rate_history",
@@ -91,15 +88,11 @@ _add(Endpoint("get_funding_rate_history", "GET",
                _p("endTime", "int64", False),
                _p("limit", "int", False, "default 100, max 200")],
               "funding_rate_history.md"))
-_add(Endpoint("change_log", "GET", "/api/v1/futures/market/change_log", False,
-              "10 req/sec/ip", "API changelog", [], "change_log.md"))
 
 # ------------------------------------------------------------------ account
 _add(Endpoint("get_single_account", "GET", "/api/v1/futures/account", True,
-              "10 req/sec/uid", "Account for one margin coin",
+              "10 req/sec/uid", "Account for one margin coin (list, one row per coin)",
               [_p("marginCoin", "string", True, "USDT")], "get_single_account.md"))
-_add(Endpoint("get_accounts", "GET", "/api/v1/futures/account/accounts", True,
-              "10 req/sec/uid", "All margin-coin accounts", [], "get_single_account.md"))
 _add(Endpoint("change_leverage", "POST", "/api/v1/futures/account/change_leverage", True,
               "10 req/sec/uid", "Set leverage for a symbol",
               [_p("marginCoin", "string", True), _p("symbol", "string", True),
@@ -132,20 +125,24 @@ _add(Endpoint("adjust_position_margin", "POST",
                _p("side", "string", False, "LONG | SHORT"),
                _p("positionId", "string", False)],
               "adjust_position_margin.md"))
-_add(Endpoint("asset_query", "GET", "/api/v1/futures/copyTrading/asset/query", True,
-              "10 req/sec/uid", "Copy-trading asset query",
-              [_p("marginCoin", "string", False)], "asset_query.md"))
+_add(Endpoint("asset_query", "GET", "/api/v1/cp/asset/query", True,
+              "10 req/sec/uid", "Copy-trading asset query (no request parameters)",
+              [], "asset_query.md"))
 
 # ------------------------------------------------------------------ position
 _add(Endpoint("get_pending_positions", "GET", "/api/v1/futures/position/get_pending_positions",
               True, "10 req/sec/uid", "Open positions",
-              [_p("symbol", "string", False), _p("positionId", "string", False)],
+              [_p("symbol", "string", False), _p("positionId", "string", False),
+               _p("subAccountId", "int64", False), _p("includeSubAccounts", "bool", False)],
               "get_pending_positions.md"))
 _add(Endpoint("get_history_positions", "GET", "/api/v1/futures/position/get_history_positions",
               True, "10 req/sec/uid", "Closed positions",
-              [_p("symbol", "string", False), _p("page", "int", False),
-               _p("pageSize", "int", False), _p("startTime", "int64", False),
-               _p("endTime", "int64", False)], "Position_history.md"))
+              [_p("symbol", "string", False), _p("positionId", "string", False),
+               _p("startTime", "int64", False),
+               _p("endTime", "int64", False),
+               _p("skip", "int64", False, "default 0"),
+               _p("limit", "int64", False, "default 10, max 100"),
+               _p("subAccountId", "int64", False)], "Position_history.md"))
 _add(Endpoint("get_position_tiers", "GET", "/api/v1/futures/position/get_position_tiers", False,
               "10 req/sec/ip", "Risk tiers + maintenance margin rate",
               [_p("symbol", "string", True)], "get_position_tiers.md"))
@@ -155,7 +152,8 @@ _add(Endpoint("place_order", "POST", "/api/v1/futures/trade/place_order", True,
               "20 req/sec/uid", "Place an order (qty is BASE COIN)",
               [_p("symbol", "string", True), _p("qty", "string", True, "base coin amount"),
                _p("side", "string", True, "BUY | SELL"),
-               _p("tradeSide", "string", True, "OPEN | CLOSE (required in hedge mode)"),
+               _p("tradeSide", "string", False,
+                  "OPEN | CLOSE - only required in hedge mode; omit in one-way"),
                _p("orderType", "string", True, "LIMIT | MARKET"),
                _p("price", "string", False, "required for LIMIT"),
                _p("positionId", "string", False, "required when tradeSide=CLOSE"),
@@ -173,38 +171,61 @@ _add(Endpoint("batch_order", "POST", "/api/v1/futures/trade/batch_order", True,
               [_p("symbol", "string", True), _p("orderList", "array", True)],
               "batch_order.md"))
 _add(Endpoint("cancel_orders", "POST", "/api/v1/futures/trade/cancel_orders", True,
-              "20 req/sec/uid", "Cancel specific orders",
-              [_p("orderList", "array", True)], "cancel_orders.md"))
+              "10 req/sec/uid", "Cancel specific orders (symbol REQUIRED; orderId or clientId per item)",
+              [_p("symbol", "string", True), _p("orderList", "array", True)],
+              "cancel_orders.md"))
 _add(Endpoint("cancel_all_orders", "POST", "/api/v1/futures/trade/cancel_all_orders", True,
               "20 req/sec/uid", "Cancel all open orders",
               [_p("symbol", "string", False)], "cancel_all_orders.md"))
 _add(Endpoint("modify_order", "POST", "/api/v1/futures/trade/modify_order", True,
-              "20 req/sec/uid", "Modify a pending order",
-              [_p("orderId", "string", True), _p("symbol", "string", True),
-               _p("price", "string", False), _p("qty", "string", False)], "modify_order.md"))
+              "20 req/sec/uid", "Modify a pending order (orderId or clientId required)",
+              [_p("orderId", "string", False), _p("clientId", "string", False),
+               _p("qty", "string", True, "amount (base coin)"),
+               _p("price", "string", False, "required for LIMIT"),
+               _p("tpPrice", "string", False), _p("tpStopType", "string", False),
+               _p("tpOrderType", "string", False), _p("tpOrderPrice", "string", False),
+               _p("slPrice", "string", False), _p("slStopType", "string", False),
+               _p("slOrderType", "string", False), _p("slOrderPrice", "string", False)],
+              "modify_order.md"))
 _add(Endpoint("get_pending_orders", "GET", "/api/v1/futures/trade/get_pending_orders", True,
               "10 req/sec/uid", "Open orders",
-              [_p("symbol", "string", False), _p("page", "int", False),
-               _p("pageSize", "int", False)], "get_pending_orders.md"))
+              [_p("symbol", "string", False), _p("orderId", "string", False),
+               _p("clientId", "string", False),
+               _p("status", "string", False, "NEW | PART_FILLED"),
+               _p("startTime", "int64", False), _p("endTime", "int64", False),
+               _p("skip", "int64", False, "default 0"),
+               _p("limit", "int64", False, "default 10, max 100")],
+              "get_pending_orders.md"))
 _add(Endpoint("get_history_orders", "GET", "/api/v1/futures/trade/get_history_orders", True,
               "10 req/sec/uid", "Order history",
-              [_p("symbol", "string", False), _p("page", "int", False),
-               _p("pageSize", "int", False), _p("startTime", "int64", False),
-               _p("endTime", "int64", False)], "get_history_orders.md"))
+              [_p("symbol", "string", False), _p("orderId", "string", False),
+               _p("clientId", "string", False),
+               _p("status", "string", False,
+                  "FILLED | CANCELED | PART_FILLED_CANCELED | EXPIRED"),
+               _p("type", "string", False, "LIMIT | MARKET"),
+               _p("startTime", "int64", False), _p("endTime", "int64", False),
+               _p("skip", "int64", False, "default 0"),
+               _p("limit", "int64", False, "default 10, max 100"),
+               _p("subAccountId", "int64", False),
+               _p("queryCanceled", "boolean", False, "true = canceled only (3d range)")],
+              "get_history_orders.md"))
 _add(Endpoint("get_order_detail", "GET", "/api/v1/futures/trade/get_order_detail", True,
-              "10 req/sec/uid", "One order by id",
+              "10 req/sec/uid", "One order by id (orderId OR clientId required)",
               [_p("orderId", "string", False), _p("clientId", "string", False)],
               "get_order_detail.md"))
 _add(Endpoint("get_history_trades", "GET", "/api/v1/futures/trade/get_history_trades", True,
               "10 req/sec/uid", "Fill history",
-              [_p("symbol", "string", False), _p("page", "int", False),
-               _p("pageSize", "int", False), _p("startTime", "int64", False),
-               _p("endTime", "int64", False)], "get_history_trades.md"))
+              [_p("symbol", "string", False), _p("orderId", "string", False),
+               _p("positionId", "string", False),
+               _p("startTime", "int64", False), _p("endTime", "int64", False),
+               _p("skip", "int64", False, "default 0"),
+               _p("limit", "int64", False, "default 10, max 100")],
+              "get_history_trades.md"))
 _add(Endpoint("close_all_position", "POST", "/api/v1/futures/trade/close_all_position", True,
-              "20 req/sec/uid", "Close all positions (market)",
+              "1 req/sec/uid", "Close all positions (market)",
               [_p("symbol", "string", False)], "close_all_position.md"))
 _add(Endpoint("flash_close_position", "POST", "/api/v1/futures/trade/flash_close_position", True,
-              "20 req/sec/uid", "Close one position at market",
+              "5 req/sec/uid", "Close one position at market",
               [_p("positionId", "string", True)], "flash_close_position.md"))
 
 # ------------------------------------------------------------------ tp/sl
@@ -258,14 +279,19 @@ _add(Endpoint("get_history_tp_sl_order", "GET", "/api/v1/futures/tpsl/get_histor
                _p("limit", "int64", False)], "get_history_tp_sl_order.md"))
 
 # ------------------------------------------------------------------ websocket
+#: Names are exact wire strings: the server happily ACKs a wrong channel name
+#: ({"op":"connect","data":{"result":true}}) and then never pushes anything.
 WS_CHANNELS = {
     "public": {
-        "depth_books": "order book depth",
-        "market_kline_<interval>": "kline, e.g. market_kline_1min / market_kline_15min",
-        "market_price": "last price",
-        "market_ticker": "single ticker",
-        "market_tickers": "all tickers",
-        "market_trade": "trades",
+        "price": "market price (mp), index price (ip), funding rate (fr)",
+        "ticker": "one symbol, 24h rolling stats",
+        "tickers": "all symbols, aggregated",
+        "trade": "public trades",
+        "depth_books": "full depth snapshot, then deltas",
+        "depth_book1/5/15": "N-level depth",
+        "market_kline_<interval>": ("kline; suffixes 1min 3min 5min 15min 30min 60min "
+                                    "2h 4h 6h 8h 12h 1day 3day 1week 1month "
+                                    "(1h is 60min, never '1hour')"),
     },
     "private": {
         "balance": "account balance updates",
@@ -276,15 +302,20 @@ WS_CHANNELS = {
 }
 
 SIGNATURE_RULE = (
+    "REST (timestamp in MILLISECONDS):\n"
     "message = nonce + timestamp + apiKey + queryString + body\n"
     "digest  = sha256(message)\n"
     "sign    = sha256(digest + secretKey)\n"
     "headers: api-key, sign, nonce, timestamp, language, Content-Type\n"
-    "body must be compact JSON with sorted keys; queryString must be sorted+urlencoded"
+    "queryString = sorted-by-key 'key+value' concatenation, NO '=' and NO '&'\n"
+    "body        = compact JSON, keys sorted, identical to the bytes sent\n"
+    "urlencoding the query for signing is the #1 cause of error 10007"
 )
 
 WS_LOGIN_RULE = (
-    "sign = sha256(sha256(timestamp + nonce + apiKey) + secretKey)  # timestamp in SECONDS"
+    "login args: {op:'login', args:[{apiKey, nonce, timestamp, sign}]}\n"
+    "sign = sha256(sha256(nonce + timestamp + apiKey) + secretKey)\n"
+    "order is nonce, then timestamp, then apiKey; timestamp in SECONDS; nonce < 64 chars"
 )
 
 

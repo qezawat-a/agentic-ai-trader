@@ -10,7 +10,7 @@ Official spec (docs/bitunix/place_order.md):
     qty         string  required  (base coin, formatted to basePrecision)
     price       string  optional  (required for LIMIT, absent for MARKET)
     side        string  required  BUY | SELL
-    tradeSide   string  required  OPEN | CLOSE
+    tradeSide   string  optional  OPEN | CLOSE - "Only required in hedge-mode"
     positionId  string  optional  (required when tradeSide == CLOSE)
     orderType   string  required  LIMIT | MARKET
     effect      string  optional  GTC | IOC | FOK | POST_ONLY (LIMIT only)
@@ -52,8 +52,8 @@ class OrderSpec:
     symbol: str
     qty: str
     side: str
-    tradeSide: str
     orderType: str
+    tradeSide: str | None = None
     price: str | None = None
     positionId: str | None = None
     effect: str | None = None
@@ -73,9 +73,13 @@ class OrderSpec:
             "symbol": self.symbol,
             "qty": self.qty,
             "side": self.side,
-            "tradeSide": self.tradeSide,
             "orderType": self.orderType,
         }
+        # tradeSide/positionId exist only in hedge mode. In one-way mode the
+        # official docs say tradeSide is not required, so it is omitted rather
+        # than sent as a field the exchange must ignore.
+        if self.tradeSide is not None:
+            body["tradeSide"] = self.tradeSide
         for k in ("price", "positionId", "effect", "clientId", "tpPrice",
                   "tpStopType", "tpOrderType", "tpOrderPrice", "slPrice",
                   "slStopType", "slOrderType", "slOrderPrice"):
@@ -113,7 +117,7 @@ def _check_str(value: Any, field: str) -> str:
 
 
 def build_order_body(*, symbol: str, qty: Any, side: str, orderType: str,
-                     tradeSide: str = "OPEN", price: Any = None,
+                     tradeSide: str | None = "OPEN", price: Any = None,
                      positionId: str | None = None, effect: str | None = None,
                      clientId: str | None = None, reduceOnly: bool | None = None,
                      tpPrice: Any = None, tpStopType: str | None = None,
@@ -139,7 +143,8 @@ def build_order_body(*, symbol: str, qty: Any, side: str, orderType: str,
     orderType = _norm(orderType)
     _check(orderType in ORDER_TYPES, "orderType", "LIMIT, MARKET")
     tradeSide = _norm(tradeSide)
-    _check(tradeSide in TRADE_SIDES, "tradeSide", "OPEN, CLOSE")
+    _check(tradeSide is None or tradeSide in TRADE_SIDES, "tradeSide",
+           "OPEN, CLOSE (or omit in one-way mode)")
     if effect is not None:
         effect = _norm(effect)
         _check(effect in EFFECTS, "effect", "GTC, IOC, FOK, POST_ONLY")
@@ -205,6 +210,14 @@ def build_order_body(*, symbol: str, qty: Any, side: str, orderType: str,
                 "order field 'effect' is only valid for LIMIT orders.")
 
     # --- tradeSide / positionId
+    #
+    # Official place_order: "tradeSide - Only required in hedge-mode" and
+    # "positionId - Only required when tradeSide is CLOSE". So tradeSide=None
+    # (one-way mode) means neither field is sent: the position is identified by
+    # the symbol (one position per symbol in one-way mode) plus reduceOnly.
+    if tradeSide is None and positionId is not None:
+        raise OrderValidationError(
+            "order field 'positionId' is only valid together with tradeSide.")
     if tradeSide == "CLOSE" and positionId is None:
         raise OrderValidationError(
             "order field 'positionId' is required when tradeSide == CLOSE.")

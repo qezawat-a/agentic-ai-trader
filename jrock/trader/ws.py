@@ -502,7 +502,11 @@ class MarketDataFeed:
         self.cache = cache if cache is not None else PriceCache()
         self.kline_cache = kline_cache
         self.latest_price: dict[str, float] = {}
-        self.latest_mark: dict[str, float] = {}
+        # The public `price` channel carries `mp` (market/last price) and `ip`
+        # (INDEX price). There is no mark price on this channel - mark price
+        # only comes from REST tickers (`markPrice`). Storing `ip` under a
+        # `latest_mark` name invited SL/TP code to use the wrong price.
+        self.latest_index: dict[str, float] = {}
         self.latest_funding: dict[str, float] = {}
         self.latest_kline: dict[tuple[str, str], dict] = {}
         self._wire()
@@ -531,7 +535,7 @@ class MarketDataFeed:
                 self.latest_price[sym] = px
                 self.cache.put_ws(sym, px, exchange_ts=(ev.ts / 1000.0) if ev.ts else 0.0)
             if d.get("ip"):
-                self.latest_mark[sym] = float(d["ip"])
+                self.latest_index[sym] = float(d["ip"])
             if d.get("fr"):
                 self.latest_funding[sym] = float(d["fr"])
         except (TypeError, ValueError):

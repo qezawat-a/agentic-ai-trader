@@ -36,7 +36,7 @@ def test_every_documented_endpoint_exists_on_client():
 
 def test_all_required_endpoints_present():
     required = {
-        "get_tickers", "change_log", "adjust_position_margin", "change_leverage",
+        "get_tickers", "adjust_position_margin", "change_leverage",
         "change_margin_mode", "change_position_mode", "get_leverage_and_margin_mode",
         "get_single_account", "asset_query", "get_depth", "get_funding_rate_batch",
         "get_funding_rate_history", "get_funding_rate", "get_kline",
@@ -58,7 +58,11 @@ def test_place_order_contract():
     assert ep.path == "/api/v1/futures/trade/place_order"
     assert ep.signed is True
     required = {p.name for p in ep.params if p.required}
-    assert required == {"symbol", "qty", "side", "tradeSide", "orderType"}
+    # tradeSide is documented as "Only required in hedge-mode", so it is not in
+    # the unconditional set - one-way accounts omit it.
+    assert required == {"symbol", "qty", "side", "orderType"}
+    by_name = {p.name: p for p in ep.params}
+    assert "hedge" in by_name["tradeSide"].description.lower()
 
 
 def test_validate_catches_missing_and_unknown():

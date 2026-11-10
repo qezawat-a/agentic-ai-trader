@@ -370,3 +370,92 @@ def test_method_survives_a_restart(tmp_path, monkeypatch):
     e2 = TraderEngine(Settings(), store=store2)
     assert e2.state.tpsl_method == "PARTIAL"
     assert e2.state.partial_close_pct == 25.0
+
+
+def test_account_pct_threshold_measures_full_equity_not_available():
+    """`available` excludes margin locked by open positions.
+
+    available=1000 locked into margin=9000 is a 10,000 USDT account. A 50% TP
+    therefore needs +5,000 USDT; a +3,000 total PnL must NOT flatten. The old
+    `equity = available` code computed a 500 USDT limit and fired.
+    """
+    s = Settings()
+    s.tpsl_method = "ACCOUNT"
+    s.account_tp_pct = 50.0
+    s.account_tp_usdt = 0.0
+    e = TraderEngine(s)
+    closed: list[str] = []
+
+    class C:
+        async def get_pending_positions(self, sym=None):
+            return [{"positionId": "P1", "symbol": "AKEUSDT", "side": "LONG",
+                     "avgOpenPrice": "0.005", "qty": "1000", "leverage": "10",
+                     "liqPrice": "0.004", "markPrice": "0.0051",
+                     "unrealizedPNL": "3000.0"}]
+
+        async def get_single_account(self):
+            return [{"marginCoin": "USDT", "available": "1000", "frozen": "0",
+                     "margin": "9000", "crossUnrealizedPNL": "0",
+                     "isolationUnrealizedPNL": "0"}]
+
+        async def get_tickers(self, sym=None):
+            return [{"symbol": sym, "lastPrice": "0.0051",
+                     "markPrice": "0.0051"}]
+
+        async def modify_position_tp_sl_order(self, *a, **k):
+            return {"orderId": "T1"}
+
+        async def close_all_position(self):
+            closed.append("all")
+            return {"ok": True}
+
+        async def get_trading_pairs(self, symbols=None):
+            return [PAIR_ROW]
+
+    e.client = C()  # type: ignore[assignment]
+
+    async def go():
+        await e.load_rules(["AKEUSDT"])
+        return await e.manage_positions()
+
+    asyncio.run(go())
+    assert closed == [], "3,000 of 10,000 equity is 30%, below the 50% TP"
+
+
+def test_account_pct_threshold_still_fires_on_true_equity():
+    """The same account at +6,000 (60% of 10,000) must flatten."""
+    s = Settings()
+    s.tpsl_method = "ACCOUNT"
+    s.account_tp_pct = 50.0
+    s.account_tp_usdt = 0.0
+    e = TraderEngine(s)
+    closed: list[str] = []
+
+    class C:
+        async def get_pending_positions(self, sym=None):
+            return [{"positionId": "P1", "symbol": "AKEUSDT", "side": "LONG",
+                     "avgOpenPrice": "0.005", "qty": "1000", "leverage": "10",
+                     "liqPrice": "0.004", "markPrice": "0.0051",
+                     "unrealizedPNL": "6000.0"}]
+
+        async def get_single_account(self):
+            return [{"marginCoin": "USDT", "available": "1000", "frozen": "0",
+                     "margin": "9000", "crossUnrealizedPNL": "0",
+                     "isolationUnrealizedPNL": "0"}]
+
+        async def close_all_position(self):
+            closed.append("all")
+            return {"ok": True}
+
+        async def get_trading_pairs(self, symbols=None):
+            return [PAIR_ROW]
+
+    e.client = C()  # type: ignore[assignment]
+
+    async def go():
+        await e.load_rules(["AKEUSDT"])
+        return await e.manage_positions()
+
+    actions = asyncio.run(go())
+    assert closed == ["all"]
+    assert actions[0]["action"] == "account_tp"

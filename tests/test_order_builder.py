@@ -176,3 +176,38 @@ def test_log_order_body_does_not_raise():
     log_order_body({"symbol": "BTCUSDT", "qty": "0.5"},
                    BitunixAPIError(10002, "Parameter Error"))
     log_order_body({"symbol": "BTCUSDT", "qty": "0.5"})
+
+# ------------------------------------------------- one-way vs hedge mode body
+def test_one_way_body_omits_tradeside_and_position_id():
+    """Docs: tradeSide is "Only required in hedge-mode" - so one-way omits it.
+
+    The position is identified by symbol + reduceOnly instead.
+    """
+    body = build_order_body(symbol="BTCUSDT", qty="0.5", side="SELL",
+                            orderType="MARKET", tradeSide=None, reduceOnly=True,
+                            rules=BTC, known_symbols={"BTCUSDT"})
+    assert "tradeSide" not in body and "positionId" not in body
+    assert body["side"] == "SELL" and body["reduceOnly"] is True
+
+
+def test_one_way_body_rejects_a_position_id_without_tradeside():
+    with pytest.raises(OrderValidationError) as e:
+        build_order_body(symbol="BTCUSDT", qty="0.5", side="SELL",
+                         orderType="MARKET", tradeSide=None, positionId="P1",
+                         rules=BTC, known_symbols={"BTCUSDT"})
+    assert "positionId" in str(e.value)
+
+
+def test_hedge_body_keeps_tradeside_and_position_id():
+    body = build_order_body(symbol="BTCUSDT", qty="0.5", side="SELL",
+                            orderType="MARKET", tradeSide="CLOSE", positionId="P1",
+                            reduceOnly=True, rules=BTC, known_symbols={"BTCUSDT"})
+    assert body["tradeSide"] == "CLOSE" and body["positionId"] == "P1"
+
+
+def test_invalid_tradeside_still_fails_when_it_is_sent():
+    with pytest.raises(OrderValidationError) as e:
+        build_order_body(symbol="BTCUSDT", qty="0.5", side="SELL",
+                         orderType="MARKET", tradeSide="BOTH",
+                         rules=BTC, known_symbols={"BTCUSDT"})
+    assert "tradeSide" in str(e.value)

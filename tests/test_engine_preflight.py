@@ -30,9 +30,17 @@ TIERS = [
 
 
 class FakeClient:
-    def __init__(self, equity, mark, last):
+    def __init__(self, equity, mark, last, mode="ONE_WAY"):
         self.equity, self.mark, self.last = equity, mark, last
+        self.mode = mode
         self.placed: list[dict] = []
+        self.mode_reads = 0
+
+    async def get_position_mode(self):
+        self.mode_reads += 1
+        if self.mode is None:
+            raise RuntimeError("position_mode endpoint unavailable")
+        return {"positionMode": self.mode}
 
     async def get_tickers(self, sym):
         return [{"symbol": sym, "lastPrice": str(self.last),
@@ -166,3 +174,56 @@ def test_tiny_account_is_refused_without_sending():
     assert r["ok"] is False
     assert placed == []
     assert "qty is 0" in r["reason"]
+
+
+# ------------------------------------------- tradeSide follows the account mode
+def _run_with_mode(mode):
+    s = Settings()
+    s.market_data_source = "rest"
+    e = TraderEngine(s)
+    e.client = FakeClient(100000.0, 0.005020, 0.005009, mode=mode)
+    e.state.leverage = 10
+
+    async def go():
+        await e.load_rules(["AKEUSDT"])
+        return await e.try_enter(Agg())
+
+    return asyncio.run(go()), e
+
+
+def test_one_way_account_omits_tradeside():
+    """Official docs: tradeSide is "Only required in hedge-mode"."""
+    r, e = _run_with_mode("ONE_WAY")
+    assert r["ok"] is True, r.get("reason")
+    body = e.client.placed[0]
+    assert "tradeSide" not in body, body
+    assert "positionId" not in body
+    assert body["side"] == "BUY"           # opening a long
+    assert body["reduceOnly"] is False
+
+
+def test_hedge_account_sends_tradeside():
+    r, e = _run_with_mode("HEDGE")
+    assert r["ok"] is True, r.get("reason")
+    body = e.client.placed[0]
+    assert body["tradeSide"] == "OPEN"
+    assert "positionId" not in body
+
+
+def test_unknown_mode_keeps_sending_tradeside():
+    """Never change a live order path we cannot verify: unknown -> today's body."""
+    r, e = _run_with_mode(None)
+    assert r["ok"] is True, r.get("reason")
+    assert e.client.placed[0]["tradeSide"] == "OPEN"
+
+
+def test_position_mode_is_cached_between_orders():
+    """One REST read must serve many orders - it is not a per-order call."""
+    r, e = _run_with_mode("ONE_WAY")
+    assert r["ok"] is True
+
+    async def again():
+        return await e.try_enter(Agg())
+
+    asyncio.run(again())
+    assert e.client.mode_reads == 1, "the mode must be cached, not re-fetched"

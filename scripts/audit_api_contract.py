@@ -191,6 +191,21 @@ def normalise(name: str) -> str:
     return name.lstrip(">").strip()
 
 
+def is_conditionally_required(p: dict) -> bool:
+    """True when the docs mark a param required but the description qualifies it.
+
+    The Required column is a boolean, but some params carry a condition in prose.
+    `tradeSide` is the important one: it is marked required yet described as
+    "Only required in hedge-mode". A one-way account must OMIT it, so the audit
+    treats it as optional - both sending it (hedge) and omitting it (one-way)
+    are valid, and it can never be reported as a missing required parameter.
+    """
+    if not p.get("required"):
+        return False
+    desc = (p.get("description") or "").lower()
+    return "only required in hedge-mode" in desc or "only required in hedge mode" in desc
+
+
 def audit() -> dict:
     contract = load_contract()
     calls = parse_client_calls()
@@ -209,9 +224,11 @@ def audit() -> dict:
         # list param, not top-level request params. Filter them out BEFORE
         # normalising, or the ">" marker is lost and they look top-level.
         doc_req_top = {p["name"] for p in e["request_params"]
-                       if p["required"] and not p["name"].startswith(">")}
+                       if p["required"] and not is_conditionally_required(p)
+                       and not p["name"].startswith(">")}
         doc_opt_top = {p["name"] for p in e["request_params"]
-                       if not p["required"] and not p["name"].startswith(">")}
+                       if (not p["required"] or is_conditionally_required(p))
+                       and not p["name"].startswith(">")}
 
         impl = by_path.get(path)
         if not impl:
