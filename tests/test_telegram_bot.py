@@ -454,3 +454,27 @@ def test_report_push_loop_absorbs_a_failing_engine(monkeypatch):
 
     assert len(sleeps) == 2
     assert app.bot.sent == []
+
+
+def test_report_pushed_to_telegram_carries_the_tpsl_section(monkeypatch):
+    """Telegram is the operator's only window into the risk.
+
+    The engine report grew a TP/SL block (method, ladder, stop, target,
+    trailing state, account thresholds). The Telegram push sends the SAME
+    text, so the block must survive the HTML escaping and reach the chat.
+    """
+    class EngineWithTpSl(FakeEngine):
+        async def report(self) -> str:
+            self.report_calls += 1
+            return ("=== J+Rock report ===\n"
+                    "-- TP/SL --\n"
+                    "method: PARTIAL - native rungs at entry (40@1,35@2,25@3)\n"
+                    "  AKEUSDT LONG qty=1000 entry=0.005 sl=0.004 tp=rungs be=on")
+
+    eng = EngineWithTpSl()
+    app = _engine_app(monkeypatch, eng)
+    asyncio.run(app.handle(9, "/report"))
+    body = app.bot.sent[-1][1]
+    assert "-- TP/SL --" in body
+    assert "40@1,35@2,25@3" in body
+    assert "sl=0.004" in body

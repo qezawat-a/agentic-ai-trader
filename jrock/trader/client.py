@@ -61,6 +61,34 @@ def _wire_bool(v: bool | None) -> str | None:
     return "true" if v else "false"
 
 
+def order_row(data: Any) -> dict:
+    """ONE order object out of an order-ish response.
+
+    The doc pages show an object (``{"orderId": "11111"}``), but the OFFICIAL
+    demo types the standalone TP/SL endpoint as an ARRAY:
+    ``FuturesPrivateApiClient.placeTpslOrders`` returns
+    ``List<OrderIdResp>`` for ``POST /api/v1/futures/tpsl/place_order``, while
+    ``placeOrder`` returns a single ``OrderIdResp``. The live server follows
+    the demo: the standalone TP/SL endpoint answers with a list.
+
+    The engine read ``(res or {}).get("orderId")`` on that response and died
+    with ``AttributeError: 'list' object has no attribute 'get'`` - AFTER the
+    first rung had already been created. The result on the exchange was one
+    take-profit where the ladder wanted three, and the scan loop died on
+    every cycle.
+
+    Normalising at the client boundary means no caller can trip over the
+    shape again: a dict stays a dict, a list yields its first order object.
+    """
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        for row in data:
+            if isinstance(row, dict):
+                return row
+    return {}
+
+
 def order_rows(data: Any) -> list[dict]:
     """Normalise an exchange ``data`` payload into a list of row dicts.
 
@@ -517,7 +545,8 @@ class BitunixClient:
             raise ValueError(
                 f"place_order is missing required parameter(s): {', '.join(missing)} "
                 f"(official required: {', '.join(self.PLACE_ORDER_REQUIRED)})")
-        return await self.request("POST", "/api/v1/futures/trade/place_order", body=kwargs)
+        return order_row(await self.request("POST", "/api/v1/futures/trade/place_order",
+                                            body=kwargs))
 
     async def batch_order(self, symbol: str, order_list: list[dict]) -> Any:
         """Batch place orders.
@@ -584,7 +613,8 @@ class BitunixClient:
                 f"(official required: {', '.join(self.MODIFY_ORDER_REQUIRED)})")
         if not kwargs.get("orderId") and not kwargs.get("clientId"):
             raise ValueError("modify_order needs orderId or clientId")
-        return await self.request("POST", "/api/v1/futures/trade/modify_order", body=kwargs)
+        return order_row(await self.request("POST", "/api/v1/futures/trade/modify_order",
+                                            body=kwargs))
 
     async def get_pending_orders(self, symbol: str | None = None, skip: int = 0,
                                  limit: int = 20, order_id: str | None = None,
@@ -721,7 +751,11 @@ class BitunixClient:
             raise ValueError("place_tp_sl_order needs at least one of tpPrice/slPrice")
         if "tpQty" not in body and "slQty" not in body:
             raise ValueError("place_tp_sl_order needs at least one of tpQty/slQty")
-        return await self.request("POST", "/api/v1/futures/tpsl/place_order", body=body)
+        # The live server answers this endpoint with an ARRAY (the official
+        # demo types it `List<OrderIdResp>`); the doc page shows an object.
+        # `order_row` collapses both into one dict.
+        return order_row(await self.request("POST", "/api/v1/futures/tpsl/place_order",
+                                            body=body))
 
     async def place_position_tp_sl_order(self, symbol: str, position_id: str,
                                          tp_price: str | None = None,
@@ -735,7 +769,8 @@ class BitunixClient:
             body["tpPrice"] = str(tp_price)
         if sl_price:
             body["slPrice"] = str(sl_price)
-        return await self.request("POST", "/api/v1/futures/tpsl/position/place_order", body=body)
+        return order_row(await self.request("POST", "/api/v1/futures/tpsl/position/place_order",
+                                            body=body))
 
     async def modify_tp_sl_order(self, order_id: str,
                                  tp_price: str | None = None,
@@ -770,7 +805,7 @@ class BitunixClient:
             body["tpQty"] = str(tp_qty)
         if sl_qty is not None and sl_qty != "":
             body["slQty"] = str(sl_qty)
-        return await self.request("POST", "/api/v1/futures/tpsl/modify_order", body=body)
+        return order_row(await self.request("POST", "/api/v1/futures/tpsl/modify_order", body=body))
 
     async def modify_position_tp_sl_order(self, symbol: str, position_id: str,
                                           tp_price: str | None = None,
@@ -789,7 +824,8 @@ class BitunixClient:
             body["tpStopType"] = str(tp_stop_type).upper()
         if sl_stop_type:
             body["slStopType"] = str(sl_stop_type).upper()
-        return await self.request("POST", "/api/v1/futures/tpsl/position/modify_order", body=body)
+        return order_row(await self.request("POST", "/api/v1/futures/tpsl/position/modify_order",
+                                            body=body))
 
     async def cancel_tp_sl_order(self, symbol: str, order_id: str) -> Any:
         """Cancel a TP/SL order. Official: BOTH `symbol` and `orderId` required.
@@ -797,8 +833,8 @@ class BitunixClient:
         The old signature sent only orderId, so every cancel was missing a
         required parameter.
         """
-        return await self.request("POST", "/api/v1/futures/tpsl/cancel_order",
-                                  body={"symbol": symbol, "orderId": str(order_id)})
+        return order_row(await self.request("POST", "/api/v1/futures/tpsl/cancel_order",
+                                            body={"symbol": symbol, "orderId": str(order_id)}))
 
     async def get_pending_tp_sl_order(self, symbol: str | None = None,
                                       position_id: str | None = None,

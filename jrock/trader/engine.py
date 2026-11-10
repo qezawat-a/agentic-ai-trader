@@ -25,7 +25,7 @@ from ..store import Store
 from .account_tpsl import (AccountTpSlConfig, account_tpsl_decision,
                            total_unrealized_pnl)
 from .aggregator import Aggregate, aggregate
-from .client import BitunixClient, BitunixConfig
+from .client import BitunixClient, BitunixConfig, order_row
 from .errors import BitunixAPIError
 from .indicators import atr, to_candles
 from .kline_cache import REST_KLINE_MAX, KlineCache
@@ -772,9 +772,18 @@ class TraderEngine:
             try:
                 if self.state.scan_on:
                     for sym in self.state.symbols:
-                        agg = await self.scan_symbol(sym)
-                        if self.state.autotrade and agg.actionable:
-                            await self.try_enter(agg)
+                        # per symbol: one broken symbol must not cost the
+                        # others their scan in the same cycle
+                        try:
+                            agg = await self.scan_symbol(sym)
+                            if self.state.autotrade and agg.actionable:
+                                await self.try_enter(agg)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:  # noqa: BLE001
+                            self.state.errors.append(
+                                f"scan {sym}: {type(e).__name__}: {e}")
+                            log.exception("scan error on %s", sym)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -1274,7 +1283,7 @@ class TraderEngine:
             self.state.errors.append(f"place_order {sym}: {e}")
             return {"ok": False, "reason": f"place_order failed: {e}", "hint": e.hint}
 
-        order_id = (res or {}).get("orderId")
+        order_id = str(order_row(res).get("orderId") or "")
         self._log_trade({
             "event": "open", "ts": time.time(), "symbol": sym, "side": side,
             "qty": qty, "entry": price, "order_id": order_id,
@@ -1380,10 +1389,21 @@ class TraderEngine:
                 allocated += step_qty
                 placed.append({"share": share, "r": rung.r, "qty": step_qty,
                                "price": target,
-                               "order_id": str((res or {}).get("orderId") or "")})
+                               "order_id": str(order_row(res).get("orderId") or "")})
                 carry_share = 0.0
             except (BitunixAPIError, ValueError) as e:
                 skipped.append({"share": share, "r": rung.r, "reason": str(e)})
+                carry_share = share
+            except Exception as e:  # noqa: BLE001
+                # A rung must NEVER take the scan loop down. The exchange
+                # answered the first rung and the engine still died on the
+                # response shape ('list' object has no attribute 'get'),
+                # which left ONE take-profit on the exchange where the ladder
+                # wanted three. A rung that cannot be read is skipped, the
+                # rest of the ladder still goes out, and the reason is on
+                # record.
+                skipped.append({"share": share, "r": rung.r,
+                                "reason": f"{type(e).__name__}: {e}"})
                 carry_share = share
 
         runner_qty = max(0.0, qty - allocated)
@@ -1719,9 +1739,56 @@ class TraderEngine:
                     f"liq={p.get('liqPrice')}")
         else:
             lines.append("no open positions")
+        lines.extend(await self._report_tpsl())
         if self.state.errors:
             lines.append(f"errors: {len(self.state.errors)} (last: {self.state.errors[-1]})")
         return "\n".join(lines)
+
+    async def _report_tpsl(self) -> list[str]:
+        """The TP/SL state of the account, in the report.
+
+        The report used to stop at the signal and the position line, so an
+        operator could not see whether the exits were actually armed: the
+        method, the ladder, the stop, the target, the trailing state and the
+        account thresholds were all invisible outside `/tpsl`. This is the
+        same information, and it is what the Telegram report push carries.
+        """
+        m = (self.state.tpsl_method or "POSITION").upper()
+        if m == "PARTIAL":
+            method = (f"PARTIAL - native rungs at entry "
+                      f"({self.state.partial_tp_ladder or 'no ladder - whole-position TP'})")
+        else:
+            method = "POSITION - one native TP/SL closes the whole position"
+        lines = ["-- TP/SL --",
+                 f"method: {method}",
+                 f"software: breakeven at {self.state.breakeven_pct:g}% ROI, "
+                 f"trailing from {self.state.trailing_trigger_roi_pct:g}% ROI "
+                 f"| {self.account_cfg().describe()}"]
+
+        # one line per managed position: what is armed, and by which method
+        for st in self.positions.values():
+            tp = f"{st.tp:g}" if st.tp else ("rungs" if m == "PARTIAL" else "none")
+            lines.append(
+                f"  {st.symbol} {st.side} qty={st.qty:g} entry={st.entry:g} "
+                f"sl={st.sl:g} tp={tp} liq={st.liq:g} "
+                f"be={'on' if st.breakeven_done else 'off'} "
+                f"trail={'on' if st.trailing_active else 'off'}"
+                + (f"@{st.trailing_stop:g}" if st.trailing_stop else "")
+                + (f" peak_roi={st.peak_roi:.2f}%" if st.peak_roi else ""))
+
+        # the rungs that are actually parked on the exchange, from the log
+        for rec in reversed(self.tpsl_history(20)):
+            if rec.get("event") != "partial_rungs_placed":
+                continue
+            placed = rec.get("placed") or []
+            if not placed:
+                continue
+            rungs = ", ".join(
+                f"{p.get('share')}%@{p.get('r')}R={p.get('price')}"
+                for p in placed)
+            lines.append(f"  parked rungs ({rec.get('symbol')}): {rungs}")
+            break
+        return lines
 
     async def pnl(self) -> dict:
         positions = await self.open_positions()

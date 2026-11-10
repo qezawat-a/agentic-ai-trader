@@ -160,6 +160,54 @@ def test_partial_rungs_go_through_the_native_endpoint_when_method_is_partial():
     assert third["tp_qty"] == "250" and third["tp_price"] == "0.008000"
 
 
+def test_partial_rungs_survive_the_array_shaped_response():
+    """The live server answers /tpsl/place_order with an ARRAY.
+
+    The doc page shows an object, but the OFFICIAL demo types the endpoint
+    `List<OrderIdResp>` and the live server follows the demo. The engine read
+    `(res or {}).get("orderId")` on that list and died with
+    `AttributeError: 'list' object has no attribute 'get'` AFTER the first rung
+    was already created - so the exchange held ONE take-profit where the ladder
+    wanted three, and the scan loop died on every cycle.
+
+    This pins the fix at both layers: the client collapses the array into one
+    order object, and the rung loop still places every rung.
+    """
+    from jrock.trader.client import BitunixClient
+
+    # --- the client boundary: an array response becomes one order dict
+    c = BitunixClient(Settings())
+
+    async def fake_request(method, path, **kw):
+        return [{"orderId": "T1", "clientId": "c1"}]   # the live array shape
+
+    c.request = fake_request  # type: ignore[assignment]
+    res = asyncio.run(c.place_tp_sl_order("AKEUSDT", "P1", tp_price="0.006",
+                                         tp_qty="400"))
+    assert isinstance(res, dict), type(res)
+    assert res["orderId"] == "T1"
+
+    # --- the engine: every rung goes out even with the array shape
+    s = Settings()
+    s.tpsl_method = "PARTIAL"
+    s.partial_tp_ladder = "40@1,35@2,25@3"
+    e = TraderEngine(s)
+    sent: list[dict] = []
+
+    class C:
+        async def place_tp_sl_order(self, *a, **kw):
+            sent.append(kw)
+            return [{"orderId": "T9"}]               # the live array shape
+
+    e.client = C()  # type: ignore[assignment]
+    from jrock.trader.tpsl import parse_partial_ladder
+    rungs = parse_partial_ladder(s.partial_tp_ladder)
+    asyncio.run(e._place_partial_rungs(
+        "AKEUSDT", "P1", "LONG", 0.005, 1000.0,
+        sl_dist=0.001, rungs=rungs, rules=AKE, trigger_type="MARK_PRICE"))
+    assert len(sent) == 3, sent
+
+
 def test_partial_ladder_too_small_falls_back_to_one_whole_position_tp():
     """A position the exchange will not split still gets ONE plan, not none."""
     s = Settings()
@@ -459,3 +507,41 @@ def test_account_threshold_is_absolute_usdt_not_available():
     assert closed == ["all"], "+3,000 PnL must cross a +100 USDT TP"
     assert actions[0]["action"] == "account_tp"
     assert actions[0]["total_pnl"] == 3000.0
+
+
+# ==================================================== the report shows TP/SL
+def test_report_shows_the_tpsl_state():
+    """The report used to stop at the signal and the position line.
+
+    An operator could not see whether the exits were armed - the method, the
+    ladder, the stop, the target, the trailing state were all invisible
+    outside `/tpsl`. The Telegram report push carries the same text, so the
+    blind spot was the operator's only window into the risk.
+    """
+    s = Settings()
+    s.tpsl_method = "PARTIAL"
+    s.partial_tp_ladder = "40@1,35@2,25@3"
+    s.account_tp_usdt = 100.0
+    e = TraderEngine(s)
+    from jrock.trader.tpsl import PositionState
+    e.positions["P1"] = PositionState(
+        position_id="P1", symbol="AKEUSDT", side="LONG", entry=0.005, qty=1000.0,
+        leverage=10, sl=0.004, tp=0.0, liq=0.003, breakeven_done=True)
+
+    class C:
+        async def get_pending_positions(self, sym=None):
+            return [{"positionId": "P1", "symbol": "AKEUSDT", "side": "LONG",
+                     "avgOpenPrice": "0.005", "qty": "1000", "leverage": "10",
+                     "liqPrice": "0.003", "markPrice": "0.0051",
+                     "unrealizedPNL": "12.5"}]
+
+        async def get_tickers(self, sym=None):
+            return [{"symbol": sym, "lastPrice": "0.0051", "markPrice": "0.0051"}]
+
+    e.client = C()  # type: ignore[assignment]
+    out = asyncio.run(e.report())
+    assert "-- TP/SL --" in out, out
+    assert "PARTIAL" in out and "40@1,35@2,25@3" in out, out
+    assert "sl=0.004" in out, out          # the stop is visible
+    assert "breakeven" in out.lower(), out
+    assert "account TP" in out, out       # the account thresholds are visible

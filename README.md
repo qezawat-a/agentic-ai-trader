@@ -315,6 +315,16 @@ are base-coin amounts. Round qty down to `basePrecision`, price to `quotePrecisi
 **Error 10011** (timestamp skew) is auto-handled: the client resyncs its clock and
 retries once.
 
+**Response shapes are not all what the doc pages show.** The official demo
+(`FuturesPrivateApiClient.java`) types `POST /api/v1/futures/tpsl/place_order`
+as `List<OrderIdResp>` while `place_order` itself is a single `OrderIdResp` -
+and the live server follows the demo, not the doc page (which shows an
+object). `client.order_row()` collapses both into one dict at the client
+boundary. Before that, the engine read `(res or {}).get("orderId")` on the
+array and died with `AttributeError: 'list' object has no attribute 'get'`
+**after the first ladder rung was already placed** - one take-profit where the
+ladder wanted three, and a dead scan loop.
+
 **Error 10002** (Parameter error) is prevented locally. Every order body is built
 by `jrock/trader/order_builder.py`, which validates each field against the
 official spec **before** sending and raises a named local error instead of

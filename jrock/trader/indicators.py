@@ -31,6 +31,12 @@ def to_candles(raw: list[dict]) -> list[Candle]:
             ))
         except (KeyError, TypeError, ValueError):
             continue
+        except AttributeError:
+            # A row that is not a dict (the exchange changed the shape) must
+            # not take the scan loop down with
+            # `AttributeError: 'list' object has no attribute 'get'`.
+            # Skip the row and keep the rest of the series.
+            continue
     out.sort(key=lambda c: c.time)
     return out
 
