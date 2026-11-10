@@ -26,7 +26,7 @@ __all__ = [
 def _env_value(value: str) -> str:
     """Render a value so python-dotenv reads it back as ONE statement.
 
-    A raw multi-line value (a prompt, a soul text, a ladder spec with newlines)
+    A raw multi-line value (a prompt or a soul text with newlines)
     written as ``KEY=line1\\nline2`` is not one statement: dotenv parses line 1
     as the value and then reports every following line as
     "could not parse statement starting at line N". That is the wall of
