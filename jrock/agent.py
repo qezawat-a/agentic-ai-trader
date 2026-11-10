@@ -61,6 +61,8 @@ AGENT COMMANDS
   /models [--free]          list models on BASE_URL; --free shows only free ones
   /set_model <name>         pin a model (writes MODEL= to .env)
   /connect_provider <url> <key>   set BASE_URL + API_KEY, then auto-probe
+                            (the key is its OWN argument; a URL-glued key is
+                             split automatically)
   /add_mcp <name> <cmd>     register an MCP server (stdio command)
   /mcp                      list registered MCP servers
   /add_skill <name> <path>  register a skill directory
@@ -654,6 +656,15 @@ class JRockAgent:
                 return await self.engine.command(raw)
             return await self.handle(f"{mapped} {rest}".strip())
 
+        # 1.5) Own configuration in plain words ("connect provider <url> <key>").
+        # Matches on the raw text: the key argument is case-sensitive, so only
+        # the keyword is case-insensitive. Acting on it - not returning a
+        # usage line, and never letting the model ask the user for syntax - is
+        # what makes this an agent and not a receiver of commands.
+        connect = re.match(r"^connect[_ ]provider\s+(\S.*)$", raw, re.I)
+        if connect:
+            return await self.cmd_connect_provider(connect.group(1))
+
         # 2) natural-language intents we can act on without the model
         if FREE_MODEL_INTENT.search(raw):
             return await self.cmd_use_free_model()
@@ -894,6 +905,14 @@ class JRockAgent:
            the model could only answer in isolation - which reads as robotic
            even when the wording is fine.
 
+        Defect 3 (fixed here): the model had zero self-knowledge. Asked
+        "connect provider https://openrouter.ai/api/v1/sk-..." it replied "I
+        don't have the connect_provider syntax in my context" and asked the
+        USER for the bot's own documentation. An agent answers self-knowledge
+        questions from its own handbook, so the command sections of HELP are
+        now part of every prompt (`_agent_handbook`, derived live from the
+        same text /help prints).
+
         The prompt below fixes both, and states the conversational contract
         explicitly: understand intent from ordinary sentences (Persian and
         English), ask when the request is ambiguous, and confirm before
@@ -928,14 +947,45 @@ class JRockAgent:
             "have the value, say so and name the command that would get it.\n"
             "- Be brief and warm. No filler praise, no walls of text, no "
             "restating the question back at them.\n"
-            "\n"
+        )
+        handbook = self._agent_handbook()
+        parts.append(
             "## What you can do\n"
-            "Commands exist and the user can type them, but they never have to. "
-            "The full list is in /help. Deterministic commands are handled "
-            "before you are ever called, so if a message reached you it is "
-            "genuinely conversational - answer it as such."
+            "You are not a passive listener: you run a live futures engine and "
+            "you have your own command surface. The handbook below is YOUR "
+            "knowledge, made part of every prompt.\n"
+            "\n"
+            "- Questions about your own commands are answered from it. Never "
+            "say you lack the command name or its arguments - and never ask "
+            "the user to find or paste your own documentation. That is the "
+            "difference between an agent and a dumb bot.\n"
+            "- A URL with the API key glued onto its end (..../v1/sk-or-v1-x) "
+            "is one confused argument, not a mystery. The connect command "
+            "splits it itself; explain that as already handled, no questions.\n"
+            "- Never repeat an API key back in full. At most its last 4 "
+            "characters.\n"
+            "\n"
+            "### Your command handbook\n\n"
+            + (handbook or "(handbook unavailable)")
+            + "\n\n"
+            "Outside these commands you are conversational: deterministic "
+            "handlers run before you are reached, so if a message reaches you "
+            "it is genuinely free text - answer it as such."
         )
         return "\n\n".join(parts)
+
+    def _agent_handbook(self) -> str:
+        """The command sections of HELP, extracted live.
+
+        Sending the same source the user sees when they type /help means the
+        model's syntax knowledge and reality cannot drift apart, and the prompt
+        never needs a hand-maintained copy to forget.
+        """
+        start = HELP.find("AGENT COMMANDS")
+        end = HELP.find("PERMISSIONS")
+        if start < 0:
+            return ""
+        return (HELP[start:end] if end > start else HELP[start:]).rstrip()
 
     def _history_messages(self) -> list[dict]:
         """The recent conversation, as chat messages.
@@ -1076,25 +1126,39 @@ class JRockAgent:
         self.memory.fact("model", name)
         return f"model set to {name} (written to .env)"
 
+    # The most common provider-connect mistake: the key glued onto the URL,
+    # e.g. "https://openrouter.ai/api/v1/sk-or-v1-..." pasted as ONE argument.
+    # An agent splits it; a bot answers with a usage line. The key shapes cover
+    # sk-/skv2-/pk- style prefixes and any long secret-shaped token.
+    GLUED_URL_AND_KEY = re.compile(
+        r"^(https?://\S+?)/"
+        r"((?:sk|skv2|pk)[A-Za-z0-9_.-]{8,}|[A-Za-z0-9_-]{43,})$")
+
     async def cmd_connect_provider(self, rest: str) -> str:
         parts = rest.split()
-        if len(parts) < 2:
-            return "Usage: /connect_provider <base_url> <api_key>"
-        base, key = parts[0].rstrip("/"), parts[1]
+        note = ""
+        if len(parts) == 2:
+            base, key = parts[0].rstrip("/"), parts[1]
+        else:
+            glued = (self.GLUED_URL_AND_KEY.match(parts[0])
+                     if len(parts) == 1 else None)
+            if glued is None:
+                return ("Usage: /connect_provider <base_url> <api_key>\n"
+                        "  e.g. /connect_provider https://openrouter.ai/api/v1 "
+                        "sk-or-v1-...\n"
+                        "The key is a SEPARATE argument - never part of the URL.")
+            base, key = glued.group(1).rstrip("/"), glued.group(2)
+            note = ("The key was glued onto the URL you sent. I split it into "
+                    "base URL + key before connecting.\n")
         self.s.base_url, self.s.api_key = base, key
         env = ROOT / ".env"
-        text = env.read_text(encoding="utf-8") if env.exists() else ""
-        for k, v in (("BASE_URL", base), ("API_KEY", key)):
-            if re.search(rf"^{k}=.*$", text, re.M):
-                text = re.sub(rf"^{k}=.*$", f"{k}={v}", text, flags=re.M)
-            else:
-                text += f"\n{k}={v}"
-        env.write_text(text.strip() + "\n", encoding="utf-8")
+        mirror_env(env, "BASE_URL", base)
+        mirror_env(env, "API_KEY", key)
         res = await autoset_model(base, key)
         if res.ok and res.selected:
             self.model = res.selected
             persist_model(env, res.selected)
-        return f"provider set to {base}\n{res.message}"
+        return f"{note}provider set to {base}\n{res.message}"
 
     def cmd_add_mcp(self, rest: str) -> str:
         parts = rest.split(maxsplit=1)
