@@ -42,6 +42,7 @@ from aiohttp import web
 
 from .agent import JRockAgent
 from .config import load_settings
+from .trader.client import order_rows
 
 log = logging.getLogger("jrock.web")
 
@@ -544,7 +545,14 @@ def _position_rows(positions: list[dict]) -> list[dict]:
     return rows
 
 
-def _order_rows(orders: list[dict]) -> list[dict]:
+def _order_rows(orders) -> list[dict]:
+    """Render order rows for the dashboard.
+
+    ``orders`` is normalised through ``order_rows`` rather than assumed to be a
+    list: the client unwraps the exchange's ``{"orderList": [...]}`` envelope,
+    but this renderer must not crash the whole ``/api/state`` response if a
+    caller ever hands it the raw envelope (or a single row) instead.
+    """
     return [{
         "symbol": o.get("symbol"),
         "side": o.get("side"),
@@ -553,7 +561,7 @@ def _order_rows(orders: list[dict]) -> list[dict]:
         "price": o.get("price"),
         "status": o.get("status"),
         "id": o.get("orderId"),
-    } for o in (orders or [])]
+    } for o in order_rows(orders)]
 
 
 def _account_summary(account_rows, positions, orders) -> dict:
@@ -575,7 +583,10 @@ def _account_summary(account_rows, positions, orders) -> dict:
         "unrealized": round(unrealized, 4),
         "realized": round(realized, 4),
         "open_positions": len(positions or []),
-        "open_orders": len(orders or []),
+        # Count ROWS, not the keys of an envelope dict: the exchange returns
+        # {"orderList": [...], "total": N}, and len() on that is 2 regardless of
+        # how many orders are actually open.
+        "open_orders": len(order_rows(orders)),
         "coins": [a.margin_coin for a in accounts],
     }
 

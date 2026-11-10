@@ -31,6 +31,7 @@ from .store import Store
 from .thinking import (DEFAULT_LEVEL, LEVEL_HELP, LEVELS, ONE_LINER,
                        build_reasoning_params, closest_level, describe_params,
                        normalize_level)
+from .trader.client import order_rows
 from .trader.engine import TraderEngine
 
 SOUL_PATH = ROOT / "soul" / "jrock.soul.md"
@@ -1376,15 +1377,22 @@ class JRockAgent:
             return f"Bitunix error {e.code}: {e.msg or e}"
         except Exception as e:  # noqa: BLE001
             return f"orders request failed: {type(e).__name__}: {e}"
-        rows = rows or []
-        if not rows:
-            return "no pending orders"
-        lines = ["=== pending orders ==="]
-        for o in rows:
-            lines.append(f"{o.get('symbol')} {o.get('side')} {o.get('orderType')} "
-                         f"qty={o.get('qty')} price={o.get('price')} "
-                         f"status={o.get('status')} id={o.get('orderId')}")
-        return "\n".join(lines)
+        # Normalise AND render inside the guard: the exchange wraps the rows in
+        # {"orderList": [...]}, and iterating that dict yields its string keys,
+        # so an unguarded loop here raised AttributeError out of the chat
+        # command instead of returning a message.
+        try:
+            rows = order_rows(rows)
+            if not rows:
+                return "no pending orders"
+            lines = ["=== pending orders ==="]
+            for o in rows:
+                lines.append(f"{o.get('symbol')} {o.get('side')} {o.get('orderType')} "
+                             f"qty={o.get('qty')} price={o.get('price')} "
+                             f"status={o.get('status')} id={o.get('orderId')}")
+            return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            return f"orders render failed: {type(e).__name__}: {e}"
 
     async def cmd_price(self, rest: str = "") -> str:
         from .trader.errors import BitunixAPIError

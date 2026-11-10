@@ -43,6 +43,41 @@ def _nonce(n: int = 32) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
+#: The keys the exchange uses to wrap a list of rows inside ``data``. Some
+#: endpoints return a bare list, others an envelope; callers should not have to
+#: know which. ``orderList`` is the documented one for the order endpoints.
+_ROW_LIST_KEYS = ("orderList", "rows", "list", "items")
+
+
+def order_rows(data: Any) -> list[dict]:
+    """Normalise an exchange ``data`` payload into a list of row dicts.
+
+    The Bitunix REST envelope is ``{"code": 0, "data": ..., "msg": "Success"}``
+    and ``request()`` returns ``data`` verbatim - but ``data`` is not always a
+    list. For ``get_pending_orders`` it is
+    ``{"orderList": [...], "total": N}``. Returning that dict to a caller that
+    expects rows is a silent trap: iterating it yields the string keys, so
+    ``row.get(...)`` raises ``AttributeError`` and ``len(...)`` counts keys.
+
+    Accepts a bare list, an envelope dict, or ``None``/empty, and always returns
+    a list of dicts. Anything unrecognised yields ``[]`` rather than raising -
+    a malformed payload should degrade the readout, not crash the dashboard.
+    """
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        for key in _ROW_LIST_KEYS:
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return [r for r in rows if isinstance(r, dict)]
+        # A single row returned unwrapped (e.g. get_order_detail).
+        if "orderId" in data or "symbol" in data:
+            return [data]
+    return []
+
+
 def sign_query_string(params: dict[str, Any] | None) -> str:
     """Build the string that goes INTO the signature.
 
@@ -471,15 +506,25 @@ class BitunixClient:
         return await self.request("POST", "/api/v1/futures/trade/modify_order", body=kwargs)
 
     async def get_pending_orders(self, symbol: str | None = None, skip: int = 0,
-                                 limit: int = 20) -> Any:
-        """Pending orders.
+                                 limit: int = 20) -> list[dict]:
+        """Pending orders, as a LIST of order rows.
 
         Official paging params are `skip`/`limit` (max 100), NOT
         `page`/`pageSize` - the live server ignores the latter and returns the
         default page.
+
+        The exchange wraps the rows in an envelope: ``data`` is
+        ``{"orderList": [...], "total": N}``, NOT a bare list. ``request()``
+        returns ``payload["data"]`` verbatim, so without unwrapping here every
+        caller receives a dict and iterating it yields the string keys
+        ("orderList", "total") - which is what made ``_order_rows`` raise
+        ``AttributeError: 'str' object has no attribute 'get'`` and made
+        ``len(orders)`` count keys instead of orders. Normalising at the client
+        boundary means every caller gets the same shape the tests stub.
         """
-        return await self.request("GET", "/api/v1/futures/trade/get_pending_orders",
+        data = await self.request("GET", "/api/v1/futures/trade/get_pending_orders",
                                   params={"symbol": symbol, "skip": skip, "limit": limit})
+        return order_rows(data)
 
     async def get_history_orders(self, symbol: str | None = None, skip: int = 0,
                                  limit: int = 20, start_time: int | None = None,
