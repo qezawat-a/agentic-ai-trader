@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import html
 import logging
 import os
@@ -48,18 +49,22 @@ COMMANDS: list[tuple[str, str]] = [
     ("positions", "open positions"),
     ("orders", "pending orders"),
     ("pnl", "account and PnL"),
+    ("report", "generate and send one engine report now"),
+    ("tpsl", "TP/SL method + rung state"),
+    ("balance", "balance and margin use"),
+    ("price", "last / mark price for the symbols"),
     ("engine", "engine flags"),
-    ("tpsl", "TP/SL method + ladder state"),
     ("help", "this message"),
 ]
 
 #: A persistent reply keyboard, also bottom-left. ``setMyCommands`` only shows
-#: the commands in the Menu sheet; this puts the four most-used ones one tap
-#: away, permanently, without the operator opening anything.
+#: the commands in the Menu sheet; this puts the most-used ones one tap away,
+#: permanently, without the operator opening anything.
 REPLY_KEYBOARD: dict[str, Any] = {
     "keyboard": [
         [{"text": "/status"}, {"text": "/positions"}],
         [{"text": "/orders"}, {"text": "/pnl"}],
+        [{"text": "/report"}, {"text": "/price"}],
         [{"text": "/tpsl"}, {"text": "/help"}],
     ],
     "resize_keyboard": True,
@@ -319,12 +324,38 @@ HELP = render_help()
 
 
 # ------------------------------------------------------------------ the bot app
+def _allowed_chats_from_env() -> set[int]:
+    """TELEGRAM_ALLOWED_CHATS as chat ids. Empty = answer any chat."""
+    raw = os.getenv("TELEGRAM_ALLOWED_CHATS", "").strip()
+    return {int(t) for t in raw.replace(",", " ").split() if t.isdigit()}
+
+
+#: Floor for the report cadence, so a mistyped interval cannot turn the bot
+#: into a Telegram flood.
+REPORT_MIN_INTERVAL = 5
+
+
 class JRockTelegramApp:
-    """Routes Telegram messages to the dashboard state or the agent router."""
+    """Routes Telegram messages to the dashboard state or the agent router.
+
+    Also the REPORT PUSH channel: when the engine has ``report on``, the loop
+    in ``report_push_loop`` generates the same report the engine prints to
+    stdout and sends it to every chat that has messaged the bot, each
+    ``report_interval`` seconds. Reports only ever go to known chats -
+    a chat that never wrote to the bot never gets one.
+    """
 
     def __init__(self, agent, bot: TelegramBot):
         self.agent = agent
         self.bot = bot
+        #: Chats that have talked to the bot this run - the report fan-out
+        #: list. TELEGRAM_ALLOWED_CHATS (empty = any) gates ANSWERS; the push
+        #: list is every allowed chat that has actually drawn a reply.
+        self.chats: set[int | str] = set()
+        self.allowed_chats = _allowed_chats_from_env()
+
+    def _chat_allowed(self, chat_id: int | str) -> bool:
+        return not self.allowed_chats or chat_id in self.allowed_chats
 
     async def state(self) -> dict:
         # Imported lazily so the snapshot machinery (network calls + readouts)
@@ -333,6 +364,10 @@ class JRockTelegramApp:
         return await build_state(self.agent)
 
     async def handle(self, chat_id: int | str, text: str) -> None:
+        # Remember the chat so the report push knows WHO to talk to. The
+        # allowlist gate already ran in run(); handle() itself is the fan-out
+        # source of truth for "chats the operator actually talked to".
+        self.chats.add(chat_id)
         cmd, rest = _split_command(text)
 
         # Every reply carries the persistent keyboard, so the commands stay in
@@ -376,9 +411,17 @@ class JRockTelegramApp:
             elif cmd == "engine":
                 await self.bot.send(chat_id, render_engine(await self.state()),
                                     markdown=True)
-            elif cmd == "tpsl":
-                out = await self.agent.handle(cmd)
+            elif cmd in ("tpsl", "balance", "price"):
+                # Read-only agent commands: reuse the CLI routing verbatim
+                # (arguments included, e.g. "/tpsl pending BTCUSDT").
+                out = await self.agent.handle(f"{cmd}{(' ' + rest) if rest else ''}")
                 await self.bot.send(chat_id, _as_html(out), markdown=True)
+            elif cmd == "report":
+                # A synchronous one-shot of the same report the engine's
+                # report loop generates - straight from the engine so it is
+                # the real thing, not a cached summary.
+                rep = await self.agent.engine.report()
+                await self.bot.send(chat_id, _as_html(rep), markdown=True)
             else:
                 # Bare text, or a command this front-end does not own: hand the
                 # ORIGINAL text to the engine router, which is the same surface
@@ -397,6 +440,52 @@ class JRockTelegramApp:
             except TelegramError:
                 pass
 
+    # ------------------------------------------------------- report -> telegram
+    def _report_interval(self) -> float:
+        """Engine's report_interval with a flood-proof floor."""
+        eng = getattr(self.agent, "engine", None)
+        try:
+            return max(REPORT_MIN_INTERVAL, float(eng.state.report_interval))
+        except Exception:  # noqa: BLE001 - missing engine/attr = safe default
+            return 30.0
+
+    async def _push_report_once(self) -> bool:
+        """Generate one report and send it to every known chat.
+
+        Returns whether anything was pushed. The three OFF conditions are
+        deliberate: report off (the operator never opted into pushes), no
+        chats known yet (nobody has talked to the bot this run), and no
+        engine (degenerate app used in tests). Unconditional sends would be
+        the spam channel nobody asked for.
+        """
+        eng = getattr(self.agent, "engine", None)
+        if eng is None or not getattr(eng.state, "report_on", False):
+            return False
+        if not self.chats:
+            return False
+        rep = await eng.report()
+        body = _as_html(rep)
+        for chat_id in sorted(self.chats, key=str):
+            await self.bot.send(chat_id, body, markdown=True)
+        eng.state.last_report_ts = time.time()
+        return True
+
+    async def report_push_loop(self) -> None:
+        """The scheduled twin of the chat's /report button.
+
+        One report pass every report_interval, forever. All failures are
+        logged and absorbed: a flaky Bitunix read or a blocked send must
+        never kill the pusher - the next pass just tries again.
+        """
+        while True:
+            try:
+                await self._push_report_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("telegram report push failed")
+            await asyncio.sleep(self._report_interval())
+
     async def run(self, *, once: bool = False) -> None:
         me = await self.bot.get_me()
         log.info("connected as @%s", me.get("username"))
@@ -412,30 +501,49 @@ class JRockTelegramApp:
             log.warning("setMyCommands failed (menu will be empty): %s", e)
         print(f"Telegram bot @{me.get('username')} is listening "
               f"(chat id is shown per message; Ctrl+C to stop)", flush=True)
+        if self.allowed_chats:
+            print(f"answering only chats in TELEGRAM_ALLOWED_CHATS: "
+                  f"{sorted(self.allowed_chats)}", flush=True)
+        else:
+            print("TELEGRAM_ALLOWED_CHATS is empty: answering ANY chat "
+                  "that writes to the bot", flush=True)
+        pusher = asyncio.create_task(self.report_push_loop(),
+                                     name="telegram-report-push")
         offset: int | None = None
-        while True:
-            try:
-                updates = await self.bot.poll(offset)
-            except TelegramError as e:
-                log.warning("poll failed: %s", e)
-                await asyncio.sleep(3)
-                continue
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log.warning("network: %s", e)
-                await asyncio.sleep(3)
-                continue
-            for u in updates:
-                offset = u.get("update_id", 0) + 1
-                msg = u.get("message") or {}
-                chat = msg.get("chat") or {}
-                text = msg.get("text")
-                if not text or "id" not in chat:
+        try:
+            while True:
+                try:
+                    updates = await self.bot.poll(offset)
+                except TelegramError as e:
+                    log.warning("poll failed: %s", e)
+                    await asyncio.sleep(3)
                     continue
-                log.info("chat=%s from=%s: %s", chat["id"],
-                         (msg.get("from") or {}).get("username"), text[:80])
-                await self.handle(chat["id"], text)
-            if once:
-                return
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    log.warning("network: %s", e)
+                    await asyncio.sleep(3)
+                    continue
+                for u in updates:
+                    offset = u.get("update_id", 0) + 1
+                    msg = u.get("message") or {}
+                    chat = msg.get("chat") or {}
+                    text = msg.get("text")
+                    if not text or "id" not in chat:
+                        continue
+                    if not self._chat_allowed(chat["id"]):
+                        log.info("chat=%s not in TELEGRAM_ALLOWED_CHATS - "
+                                 "ignored", chat["id"])
+                        continue
+                    log.info("chat=%s from=%s: %s", chat["id"],
+                             (msg.get("from") or {}).get("username"), text[:80])
+                    await self.handle(chat["id"], text)
+                if once:
+                    return
+        finally:
+            pusher.cancel()
+            # Awaiting a cancelled task raises CancelledError (a BaseException,
+            # deliberately not an Exception) - suppress exactly that.
+            with contextlib.suppress(asyncio.CancelledError):
+                await pusher
 
 
 def _as_html(text: str) -> str:

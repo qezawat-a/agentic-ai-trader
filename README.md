@@ -76,6 +76,66 @@ Runtime: `/selfheal once|loop|stop|status`.
 
 ---
 
+## Telegram chat
+
+`python -m jrock.telegram_bot` is the same agent in a Telegram chat, so the bot can
+be driven from a phone with nothing listening on any port. Every line it receives
+goes through the same `JRockAgent.handle()` the CLI uses, and every number comes
+from the same `build_state` snapshot (`jrock/state.py`) - the view cannot drift
+from the engine.
+
+```bash
+export TELEGRAM_BOT_TOKEN=123456:ABC...   # from @BotFather
+python -m jrock.telegram_bot
+```
+
+The first message from the operator's chat prints that chat id. Put it in
+`TELEGRAM_ALLOWED_CHATS` to restrict who the bot answers (leave it empty to answer
+any chat that finds the bot, or several chats as `id1,id2`). A chat not in the list
+gets no reply at all - not even an error.
+
+### Menu commands (10)
+
+The commands are published to Telegram's Menu button at startup, so they are visible
+without typing `help` first, and the most-used ride on a permanent reply keyboard:
+
+| Command | What it does |
+|---|---|
+| `/status` | engine + account + positions |
+| `/positions` | open positions |
+| `/orders` | pending orders |
+| `/pnl` | account and PnL |
+| `/report` | generate and send one engine report now |
+| `/tpsl` | TP/SL method + rung state: show/set (`/tpsl pending BTCUSDT`) |
+| `/balance` | balance and margin use |
+| `/price` | last / mark price for the symbols |
+| `/engine` | engine flags |
+| `/help` | all of the above, plus `<topic>` pages |
+
+Anything else typed in the chat is passed to the engine router verbatim, so the
+natural-language phrases and commands the CLI accepts (including `/think`, `/code`,
+`/selfheal` and the trade commands) work here too - they simply have no menu button.
+
+### Report pushing
+
+The engine's report loop prints the report to stdout; the Telegram bot is a second,
+active channel for the same report:
+
+```text
+report on                 -> reports are PUSHED to the chat every report_interval
+/report                   -> one report immediately, regardless of the toggle
+```
+
+- A report is only ever pushed to chats that have previously messaged the bot - a
+  chat that never wrote to it never receives one.
+- Pushes stop at once when the operator says `report off`.
+- `report_interval` is honored with a 5-second floor so a mistyped value cannot
+  flood Telegram.
+- Report generation failures are logged and absorbed; the next interval just tries
+  again.
+
+---
+
 ## Commands
 
 ### Agent

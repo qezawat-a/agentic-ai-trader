@@ -81,8 +81,8 @@ def _app(monkeypatch, state=STATE):
 def test_commands_cover_every_documented_command():
     """Every command the bot routes must be published to the Menu."""
     names = [c for c, _ in tb.COMMANDS]
-    assert names == ["status", "positions", "orders", "pnl", "engine",
-                     "tpsl", "help"]
+    assert names == ["status", "positions", "orders", "pnl", "report",
+                     "tpsl", "balance", "price", "engine", "help"]
 
 
 def test_commands_are_valid_telegram_command_names():
@@ -172,6 +172,15 @@ def test_reply_keyboard_is_persistent_and_bottom_left():
     for text in flat:
         assert text.startswith("/")
         assert text.lstrip("/") in [c for c, _ in tb.COMMANDS], text
+
+
+def test_keyboard_pins_the_daily_drivers():
+    """The buttons this expansion was about: one-tap report + live prices."""
+    flat = [b["text"] for row in tb.REPLY_KEYBOARD["keyboard"] for b in row]
+    assert "/report" in flat
+    assert "/price" in flat
+    # Four buttons per row max - bulky keyboards crowd the chat on phones.
+    assert all(len(row) <= 4 for row in tb.REPLY_KEYBOARD["keyboard"])
 
 
 def test_send_attaches_the_keyboard_by_default():

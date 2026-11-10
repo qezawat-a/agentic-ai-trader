@@ -1,18 +1,22 @@
 """Tests for the Telegram front-end (jrock/telegram_bot.py).
 
-Two things are being protected here:
+Three things are being protected here:
 
 1. The bot must never contain a bot token, and must fail loudly (exit 2 with
    guidance) when TELEGRAM_BOT_TOKEN is absent - a channel that starts and
    silently answers nothing is worse than one that refuses to start.
 2. Every number it reports comes from `build_state`, the SAME snapshot the web
    dashboard uses, so the two front-ends cannot disagree.
+3. The REPORT PUSH channel (report on -> engine report to every chat that
+   talked to the bot, each report_interval) and the TELEGRAM_ALLOWED_CHATS
+   gate, which is documented in .env.example and must not be decorative.
 
 No test touches the network: TelegramBot.call is replaced by a recorder.
 """
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -198,3 +202,255 @@ def test_failure_is_reported_to_the_chat_not_swallowed(monkeypatch):
     app.state = boom                  # type: ignore[assignment]
     asyncio.run(app.handle(42, "/status"))
     assert "RuntimeError" in app.bot.sent[-1][1]
+
+
+# ------------------------------------------------------------ engine-backed fakes
+
+
+class FakeEngine:
+    """Mini engine stand-in: a report counter plus the state the app touches."""
+
+    def __init__(self, *, report_on: bool = False, interval: float = 30.0):
+        self.state = SimpleNamespace(report_on=report_on,
+                                     report_interval=interval,
+                                     last_report_ts=0.0)
+        self.report_calls = 0
+
+    async def report(self) -> str:
+        self.report_calls += 1
+        return f"report #{self.report_calls}"
+
+
+def _engine_app(monkeypatch, engine: FakeEngine) -> tb.JRockTelegramApp:
+    """_app but whose agent carries a fake engine instead of only handle()."""
+    app = _app(monkeypatch)
+    app.agent = SimpleNamespace(handle=app.agent.handle, engine=engine)
+    return app
+
+
+class _Stop(BaseException):
+    """Ends report_push_loop from a fake sleep (BaseException: the loop's
+    `except Exception` must NOT swallow it - that is part of what we test)."""
+
+
+class FullFakeBot:
+    """RecordingBot + the methods run() needs (get_me / set_my_commands / poll)."""
+
+    def __init__(self, updates: list[dict] | None = None):
+        self.sent: list[tuple] = []
+        self.commands = None
+        self._updates = updates or []
+
+    async def get_me(self):
+        return {"username": "TestBot"}
+
+    async def set_my_commands(self, commands):
+        self.commands = list(commands)
+        return True
+
+    async def poll(self, offset, timeout=30):
+        return self._updates
+
+    async def send(self, chat_id, text, *, markdown=False):
+        self.sent.append((chat_id, text, markdown))
+        return True
+
+
+# ------------------------------------------------------------------- /report cmd
+
+
+def test_report_command_pulls_the_engine_report(monkeypatch):
+    """/report is the one-shot engine report, straight from engine.report()."""
+    eng = FakeEngine()
+    app = _engine_app(monkeypatch, eng)
+    asyncio.run(app.handle(9, "/report"))
+    assert eng.report_calls == 1
+    assert "report #1" in app.bot.sent[-1][1]
+    assert app.bot.sent[-1][2] is True  # markdown
+
+
+def test_report_command_ticks_the_counter_each_call(monkeypatch):
+    eng = FakeEngine()
+    app = _engine_app(monkeypatch, eng)
+    asyncio.run(app.handle(9, "/report"))
+    asyncio.run(app.handle(9, "/report"))
+    assert eng.report_calls == 2
+    assert "report #2" in app.bot.sent[-1][1]
+
+
+# -------------------------------------------------------------- the chat fan-out
+
+
+def test_handle_remembers_the_chat(monkeypatch):
+    """The push list is built by talking to the bot: first message registers it."""
+    app = _app(monkeypatch)
+    assert app.chats == set()
+    asyncio.run(app.handle(7, "/status"))
+    assert app.chats == {7}
+
+
+def test_handle_tracks_every_chat_that_writes(monkeypatch):
+    app = _app(monkeypatch)
+    asyncio.run(app.handle(7, "/status"))
+    asyncio.run(app.handle(8, "/status"))
+    asyncio.run(app.handle(9, "turn the engine on"))
+    assert app.chats == {7, 8, 9}
+
+
+# --------------------------------------------------------- TELEGRAM_ALLOWED_CHATS
+
+
+def test_allowed_chats_env_parses_spaces_and_commas(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHATS", "111, 222 333")
+    assert tb._allowed_chats_from_env() == {111, 222, 333}
+
+
+def test_allowed_chats_env_empty_means_any(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
+    assert tb._allowed_chats_from_env() == set()
+
+
+def test_allowed_chats_env_ignores_junk(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHATS", " , abc, 555 , -1")
+    assert tb._allowed_chats_from_env() == {555}
+
+
+def test_chat_allowed_empty_list_accepts_everyone(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
+    app = _app(monkeypatch)
+    assert app._chat_allowed(1) is True
+    assert app._chat_allowed(99999) is True
+
+
+def test_chat_allowed_list_limits_answers(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHATS", "7")
+    app = _app(monkeypatch)
+    assert app._chat_allowed(7) is True
+    assert app._chat_allowed(9) is False
+
+
+def test_run_ignores_updates_from_disallowed_chats(monkeypatch):
+    """The allowlist must gate ANSWERS, not just the help text: an update from
+    a chat outside the list gets no reply and never joins the fan-out."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHATS", "7")
+    updates = [
+        {"update_id": 1, "message": {"chat": {"id": 7}, "text": "/status",
+                                     "from": {"username": "operator"}}},
+        {"update_id": 2, "message": {"chat": {"id": 9}, "text": "/status",
+                                     "from": {"username": "intruder"}}},
+    ]
+    app = _app(monkeypatch)
+    app.bot = FullFakeBot(updates)
+    asyncio.run(app.run(once=True))
+    assert [c for c, _, _ in app.bot.sent] == [7]
+    assert app.chats == {7}
+
+
+# ------------------------------------------------------------- the report pusher
+
+
+def test_push_report_once_fans_out_to_every_known_chat(monkeypatch):
+    eng = FakeEngine(report_on=True)
+    app = _engine_app(monkeypatch, eng)
+    app.chats.update([9001, 8, 77])
+    assert asyncio.run(app._push_report_once()) is True
+    # sorted(chat ids as strings) - deterministic fan-out order
+    assert [c for c, _, _ in app.bot.sent] == [77, 8, 9001]
+    assert all(md is True for _, _, md in app.bot.sent)
+    assert eng.report_calls == 1
+    assert eng.state.last_report_ts > 0.0
+
+
+def test_push_report_once_is_a_noop_when_report_off(monkeypatch):
+    """The operator never opted into pushes - the bot must stay silent."""
+    eng = FakeEngine(report_on=False)
+    app = _engine_app(monkeypatch, eng)
+    app.chats.add(7)
+    assert asyncio.run(app._push_report_once()) is False
+    assert app.bot.sent == []
+    assert eng.report_calls == 0
+
+
+def test_push_report_once_is_a_noop_when_no_chats_known(monkeypatch):
+    """A chat that never talked to the bot never gets a report."""
+    eng = FakeEngine(report_on=True)
+    app = _engine_app(monkeypatch, eng)
+    assert asyncio.run(app._push_report_once()) is False
+    assert app.bot.sent == []
+    assert eng.report_calls == 0
+
+
+def test_push_report_once_is_a_noop_without_an_engine(monkeypatch):
+    """agent=None (the bare test app): fail closed, never crash the loop."""
+    app = _app(monkeypatch)
+    assert asyncio.run(app._push_report_once()) is False
+    assert app.bot.sent == []
+
+
+def test_report_interval_uses_the_engine_interval(monkeypatch):
+    eng = FakeEngine(interval=90.0)
+    app = _engine_app(monkeypatch, eng)
+    assert app._report_interval() == pytest.approx(90.0)
+
+
+def test_report_interval_has_a_flood_floor(monkeypatch):
+    """A mistyped report_interval=1 must not flood Telegram: floor 5s."""
+    eng = FakeEngine(interval=2.0)
+    app = _engine_app(monkeypatch, eng)
+    assert app._report_interval() == tb.REPORT_MIN_INTERVAL
+
+
+def test_report_interval_survives_a_missing_engine(monkeypatch):
+    app = _app(monkeypatch)  # agent=None
+    assert app._report_interval() == pytest.approx(30.0)
+
+
+def test_report_push_loop_pushes_until_stopped(monkeypatch):
+    """Two full passes, then a fake sleep that stops it - and the loop's
+    `except Exception` must not swallow the stop signal (BaseException)."""
+    eng = FakeEngine(report_on=True, interval=30.0)
+    app = _engine_app(monkeypatch, eng)
+    app.chats.add(7)
+
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            raise _Stop()
+        return await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with pytest.raises(_Stop):
+        asyncio.run(app.report_push_loop())
+
+    assert eng.report_calls == 2
+    assert len(app.bot.sent) == 2
+    assert sleeps == [30.0, 30.0]
+
+
+def test_report_push_loop_absorbs_a_failing_engine(monkeypatch):
+    """A broken engine is logged, not fatal: the pusher keeps its cadence."""
+    eng = FakeEngine(report_on=True)
+    app = _engine_app(monkeypatch, eng)
+
+    async def boom():
+        raise RuntimeError("engine snapshot exploded")
+
+    eng.report = boom  # type: ignore[method-assign]
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            raise _Stop()
+        return
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with pytest.raises(_Stop):
+        asyncio.run(app.report_push_loop())
+
+    assert len(sleeps) == 2
+    assert app.bot.sent == []
