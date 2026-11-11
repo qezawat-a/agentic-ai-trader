@@ -27,7 +27,7 @@ from .model_selector import autoset_model, persist_model
 from . import nlu
 from .permissions import PermissionManager
 from .settings_store import mirror_env
-from .store import Store
+from .store import Store, open_store
 from .thinking import (DEFAULT_LEVEL, LEVEL_HELP, LEVELS, ONE_LINER,
                        build_reasoning_params, closest_level, describe_params,
                        normalize_level)
@@ -323,7 +323,7 @@ class JRockAgent:
             block_destructive=self.s.block_destructive,
         )
         self.tools = Tools(self.perms)
-        self.store = Store(data_dir=self.s.data_dir)
+        self.store = open_store(self.s)
         self._register_secrets()
         self.memory = MemoryStore(self.s.data_dir / "memory.jsonl")
         # Precedence: persisted store > .env > built-in default. Applied before
@@ -443,6 +443,15 @@ class JRockAgent:
         return f"Soul updated ({len(text)} chars appended)."
 
     # ------------------------------------------------------------ startup
+    def state_banner(self) -> str:
+        """One honest line about what survived the restart, and from where.
+
+        Public: the Telegram bot shows it to the operator when they first
+        write after a restart, so "everything looks reset" is explained
+        instead of guessed at.
+        """
+        return self._state_banner()
+
     def _state_banner(self) -> str:
         """One honest line about what survived the restart, and from where."""
         sm = self.store.summary()
@@ -455,8 +464,10 @@ class JRockAgent:
         # in fact restored eight of them.
         restored = self.engine.restored
         n_settings = sm["settings"] + len(restored.get("settings") or [])
+        where = (sm["path"] if sm.get("kind") == "database"
+                 else str(Path(sm["path"]).parent))
         parts = [f"State: loaded {n_settings} settings, "
-                 f"{mem['total']} memory entries from {Path(sm['path']).parent}"]
+                 f"{mem['total']} memory entries from {where}"]
         if sm["migrated_from"]:
             parts.append(f"  migrated store schema v{sm['migrated_from']} -> v{sm['version']}")
         if sm["recovered_backup"]:

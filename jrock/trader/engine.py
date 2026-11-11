@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from ..account import account_equity
 from ..config import Settings
-from ..store import Store
+from ..store import Store, open_store
 from .account_tpsl import (AccountTpSlConfig, account_tpsl_decision,
                            total_unrealized_pnl)
 from .aggregator import Aggregate, aggregate
@@ -235,7 +235,9 @@ class TraderEngine:
 
     def _open_store(self, settings: Settings, store: Store | None) -> Store:
         """The store, with the API secrets registered as secrets."""
-        st = store if store is not None else Store(data_dir=self.data_dir)
+        # No injected store -> build the right one for this configuration
+        # (the database when DATABASE_URL is set, the file otherwise).
+        st = store if store is not None else open_store(settings)
         if settings.bitunix_api_key:
             st.register_secret(settings.bitunix_api_key)
         if settings.bitunix_api_secret:
@@ -2344,7 +2346,8 @@ class TraderEngine:
         "start trading", "stop trading", "autotrade", "engine on", "engine off",
         "status", "report ", "trades_history", "trades history", "tpsl_history",
         "tpsl history", "pnl", "p&l", "settings", "scan on", "scan off",
-        "mid management", "reversal", "scans interval", "breakeven threshold",
+        "mid management", "reversal", "reversal_confidence", "reentry cooldown",
+        "scans interval", "breakeven threshold",
         "trailing trigger", "liq sl distance", "min agreeing", "timeframes",
         "min confidence", "tf min confidence", "positions history", "close position",
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
@@ -2369,7 +2372,7 @@ class TraderEngine:
         prefix only counts as a command when the REST of the line is the
         argument shape that command actually accepts.
         """
-        low = line.strip().lower()
+        low = self._normalize_command(line.strip().lower())
         if not low:
             return False
         if low in ("status", "pnl", "p&l", "trades_history", "tpsl_history",
@@ -2385,13 +2388,37 @@ class TraderEngine:
                 return True
         return False
 
+    #: The wording an operator actually types, mapped onto the canonical
+    #: grammar. Without this, a setting they believe they changed is
+    #: SILENTLY not changed - the line falls through to the model, which
+    #: either fails or invents a confirmation - and the old value is still
+    #: there after a restart. That reads as "everything reset".
+    COMMAND_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
+        (re.compile(r"^risk[ _]pct\s+(.+)$"), r"risk \1"),
+        (re.compile(r"^risk per trade\s+(.+)$"), r"risk \1"),
+        (re.compile(r"^margin_amount_pct\s+(.+)$"), r"margin amount \1"),
+        (re.compile(r"^margin per trade\s+(.+)$"), r"margin amount \1"),
+        (re.compile(r"^reversal[ _]conf(?:idence)?\s+(.+)$"), r"reversal_confidence \1"),
+        (re.compile(r"^breakeven\s+([\d.]+)$"), r"breakeven threshold \1"),
+        (re.compile(r"^scan interval\s+(.+)$"), r"scans interval \1"),
+        (re.compile(r"^reentry[ _]cooldown\s+(.+)$"), r"reentry cooldown \1"),
+    )
+
+    def _normalize_command(self, low: str) -> str:
+        """Rewrite the operator's wording into the canonical grammar."""
+        for pattern, replacement in self.COMMAND_ALIASES:
+            m = pattern.match(low)
+            if m:
+                return pattern.sub(replacement, low)
+        return low
+
     #: Commands whose argument is a bare number (optionally with a unit word).
     _NUMERIC_ARG_COMMANDS: tuple[str, ...] = (
         "leverage", "risk", "max open positions", "scans interval",
         "report interval", "breakeven threshold", "trailing trigger",
         "liq sl distance", "min agreeing", "min confidence",
         "tf min confidence", "account tp usdt", "account sl usdt",
-        "margin amount",
+        "margin amount", "reversal_confidence", "reentry cooldown",
     )
 
     def _is_command_argument(self, prefix: str, rest: str) -> bool:
@@ -2473,7 +2500,10 @@ class TraderEngine:
         raw = line.strip()
         if not raw:
             return ""
-        low = raw.lower()
+        # The operator's wording is normalised onto the canonical grammar
+        # here too, so the aliases behave the same in every branch.
+        low = self._normalize_command(raw.lower())
+        raw = low
 
         def arg(prefix: str) -> str:
             return raw[len(prefix):].strip()
@@ -2543,6 +2573,13 @@ class TraderEngine:
                 return f"Reversal confidence = {s.reversal_confidence}."
             except ValueError:
                 return "Usage: Reversal_confidence=70"
+        if low.startswith("reentry cooldown"):
+            try:
+                s.reentry_cooldown_sec = int(arg("reentry cooldown").split()[-1])
+                return (f"Re-entry cooldown = {s.reentry_cooldown_sec}s "
+                        f"(the same symbol cannot be re-entered faster than this).")
+            except (ValueError, IndexError):
+                return "Usage: reentry cooldown sec 60"
         if low.startswith("reversal"):
             val = arg("reversal").strip("= ").lower()
             s.reversal = val in ("true", "1", "on", "yes")

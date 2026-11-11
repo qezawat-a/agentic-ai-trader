@@ -363,3 +363,38 @@ def test_settings_shows_every_settable_field(tmp_path):
     out = _run(a.handle("/settings"))
     for field, needle in SETTINGS_VISIBLE.items():
         assert needle in out, f"{field} is not visible in /settings (looked for {needle!r})"
+
+
+# ---------------------------------------------------------------- the aliases
+# The wording an operator actually types. Each one used to fall through to
+# the model (which failed, or invented a confirmation) and leave the setting
+# unchanged - so the operator saw the old value and thought it had reset.
+SETTING_ALIASES = [
+    ("risk_pct 2.0",        "risk_pct", 2.0),
+    ("risk pct 2.0",        "risk_pct", 2.0),
+    ("risk per trade 2.0",  "risk_pct", 2.0),
+    ("margin_amount_pct 35", "margin_amount_pct", 35.0),
+    ("margin per trade 35", "margin_amount_pct", 35.0),
+    ("reversal confidence 85", "reversal_confidence", 85.0),
+    ("reversal_confidence 85", "reversal_confidence", 85.0),
+    ("breakeven 12",        "breakeven_pct", 12.0),
+    ("scan interval 15",    "scan_interval", 15),
+    ("reentry cooldown 120", "reentry_cooldown_sec", 120),
+]
+
+
+@pytest.mark.parametrize("line,field,value", SETTING_ALIASES)
+def test_a_setting_alias_reaches_the_engine(tmp_path, line, field, value):
+    """An alias must set the value, not fall through to the model."""
+    a = _agent(tmp_path)
+    out = _run(a.handle(line))
+    assert "model" not in out.lower()[:80], f"{line} went to the model: {out}"
+    assert getattr(a.engine.state, field) == value, (line, out)
+
+
+def test_the_aliases_do_not_swallow_a_question(tmp_path):
+    """The alias grammar must stay narrow: a question is still a question."""
+    a = _agent(tmp_path)
+    for q in ("is the leverage too high?", "what does margin per trade mean?",
+              "should I set reversal confidence to 90?"):
+        assert not a.engine.looks_like_command(q), q

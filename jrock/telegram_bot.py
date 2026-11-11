@@ -401,8 +401,23 @@ class JRockTelegramApp:
         # Remember the chat so the report push knows WHO to talk to. The
         # allowlist gate already ran in run(); handle() itself is the fan-out
         # source of truth for "chats the operator actually talked to".
+        first_contact = chat_id not in self.chats
         self.chats.add(chat_id)
         cmd, rest = _split_command(text)
+
+        # The first message after a restart gets the state banner: what
+        # survived, and - crucially - that engine_on/autotrade are NOT
+        # auto-resumed. Without this the operator sees a "reset" agent and
+        # has no way to tell a deliberate safety choice from a lost state.
+        if first_contact:
+            try:
+                banner = self.agent.state_banner()
+            except Exception as e:  # noqa: BLE001 - the banner must never
+                log.debug("state banner unavailable: %s", e)   # break the chat
+                banner = ""
+            if banner:
+                await self.bot.send(chat_id, f"<b>J+Rock restarted</b>\n{_e(banner)}",
+                                    markdown=True)
 
         # Every reply carries the persistent keyboard, so the commands stay in
         # the bottom-left corner of the chat without the operator asking for

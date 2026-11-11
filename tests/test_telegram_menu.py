@@ -250,3 +250,28 @@ def test_status_renders_the_screenshot_numbers(monkeypatch):
     assert "0.68" in text
     assert "INIUSDT" in text
     assert "25x" in text
+
+
+def test_the_first_message_after_a_restart_explains_the_state():
+    """The operator must not have to guess why the agent looks reset.
+
+    engine_on and autotrade are deliberately NOT auto-resumed after a
+    restart, so the bot says so out loud when they first write.
+    """
+    from jrock.agent import JRockAgent
+    from jrock.config import Settings
+
+    agent = JRockAgent(Settings())
+    bot = RecordingCallBot()
+    app = tb.JRockTelegramApp(agent, bot)
+
+    asyncio.run(app.handle(42, "/status"))
+    first = [p for _m, p in bot.calls]
+    text = " ".join(str(p.get("text", "")) for p in first)
+    assert "J+Rock restarted" in text, text[:200]
+
+    # and only once: the second message must not repeat the banner
+    before = len(bot.calls)
+    asyncio.run(app.handle(42, "/status"))
+    new_text = " ".join(str(p.get("text", "")) for _m, p in bot.calls[before:])
+    assert "J+Rock restarted" not in new_text, new_text[:200]

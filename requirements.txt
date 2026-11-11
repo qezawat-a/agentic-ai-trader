@@ -3,3 +3,7 @@ websockets>=12.0
 python-dotenv>=1.0
 pytest>=8.0
 pytest-asyncio>=0.23
+# Optional: only needed when DATABASE_URL is set. The durable state then
+# lives in Postgres instead of data/state.json, so a redeploy that recreates
+# the working copy cannot lose it.
+psycopg[binary]>=3.1

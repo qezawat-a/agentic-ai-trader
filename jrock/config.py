@@ -118,6 +118,10 @@ class Settings:
     bitunix_base_url: str = "https://fapi.bitunix.com"
     bitunix_ws_public: str = "wss://fapi.bitunix.com/public/"
     bitunix_ws_private: str = "wss://fapi.bitunix.com/private/"
+    #: Postgres DSN for the durable state. Empty -> the file store
+    #: (data/state.json). Set -> the database IS the state, so a redeploy that
+    #: recreates the checkout cannot lose it.
+    database_url: str = ""
     auto_accept_edit: bool = False
     full_device_access: bool = False
     block_destructive: bool = True
@@ -286,6 +290,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         account_sl_usdt=_f("ACCOUNT_SL_USDT", 0.0),
         self_heal_interval_hours=_f("SELF_HEAL_INTERVAL_HOURS", 6.0),
         self_heal_auto_push=_b("SELF_HEAL_AUTO_PUSH", True),
+        database_url=(os.getenv("DATABASE_URL") or "").strip(),
     )
 
 

@@ -304,6 +304,7 @@ class Store:
     # ------------------------------------------------------------------- report
     def summary(self) -> dict[str, Any]:
         return {
+            "kind": "file",
             "path": str(self.path),
             "version": self.version,
             "settings": len(self.settings),
@@ -319,6 +320,27 @@ class Store:
 
     def size_bytes(self) -> int:
         return self.path.stat().st_size if self.path.exists() else 0
+
+
+# ------------------------------------------------------------------- factory
+def open_store(settings) -> Store:
+    """The store the agent and the engine use.
+
+    DATABASE_URL set  -> Postgres. The database IS the state, so it survives a
+    redeploy that recreates the working copy.
+    DATABASE_URL unset -> the file store (data/state.json), as before.
+
+    Fail closed: when DATABASE_URL is set but the database cannot be used,
+    this raises instead of falling back to a file. A silent fallback would
+    reproduce the exact bug the database was added to fix - the state would
+    look fine right up to the next redeploy.
+    """
+    dsn = (getattr(settings, "database_url", "") or "").strip()
+    if not dsn:
+        return Store(data_dir=settings.data_dir)
+    from .pgstore import PostgresStore
+
+    return PostgresStore(dsn)
 
 
 # ------------------------------------------------------------------ compat shim
