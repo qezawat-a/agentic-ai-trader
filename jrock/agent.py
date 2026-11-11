@@ -32,7 +32,7 @@ from .thinking import (DEFAULT_LEVEL, LEVEL_HELP, LEVELS, ONE_LINER,
                        build_reasoning_params, closest_level, describe_params,
                        normalize_level)
 from .trader.client import order_rows
-from .trader.engine import TraderEngine
+from .trader.engine import MIN_STOP_TICKS, TraderEngine
 
 SOUL_PATH = ROOT / "soul" / "jrock.soul.md"
 
@@ -1797,8 +1797,12 @@ class JRockAgent:
         if self._has_bitunix_keys():
             lines.append(await self._settings_position_mode())
         else:
-            lines.append("position mode: ? (no API keys - the exchange was not read)")
+            # The exchange is the truth for the position mode; the local
+            # setting is only a hint, so it is labelled as one.
+            lines.append(f"position mode: ? (no API keys - the exchange was not "
+                         f"read; the local setting is {self.engine.state.position_mode})")
         lines.extend(self._settings_config_lines())
+        lines.extend(self._settings_param_lines())
         if syms:
             if not self._has_bitunix_keys():
                 lines.append("per-symbol settings: skipped (no API keys)")
@@ -1821,7 +1825,11 @@ class JRockAgent:
 
     def _settings_config_lines(self) -> list[str]:
         """The account-level config: margin mode, leverage and the rest of the
-        engine's trading parameters. No per-symbol listing."""
+        engine's trading parameters. No per-symbol listing.
+
+        Every field the operator can set has to be here: a setting they
+        cannot see is a setting they cannot verify.
+        """
         s = self.engine.state
         # The margin target is the SIZING AUTHORITY when it is set, and risk_pct
         # is then ignored - so both must be on screen, or the operator cannot
@@ -1838,6 +1846,7 @@ class JRockAgent:
             f"margin mode: {s.margin_mode}",
             f"leverage: {s.leverage}x",
             f"max open positions: {s.max_open_positions}",
+            f"symbols: {','.join(s.symbols) or 'none'}",
             margin_line,
             risk_line,
             f"breakeven: {s.breakeven_pct}%  "
@@ -1847,6 +1856,8 @@ class JRockAgent:
             f"timeframes: {','.join(s.timeframes)}",
             f"min confidence: {s.min_confidence}  "
             f"tf min confidence: {s.tf_min_confidence}",
+            f"reversal: {'on' if s.reversal else 'off'}  "
+            f"reversal confidence: {s.reversal_confidence}",
             f"scan interval: {s.scan_interval}s  "
             f"report interval: {s.report_interval}s  "
             f"re-entry cooldown: {s.reentry_cooldown_sec}s",
@@ -1854,7 +1865,18 @@ class JRockAgent:
             f"partial ladder: {s.partial_tp_ladder or 'off'} "
             f"(account TP/SL {s.account_tp_usdt:g}/{s.account_sl_usdt:g} USDT)",
             f"engine_on={s.engine_on} scan_on={s.scan_on} "
-            f"autotrade={s.autotrade} mid_management={s.mid_management}",
+            f"autotrade={s.autotrade} report_on={s.report_on} "
+            f"mid_management={s.mid_management}",
+        ]
+
+    def _settings_param_lines(self) -> list[str]:
+        """The engine's own parameters - the numbers that shape every order
+        (fees, margin safety, the minimum stop)."""
+        s = self.engine.s
+        return [
+            f"engine parameters: min stop {MIN_STOP_TICKS} ticks  "
+            f"taker fee {s.taker_fee_rate * 100:g}%  "
+            f"margin safety {s.margin_safety_pct:g}%",
         ]
 
     async def _settings_per_symbol(self, syms: list[str], lines: list[str]) -> None:

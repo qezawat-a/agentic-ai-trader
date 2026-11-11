@@ -302,3 +302,64 @@ def test_settings_show_the_margin_target_and_the_cooldown(tmp_path):
     out = _run(a.handle("/settings"))
     assert "margin per trade: off" in out, out
     assert "risk per trade: 1.5%" in out, out
+
+
+# Every field of EngineState that the operator can set, and the text in
+# /settings that must carry it. A field that is NOT in this table is a field
+# nobody can see - and a new field breaks the test until it is added here.
+SETTINGS_VISIBLE = {
+    "engine_on": "engine_on=",
+    "scan_on": "scan_on=",
+    "autotrade": "autotrade=",
+    "report_on": "report_on=",
+    "mid_management": "mid_management=",
+    "scan_interval": "scan interval:",
+    "report_interval": "report interval:",
+    "reentry_cooldown_sec": "re-entry cooldown:",
+    "reversal": "reversal:",
+    "reversal_confidence": "reversal confidence:",
+    "symbols": "symbols:",
+    "leverage": "leverage:",
+    "margin_mode": "margin mode:",
+    "position_mode": "position mode:",
+    "max_open_positions": "max open positions:",
+    "risk_pct": "risk per trade:",
+    "margin_amount_pct": "margin per trade:",
+    "breakeven_pct": "breakeven:",
+    "trailing_trigger_roi_pct": "trailing trigger:",
+    "liq_sl_distance_pct": "liq SL distance:",
+    "min_agreeing": "min agreeing strategies:",
+    "timeframes": "timeframes:",
+    "min_confidence": "min confidence:",
+    "tf_min_confidence": "tf min confidence:",
+    "tpsl_method": "tpsl method:",
+    "partial_tp_ladder": "partial ladder:",
+    "account_tp_usdt": "account TP/SL",
+    "account_sl_usdt": "account TP/SL",
+}
+
+# The fields that are engine internals, not operator settings.
+SETTINGS_INTERNAL = {
+    "last_scan_ts", "last_report_ts", "scans", "errors", "notes",
+}
+
+
+def test_settings_shows_every_settable_field(tmp_path):
+    """A setting the operator cannot see is a setting they cannot verify.
+
+    This is the gate that keeps /settings complete: when a new field is added
+    to EngineState, this test fails until the field is either shown or
+    explicitly listed as an internal.
+    """
+    from jrock.trader.engine import EngineState
+
+    fields = {f.name for f in EngineState.__dataclass_fields__.values()}
+    uncovered = fields - set(SETTINGS_VISIBLE) - SETTINGS_INTERNAL
+    assert not uncovered, f"new EngineState fields are not shown in /settings: {sorted(uncovered)}"
+    stale = set(SETTINGS_VISIBLE) - fields
+    assert not stale, f"SETTINGS_VISIBLE names a field that no longer exists: {sorted(stale)}"
+
+    a = _agent(tmp_path)
+    out = _run(a.handle("/settings"))
+    for field, needle in SETTINGS_VISIBLE.items():
+        assert needle in out, f"{field} is not visible in /settings (looked for {needle!r})"
