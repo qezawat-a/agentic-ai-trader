@@ -1427,6 +1427,38 @@ class TraderEngine:
         except BitunixAPIError as e:
             if e.code not in (20006,):
                 self.state.errors.append(f"leverage {ctx.sym}: {e}")
+            return
+        await self._note_leverage_result(ctx)
+
+    async def _note_leverage_result(self, ctx: _EntryContext) -> None:
+        """What the exchange actually stored after the leverage write.
+
+        The official write (`change_leverage`) is symbol-wide - it has no
+        side parameter - but in hedge mode the exchange keeps LONG and
+        SHORT leverage separately (`get_trading_settings` returns
+        `longLeverage` and `shortLeverage`, and the UI's "Sync Long/Short"
+        toggle keeps them equal). Read the symbol back after the write so
+        the entry notes show whether both sides took the value.
+        """
+        try:
+            data = await self.client.get_trading_settings(ctx.sym)
+        except Exception:  # noqa: BLE001 - a note must never break an entry
+            return
+        rows = data if isinstance(data, list) else ([data] if data else [])
+        row = next((r for r in rows if isinstance(r, dict)
+                    and str(r.get("symbol", "")).upper() == ctx.sym.upper()),
+                   None)
+        if row is None:
+            return
+        long_lev = row.get("longLeverage")
+        short_lev = row.get("shortLeverage")
+        if long_lev is None and short_lev is None:
+            return
+        verdict = ("synced" if long_lev == short_lev
+                   else "NOT synced - the UI's Sync Long/Short will be off")
+        ctx.notes.append(
+            f"leverage applied {ctx.sym}: the exchange now reports "
+            f"long {long_lev}x / short {short_lev}x ({verdict})")
 
     async def _build_entry_body(self, ctx: _EntryContext, order_side: str,
                                 plan: Any, tp_for_order: float | None,

@@ -1880,7 +1880,7 @@ class JRockAgent:
                 lines.append(f"{sym}: {type(e).__name__}: {e}")
                 continue
             row = d[0] if isinstance(d, list) and d else (d or {})
-            lines.append(f"{sym}: leverage={row.get('leverage')}x "
+            lines.append(f"{sym}: leverage={self._per_side_leverage(row)} "
                          f"marginMode={row.get('marginMode')}")
         return "\n".join(lines)
 
@@ -2002,6 +2002,32 @@ class JRockAgent:
             f"margin safety {s.margin_safety_pct:g}%",
         ]
 
+    @staticmethod
+    def _per_side_leverage(row: Any) -> str:
+        """How the exchange stores leverage for one symbol.
+
+        In hedge mode the exchange keeps LONG and SHORT separately
+        (official `get_trading_settings` returns `longLeverage` and
+        `shortLeverage`). The UI's "Sync Long/Short" toggle keeps them
+        equal; when they drift the toggle goes off and the dialog shows
+        two numbers. Show that truth instead of the legacy symbol-wide
+        field, which can hide a drift.
+        """
+        try:
+            long_lev = int(row.get("longLeverage"))
+            short_lev = int(row.get("shortLeverage"))
+        except (TypeError, ValueError):
+            long_lev = short_lev = 0
+        if long_lev and short_lev:
+            if long_lev == short_lev:
+                return f"{long_lev}x (long {long_lev}x / short {short_lev}x, synced)"
+            return (f"{long_lev}x (long {long_lev}x / "
+                    f"short {short_lev}x - NOT synced)")
+        try:
+            return f"{int(row.get('leverage'))}x"
+        except (TypeError, ValueError):
+            return "?x"
+
     async def _settings_per_symbol(self, syms: list[str], lines: list[str]) -> None:
         """Only when the user names a REAL symbol, show that symbol's
         configured margin mode + leverage. Never a wall of symbols."""
@@ -2037,7 +2063,7 @@ class JRockAgent:
             for r in rows:
                 if isinstance(r, dict):
                     lines.append(f"  {r.get('symbol')}: "
-                                 f"leverage={r.get('leverage')}x "
+                                 f"leverage={self._per_side_leverage(r)} "
                                  f"marginMode={r.get('marginMode')}")
 
     async def _valid_symbols(self, syms: list[str]) -> set[str] | None:
