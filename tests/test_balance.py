@@ -103,11 +103,40 @@ def test_render_balance_has_all_columns():
     out = render_balance(BalanceReport(accounts=parse_accounts(MOCK_ACCOUNT),
                                        is_demo=False,
                                        base_url="https://fapi.bitunix.com"))
-    for col in ("asset", "available", "frozen", "margin", "unrealized", "equity"):
+    for col in ("asset", "available", "frozen", "margin", "equity"):
         assert col in out
     assert "USDT" in out
     assert "1012.0000" in out
     assert "LIVE" in out
+
+
+def test_render_balance_shows_cross_isolation_and_bonus_separately():
+    """The endpoint reports three distinct fields - crossUnrealizedPNL,
+    isolationUnrealizedPNL and bonus. Each must have its own column: one
+    combined 'unrealized' number hides which margin mode holds the PnL, and
+    a footer-only bonus is easy to miss."""
+    row = dict(MOCK_ACCOUNT[0], crossUnrealizedPNL="2.5",
+               isolationUnrealizedPNL="1.5", bonus="7")
+    out = render_balance(BalanceReport(accounts=parse_accounts([row]),
+                                       is_demo=False,
+                                       base_url="https://fapi.bitunix.com"))
+    for col in ("cross uPnL", "iso uPnL", "bonus"):
+        assert col in out, f"missing column: {col}"
+    assert "+2.5000" in out and "+1.5000" in out and "7.0000" in out
+    # the combined total still equals cross + isolation; bonus stays out
+    assert "1014.0000" in out  # 1000 + 0 frozen + 10 margin + 2.5 + 1.5
+
+
+def test_bonus_is_not_counted_into_equity():
+    """Futures bonus is exchange credit - visible, but not equity."""
+    row = dict(MOCK_ACCOUNT[0], bonus="50")
+    a = parse_accounts([row])[0]
+    assert a.bonus == 50.0
+    assert a.equity == a.available + a.frozen + a.margin + a.unrealized
+    out = render_balance(BalanceReport(accounts=parse_accounts([row]),
+                                       is_demo=False,
+                                       base_url="https://fapi.bitunix.com"))
+    assert "NOT counted into equity" in out
 
 
 def test_render_balance_marks_demo():

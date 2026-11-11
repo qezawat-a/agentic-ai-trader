@@ -135,14 +135,21 @@ def render_balance(report: BalanceReport) -> str:
     lines = [f"=== account balance ({env}) ===",
              f"endpoint: {report.base_url}", ""]
 
-    headers = ("asset", "available", "frozen", "margin", "unrealized", "equity")
+    # All three unrealized/bonus fields the endpoint reports, each in its own
+    # column: collapsing cross + isolation into one number hid which margin
+    # mode actually held the PnL, and bonus (futures bonus, exchange credit -
+    # NOT counted into equity) was buried in a footer line.
+    headers = ("asset", "available", "frozen", "margin",
+               "cross uPnL", "iso uPnL", "bonus", "equity")
     rows = []
     for a in report.accounts:
         rows.append((a.margin_coin,
                      f"{a.available:.4f}",
                      f"{a.frozen:.4f}",
                      f"{a.margin:.4f}",
-                     f"{a.unrealized:+.4f}",
+                     f"{a.cross_unrealized:+.4f}",
+                     f"{a.isolation_unrealized:+.4f}",
+                     f"{a.bonus:.4f}",
                      f"{a.equity:.4f}"))
 
     widths = [max(len(headers[i]), *(len(r[i]) for r in rows)) for i in range(len(headers))]
@@ -154,16 +161,20 @@ def render_balance(report: BalanceReport) -> str:
 
     if len(report.accounts) > 1:
         lines.append("  ".join("-" * w for w in widths))
-        lines.append(fmt.format("TOTAL", "", "", "",
-                                f"{report.total_unrealized:+.4f}",
-                                f"{report.total_equity:.4f}"))
+        lines.append(fmt.format(
+            "TOTAL", "", "", "",
+            f"{sum(a.cross_unrealized for a in report.accounts):+.4f}",
+            f"{sum(a.isolation_unrealized for a in report.accounts):+.4f}",
+            f"{sum(a.bonus for a in report.accounts):.4f}",
+            f"{report.total_equity:.4f}"))
 
     lines.append("")
     for a in report.accounts:
         lines.append(f"{a.margin_coin}: position mode={a.position_mode or '?'} "
-                     f"transferable={a.transfer:.4f} bonus={a.bonus:.4f}")
+                     f"transferable={a.transfer:.4f}")
     lines.append("")
-    lines.append("equity = available + frozen + margin + unrealized")
+    lines.append("equity = available + frozen + margin + cross uPnL + iso uPnL "
+                 "(bonus is exchange credit and is NOT counted into equity)")
     return "\n".join(lines)
 
 
