@@ -50,13 +50,15 @@ def _run(coro):
 
 
 # ------------------------------------------------------- junk gets executed
-def test_wrapped_ladder_call_is_executed(tmp_path):
+def test_wrapped_ladder_call_is_refused_with_the_command_to_type(tmp_path):
+    """An imagined SETTER is never run - the operator gets the exact command."""
     a = _agent(tmp_path)
     _stub_chat(a, "<|tool_call_start|>[/-partial_ladder_off()]<|tool_call_end|>")
     out = _run(a.chat("turn off the ladder"))
     assert "<|tool_call" not in out
-    assert "PARTIAL ladder OFF" in out
-    assert not a.engine.state.partial_tp_ladder
+    assert "I did not run" in out
+    assert "partial ladder off" in out
+    assert a.engine.state.partial_tp_ladder  # unchanged
 
 
 def test_wrapped_tpsl_call_shows_the_exits(tmp_path):
@@ -76,14 +78,14 @@ def test_bare_bracket_call_without_the_tokens(tmp_path):
     assert "engine" in out.lower()
 
 
-def test_prose_stays_around_the_executed_call(tmp_path):
+def test_prose_stays_around_the_refused_call(tmp_path):
     a = _agent(tmp_path)
     _stub_chat(a, "Sure - turning it off now.\n"
                   "<|tool_call_start|>[/-partial_ladder_off()]<|tool_call_end|>\n"
                   "Done.")
     out = _run(a.chat("turn the ladder off"))
     assert "turning it off now" in out
-    assert "PARTIAL ladder OFF" in out
+    assert "I did not run" in out
     assert "<|tool_call" not in out
 
 
@@ -114,14 +116,22 @@ def test_normal_markdown_survives(tmp_path):
     assert "See the docs [here](https://example.com)" in out
 
 
-def test_ladder_call_routes_through_the_confirm_free_path(tmp_path):
-    """`partial ladder off` is not destructive - it must be APPLIED, not
-    parked in a confirm prompt."""
+def test_imagined_close_position_never_executes(tmp_path):
+    """The worst case: the model imagines a CLOSE. It must be refused, and
+    the position must still be there."""
     a = _agent(tmp_path)
-    _stub_chat(a, "[/-partial_ladder_off()]")
-    out = _run(a.chat("ladder off please"))
-    assert not a.engine.state.partial_tp_ladder
-    assert "confirm" not in out.lower()
+    _stub_chat(a, "<|tool_call_start|>[/close position INITUSDT()]<|tool_call_end|>")
+    out = _run(a.chat("what should I do with INIT"))
+    assert "I did not run" in out
+    assert "close position INITUSDT" in out
+
+
+def test_imagined_leverage_set_never_executes(tmp_path):
+    a = _agent(tmp_path)
+    _stub_chat(a, "[/leverage(100)]")
+    out = _run(a.chat("bump it"))
+    assert a.engine.state.leverage != 100
+    assert "I did not run" in out
 
 
 # ---------------------------------------------------- smalltalk false hit

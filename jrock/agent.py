@@ -1138,25 +1138,62 @@ class JRockAgent:
             cmd = f"{cmd} {args}"
         return cmd
 
+    #: Engine prefixes an IMAGINED tool call may reach: reads only. Anything
+    #: that moves money or changes state must come from the OPERATOR, not
+    #: from a free model's hallucinated syntax - so those fall through to
+    #: the NLU gate (confirm prompt) or are refused outright.
+    _IMAGINED_CALL_READ_PREFIXES: tuple[str, ...] = (
+        "status", "pnl", "p&l", "settings", "symbols", "trades history",
+        "trades_history", "tpsl history", "tpsl_history", "positions history",
+    )
+
+    #: AGENT_BARE mappings an imagined call may reach with no arguments.
+    _IMAGINED_CALL_BARE_READS: frozenset[str] = frozenset({
+        "balance", "bal", "wallet", "equity", "funds", "positions", "orders",
+        "price", "prices", "quote", "funding", "tpsl", "leverage", "margin",
+        "settings", "pnl", "status", "symbols", "pairs", "markets",
+    })
+
     async def _route_tool_call(self, text: str) -> str | None:
         """Run an imagined tool call through the SAME surfaces a human uses.
 
-        Engine grammar first, then the deterministic NLU. It never reaches
-        the model, so a junk reply cannot loop back into another model call,
-        and a destructive call gets the same confirm prompt a person gets.
+        Strictly READ-ONLY. The model imagined the call - the operator did
+        not type it - so nothing here may change state or move money:
+        engine reads and bare agent reads run, everything else falls to the
+        deterministic NLU, whose destructive intents get a confirm prompt
+        like a normal sentence. It never reaches the model, so a junk reply
+        cannot loop back into another model call.
         """
         low = text.strip().lower()
         if not low:
             return None
-        if low.split()[0] in AGENT_BARE:
-            return await self.handle(low)
-        if self.engine.looks_like_command(low):
+        refusal = (f"I did not run {text.strip()!r} from the model's reply - "
+                   f"I only auto-run read-only commands on a model's behalf. "
+                   f"To do it yourself, type: {text.strip()}")
+        head = low.split()[0]
+        rest = low[len(head):].strip()
+        if head in self._IMAGINED_CALL_BARE_READS and not rest:
+            return await self.handle(head)
+        if head in self._IMAGINED_CALL_BARE_READS and rest:
+            # a read with a symbol argument ("leverage BTCUSDT"); a numeric
+            # rest would be a SETTER - refused.
+            if re.search(r"\d", rest) or not re.fullmatch(
+                    r"[a-z0-9, ]*usdt[a-z0-9, ]*|all", rest):
+                return refusal
+            return await self.handle(f"{head} {rest}")
+        normalized = self.engine._normalize_command(low)
+        if (self.engine.looks_like_command(low)
+                and normalized.startswith(self._IMAGINED_CALL_READ_PREFIXES)):
             return await self.engine.command(low)
+        if self.engine.looks_like_command(low):
+            return refusal
         resolved = nlu.parse(low)
         if isinstance(resolved, nlu.Clarification):
             return self._render_clarification(resolved)
-        if isinstance(resolved, nlu.Intent) and resolved.command != "smalltalk":
-            return await self._act_on_intent(resolved)
+        if isinstance(resolved, nlu.Intent) and not resolved.destructive:
+            return await self._run_intent(resolved)
+        if isinstance(resolved, nlu.Intent):
+            return refusal
         return None
 
     async def _postprocess_model_reply(self, out: str) -> str:
