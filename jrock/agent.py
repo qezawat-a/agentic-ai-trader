@@ -2177,7 +2177,13 @@ class JRockAgent:
         if not syms:
             return
         try:
-            data = await self.engine.client.get_trading_settings(",".join(syms))
+            # The documented max for the symbols filter is 50 per call;
+            # chunk so even an over-long persisted watchlist stays in contract.
+            data: list = []
+            for i in range(0, len(syms), 50):
+                chunk = ",".join(syms[i:i + 50])
+                rows = await self.engine.client.get_trading_settings(chunk)
+                data.extend(rows if isinstance(rows, list) else [rows])
         except BitunixAPIError as e:
             if e.code == 20015:
                 lines.append(f"per-symbol settings: error 20015 - "
@@ -2232,6 +2238,8 @@ class JRockAgent:
 
     async def cmd_symbols(self, rest: str = "") -> str:
         from .trader.errors import BitunixAPIError
+
+        tokens = [t.upper() for t in re.split(r"[,\s]+", (rest or "").strip()) if t]
         try:
             data = await self.engine.client.get_trading_pairs()
         except BitunixAPIError as e:
@@ -2239,19 +2247,76 @@ class JRockAgent:
         except Exception as e:  # noqa: BLE001
             return f"symbols request failed: {type(e).__name__}: {e}"
         rows = data if isinstance(data, list) else []
-        q = (rest or "").strip().upper()
-        if q:
-            rows = [r for r in rows if q in str(r.get("symbol", "")).upper()]
-        if not rows:
-            return f"no symbols matching {q!r}" if q else "no symbols returned"
-        lines = [f"{len(rows)} symbol(s)" + (f" matching {q}" if q else "") + ":"]
-        for r in rows[:60]:
+        tradable = {str(r.get("symbol", "")).upper() for r in rows}
+
+        # "/symbols" bare: the operator's WATCHLIST, with each symbol's
+        # tradable status - not the whole exchange dumped back at them.
+        if not tokens:
+            watch = self.engine.state.symbols
+            if not watch:
+                return ("watchlist is empty - set it: "
+                        "symbols BTCUSDT,ETHUSDT (or /symbols BTCUSDT,ETHUSDT)")
+            lines = [f"watchlist ({len(watch)}):"]
+            for sym in watch:
+                lines.append(f"  {sym:<16} "
+                             + ("tradable" if sym in tradable else "NOT in the exchange list"))
+            lines.append("lookup the whole exchange: /symbols all | "
+                         "set: /symbols INITUSDT,ONEUSDT")
+            return "\n".join(lines)
+
+        # "/symbols all": the full exchange list (the old bare behaviour).
+        if tokens == ["ALL"]:
+            if not rows:
+                return "no symbols returned"
+            lines = [f"{len(rows)} symbol(s):"]
+            for r in rows[:60]:
+                lines.append(f"  {r.get('symbol'):<16} status={r.get('symbolStatus')} "
+                             f"maxLev={r.get('maxLeverage')} "
+                             f"basePrec={r.get('basePrecision')} "
+                             f"minVol={r.get('minTradeVolume')}")
+            if len(rows) > 60:
+                lines.append(f"  ... {len(rows) - 60} more")
+            return "\n".join(lines)
+
+        # Exact, comma/space separated tokens that all exist = a SET request:
+        # "/symbols INITUSDT, ONEUSDT" sets the watchlist. (The old code
+        # filtered the exchange list with the WHOLE string "INITUSDT, ONEUSDT"
+        # as one substring - which matches nothing, so the setter was
+        # unreachable from the slash form.)
+        exact = [t for t in tokens if t in tradable]
+        junk = [t for t in tokens
+                if t not in tradable
+                and not any(t in s for s in tradable)]
+        if junk:
+            # A name that is not even a fragment of any listed symbol is a
+            # typo - refuse the WHOLE request rather than half-applying it.
+            return (f"not in the exchange's trading pairs: {', '.join(junk)}\n"
+                    f"nothing was set. Check the spelling "
+                    f"(a fragment like 'INIT' looks symbols up)")
+        if exact and len(exact) == len(tokens):
+            out = await self.engine.command("symbols " + ",".join(tokens))
+            return (f"{out}\n"
+                    f"watchlist is now: {', '.join(self.engine.state.symbols)}")
+
+        # Otherwise: substring lookup across the tokens (discovery: "/symbols INIT").
+        q_rows = [r for r in rows
+                  if any(t in str(r.get("symbol", "")).upper() for t in tokens)]
+        if not q_rows:
+            missing = ", ".join(t for t in tokens if t not in tradable)
+            return (f"no symbols matching {rest.strip()!r}\n"
+                    f"not in the exchange's trading pairs: {missing}\n"
+                    f"(exact USDT symbols SET the watchlist; a fragment like "
+                    f"'INIT' looks them up)")
+        lines = [f"{len(q_rows)} symbol(s) matching {rest.strip()}: "]
+        for r in q_rows[:60]:
             lines.append(f"  {r.get('symbol'):<16} status={r.get('symbolStatus')} "
                          f"maxLev={r.get('maxLeverage')} "
                          f"basePrec={r.get('basePrecision')} "
                          f"minVol={r.get('minTradeVolume')}")
-        if len(rows) > 60:
-            lines.append(f"  ... {len(rows) - 60} more")
+        if len(q_rows) > 60:
+            lines.append(f"  ... {len(q_rows) - 60} more")
+        lines.append("set the watchlist with the exact names: "
+                     "/symbols " + ",".join(sorted({str(r.get('symbol')) for r in q_rows[:4]})))
         return "\n".join(lines)
 
     def cmd_memory(self, query: str) -> str:

@@ -3076,6 +3076,13 @@ class TraderEngine:
                 continue
             syms.append(sym)
         if syms:
+            # The account endpoints that take a symbols filter cap it at 50
+            # (documented on GET /api/v1/futures/account/trading_settings),
+            # and the watchlist feeds those calls. Refusing >50 here keeps
+            # every downstream symbols=... call inside the contract.
+            if len(syms) > 50:
+                return (f"max 50 symbols - you listed {len(syms)}. "
+                        f"Trim the list: Symbols BTCUSDT,ETHUSDT,...")
             s.symbols = syms
             await self.load_rules(syms)
             msg = f"Symbols = {','.join(syms)}"
