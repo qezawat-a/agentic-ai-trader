@@ -337,6 +337,23 @@ class BitunixClient:
 
     async def get_kline(self, symbol: str, interval: str, limit: int = 200,
                         end_time: int | None = None, ktype: str = "LAST_PRICE") -> Any:
+        """Market kline history.
+
+        VERIFIED against the 2026-11 changelog and docs/bitunix/get_kline.md:
+        - `startTime` is NOT a supported parameter and was removed from the
+          docs - it must never be sent (the other endpoints that still take
+          startTime are separate APIs).
+        - The query is `endTime` + `limit` COUNTING BACKWARD; the candle whose
+          open time equals `endTime` is NOT included (exclusive bound). Best
+          practice is an interval-aligned `endTime`; omitted, the server uses
+          the current forming candle's open time - so a plain call returns the
+          latest CLOSED candles, which is exactly what the strategies need.
+        - `type` defaults to LAST_PRICE; MARK_PRICE klines now actually work
+          (the parameter used to be ignored). The engine deliberately trades
+          on LAST_PRICE candles and validates TP/SL triggers against the MARK
+          price read from tickers instead.
+        - limit defaults to 100, maximum 200 (REST_KLINE_MAX matches).
+        """
         return await self.request("GET", "/api/v1/futures/market/kline",
                                   params={"symbol": symbol, "interval": interval, "limit": limit,
                                           "endTime": end_time, "type": ktype}, signed=False)

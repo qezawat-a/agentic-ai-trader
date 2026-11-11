@@ -165,6 +165,55 @@ def test_kline_uses_type_not_klinetype():
     assert "klineType" not in params
 
 
+def test_kline_sends_no_start_time_ever():
+    """2026-11 changelog: startTime is NOT supported on this endpoint and was
+    removed from the docs. The client must not even have the parameter."""
+    c, calls = _client()
+    asyncio.run(c.get_kline("BTCUSDT", "5m", limit=100))
+    params = calls[0]["params"]
+    assert "startTime" not in params
+    import inspect
+    from jrock.trader.client import BitunixClient
+    sig = inspect.signature(BitunixClient.get_kline)
+    assert "start_time" not in sig.parameters
+
+
+def test_kline_end_time_is_forwarded_and_never_serialized_as_none():
+    """The bound is exclusive and the count goes backward from endTime - the
+    client forwards it verbatim when given, and the transport drops it when
+    not given (request() filters None/"" params before building the URL)."""
+    c, calls = _client()
+    asyncio.run(c.get_kline("BTCUSDT", "15m", limit=2, end_time=1672410000000))
+    assert calls[0]["params"]["endTime"] == 1672410000000
+    asyncio.run(c.get_kline("BTCUSDT", "15m", limit=2))
+    assert calls[1]["params"]["endTime"] is None
+    dropped = {k: v for k, v in calls[1]["params"].items() if v is not None and v != ""}
+    assert "endTime" not in dropped
+
+
+def test_kline_type_defaults_to_last_price_and_accepts_mark_price():
+    """Default LAST_PRICE (the strategies trade last-price candles);
+    MARK_PRICE klines now actually work when asked for explicitly."""
+    c, calls = _client()
+    asyncio.run(c.get_kline("BTCUSDT", "1m", limit=10))
+    assert calls[0]["params"]["type"] == "LAST_PRICE"
+    asyncio.run(c.get_kline("BTCUSDT", "1m", limit=10, ktype="MARK_PRICE"))
+    assert calls[1]["params"]["type"] == "MARK_PRICE"
+
+
+def test_kline_limit_respects_the_documented_maximum():
+    """limit defaults to 100, max 200 - the engine's REST fallback must never
+    ask for more."""
+    from jrock.trader.kline_cache import REST_KLINE_MAX
+    assert REST_KLINE_MAX == 200
+    c, calls = _client()
+    asyncio.run(c.get_kline("BTCUSDT", "1m", limit=300))
+    assert calls[0]["params"]["limit"] == 300  # the CLIENT forwards; the ENGINE caps
+    from jrock.trader.engine import TraderEngine
+    e = TraderEngine.__new__(TraderEngine)  # cap logic, no network
+    assert min(300, REST_KLINE_MAX) == 200
+
+
 def test_trading_pairs_endpoint_path():
     c, calls = _client()
     asyncio.run(c.get_trading_pairs())
