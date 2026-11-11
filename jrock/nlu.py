@@ -173,6 +173,11 @@ def _b_positions(t: str) -> Intent:
                   describe="show open positions")
 
 
+def _b_history(t: str) -> Intent:
+    return Intent("history", "history", 0.95,
+                  describe="show closed positions, TP/SL events and trades")
+
+
 def _b_orders(t: str) -> Intent:
     return Intent("orders", "orders", 0.95,
                   describe="show pending orders")
@@ -513,6 +518,21 @@ RULES: list[tuple[str, re.Pattern, object]] = [
      _b_balance),
     ("balance", re.compile(r"\bhow much\b.*\b(do i have|have i got|is (in|on) my)\b", re.I),
      _b_balance),
+
+    # --- history (BEFORE positions: "position history" must not be read as
+    # the open-positions listing - the model then answers from the live
+    # state ("no open positions") and the operator never sees the past)
+    ("history", re.compile(r"\bhistory\b[^\n]{0,40}?\b(positions?|trades?|orders?|tpsl|tp\s*/\s*sl)\b", re.I),
+     _b_history),
+    ("history", re.compile(r"\b(positions?|trades?|trade|orders?|tpsl|tp\s*/\s*sl)\s+history\b", re.I),
+     _b_history),
+    ("history", re.compile(r"\b(past|previous|old)\s+(positions?|trades?|orders?)\b", re.I),
+     _b_history),
+    ("history", re.compile(r"^\s*(show\s+|see\s+|give\s+(me\s+)?)?(my\s+)?(trade\s+)?history\s*\??$", re.I),
+     _b_history),
+    # "تاریخچه" = history (Persian). With anything after it, or alone, the
+    # past is what is being asked for - a read-only view, so the rule is safe.
+    ("history", re.compile(r"^\s*تاریخچه\b"), _b_history),
 
     # --- positions
     ("positions", re.compile(

@@ -53,6 +53,7 @@ COMMANDS: list[tuple[str, str]] = [
     # --- the trading engine
     ("status", "engine + account + positions"),
     ("positions", "open positions"),
+    ("history", "closed positions + TP/SL + trades"),
     ("orders", "pending orders"),
     ("pnl", "account and PnL"),
     ("report", "generate and send one engine report now"),
@@ -464,7 +465,7 @@ class JRockTelegramApp:
             elif cmd == "exits":
                 out = await self.agent.handle("/exits")
                 await self.bot.send(chat_id, _e(out))
-            elif cmd in ("tpsl", "balance", "price"):
+            elif cmd in ("tpsl", "balance", "price", "history"):
                 # Read-only agent commands: reuse the CLI routing verbatim
                 # (arguments included, e.g. "/tpsl pending BTCUSDT").
                 out = await self.agent.handle(f"{cmd}{(' ' + rest) if rest else ''}")

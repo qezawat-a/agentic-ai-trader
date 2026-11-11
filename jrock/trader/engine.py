@@ -16,6 +16,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -52,6 +53,14 @@ from .tpsl import (PartialLadderError, PositionState, LadderRung,
 from .ws import MarketDataFeed, PrivateFeed, WSConfig
 
 log = logging.getLogger("jrock.engine")
+
+
+def _fmt_ms_ts(ts: Any) -> str:
+    """Render a millisecond unix timestamp as a short local time, or '?'."""
+    try:
+        return datetime.fromtimestamp(float(ts) / 1000).strftime("%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "?"
 
 #: Which price the exchange compares a TP/SL trigger against. MARK_PRICE is the
 #: documented Bitunix default and the engine's historical behaviour; the SAME
@@ -2566,10 +2575,70 @@ class TraderEngine:
     async def positions_history(self, n: int = 20) -> list[dict]:
         try:
             data = await self.client.get_history_positions(skip=0, limit=n)
-            return data or []
         except BitunixAPIError as e:
             self.state.errors.append(f"positions_history: {e}")
             return []
+        # The official response is {"data": {"positionList": [...],
+        # "total": N}} and request() returns the inner object verbatim.
+        if isinstance(data, dict):
+            return data.get("positionList") or []
+        return data or []
+
+    async def render_history(self, n: int = 12) -> str:
+        """One readable view of everything that already happened.
+
+        Three sources: closed positions from the exchange
+        (get_history_positions), TP/SL events and trades from the local
+        jsonl logs. The raw JSON is still available with the exact
+        "positions history" / "trades history" / "tpsl history" commands.
+        """
+        lines = ["=== history ==="]
+        try:
+            closed = await self.positions_history(n)
+        except Exception as e:  # noqa: BLE001 - a dead API must not hide the local logs
+            closed = []
+            lines.append(f"-- closed positions (exchange) -- API error: {e}")
+        else:
+            err = next((e for e in reversed(self.state.errors)
+                        if e.startswith("positions_history: ")), None)
+            lines.append("-- closed positions (exchange) --"
+                         + (f" API error: {err.split(': ', 1)[1]}" if err else ""))
+            for p in closed:
+                lines.append(
+                    f"{p.get('symbol')} {p.get('side')} "
+                    f"{p.get('entryPrice')} -> {p.get('closePrice')} "
+                    f"realized={p.get('realizedPNL')} fee={p.get('fee')} "
+                    f"funding={p.get('funding')} {p.get('leverage')}x "
+                    f"closed {_fmt_ms_ts(p.get('mtime'))}")
+            if not closed:
+                lines.append("(no closed positions on the exchange yet)")
+        tpsl = self.tpsl_history(n)
+        lines.append("-- TP/SL events (local log) --")
+        for rec in tpsl[-n:]:
+            lines.append(self._history_line(rec))
+        if not tpsl:
+            lines.append("(none logged yet)")
+        trades = self.trades_history(n)
+        lines.append("-- trades (local log) --")
+        for rec in trades[-n:]:
+            lines.append(self._history_line(rec))
+        if not trades:
+            lines.append("(none logged yet)")
+        lines.append("raw JSON: positions history / trades history / tpsl history")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _history_line(rec: dict) -> str:
+        ts = rec.get("ts")
+        when = _fmt_ms_ts(ts * 1000 if isinstance(ts, (int, float)) else None)
+        parts = [when, str(rec.get("event", "?"))]
+        for k, v in rec.items():
+            if k in ("ts", "event", "plan", "confidence", "strength",
+                     "agreeing", "order_id", "position_id"):
+                continue
+            if isinstance(v, (str, int, float, bool)) and v != "":
+                parts.append(f"{k}={v}")
+        return " ".join(parts)
 
     # ================================================================ settings
     def store_line(self) -> str:
@@ -2622,7 +2691,7 @@ class TraderEngine:
         "scans interval", "breakeven threshold",
         "trailing trigger", "liq sl distance", "min agreeing", "timeframes",
         "min confidence", "tf min confidence", "positions history", "close position",
-        "min stop ticks", "trend gate",
+        "min stop ticks", "trend gate", "history",
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
         "margin amount", "margin add", "margin reduce",
         "leverage", "risk ",
@@ -2652,7 +2721,8 @@ class TraderEngine:
         if low in ("status", "pnl", "p&l", "trades_history", "tpsl_history",
                    "trades history", "tpsl history", "engine on", "engine off",
                    "start trading", "stop trading", "scan on", "scan off",
-                   "report on", "report off", "settings", "settings trade"):
+                   "report on", "report off", "settings", "settings trade",
+                   "history"):
             return True
         for p in self.COMMAND_PREFIXES:
             if not low.startswith(p):
@@ -2690,6 +2760,12 @@ class TraderEngine:
         # model and, with the model down, produced an error dump.
         (re.compile(r"^min stop ticks?\s+([\d.]+)$"), r"min stop ticks \1"),
         (re.compile(r"^min stop\s+([\d.]+)$"), r"min stop ticks \1"),
+        # The history view, in the wording people actually type. "positions
+        # history" stays the raw JSON command; these forms get the readable
+        # view ("position history", "history position", "trade history").
+        (re.compile(r"^position history\b"), "history"),
+        (re.compile(r"^history positions?\b"), "history"),
+        (re.compile(r"^trade history\b"), "history"),
     )
 
     def _normalize_command(self, low: str) -> str:
@@ -2733,7 +2809,7 @@ class TraderEngine:
                          "tpsl history", "symbols", "positions history",
                          "engine on", "engine off", "scan on", "scan off",
                          "report on", "report off", "start trading",
-                         "stop trading", "autotrade", "trend gate")
+                         "stop trading", "autotrade", "trend gate", "history")
         # A numeric command takes a number, optionally preceded by a unit word
         # ("leverage to 20", "risk pct 1.5", "min confidence 70").
         if p in self._NUMERIC_ARG_COMMANDS:
@@ -2767,6 +2843,9 @@ class TraderEngine:
             return True
         if p == "trend gate":
             # bare = read; on/off; "timeframe 15m" - all valid shapes
+            return True
+        if p == "history":
+            # bare = the view; a count ("history 20") narrows it
             return True
         if p == "timeframes":
             return bool(re.search(r"\d+[mhd]", rest, re.I))
@@ -2996,6 +3075,10 @@ class TraderEngine:
     async def _cmd_positions(self, raw: str, low: str, arg) -> str | None:
         """The positions, the margin and the account settings."""
         s = self.state
+        if low == "history" or low.startswith("history "):
+            rest = arg("history").strip()
+            m = re.search(r"\d+", rest)
+            return await self.render_history(int(m.group()) if m else 12)
         if low.startswith("positions history"):
             return json.dumps(await self.positions_history(), indent=2)
         if low.startswith("close position"):

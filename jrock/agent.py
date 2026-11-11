@@ -109,6 +109,7 @@ TRADER ENGINE COMMANDS
   engine on | engine off            status
   report on | report off            report interval sec 30
   trades_history | tpsl_history | pnl | positions history
+  history (closed positions + TP/SL + trades, readable)
   settings trade                    scan on | scan off
   mid management position trigger   reversal=true  reversal_confidence=70
   scans interval sec 30             breakeven threshold pct 0.6
@@ -169,6 +170,8 @@ AGENT_BARE: dict[str, str] = {
     "balance": "/balance", "bal": "/balance", "wallet": "/balance",
     "equity": "/balance", "funds": "/balance",
     "positions": "/positions", "position": "/positions",
+    "history": "/history", "hist": "/history",
+    "تاریخچه": "/history",
     "orders": "/orders", "order": "/orders",
     "price": "/price", "prices": "/price", "quote": "/price",
     "funding": "/funding", "funding_rate": "/funding",
@@ -650,7 +653,9 @@ class JRockAgent:
         if cmd == "/balance":
             return await self.cmd_balance()
         if cmd == "/positions":
-            return await self.cmd_positions()
+            return await self.cmd_positions(rest)
+        if cmd == "/history":
+            return await self.cmd_history(rest)
         if cmd == "/orders":
             return await self.cmd_orders()
         if cmd == "/price":
@@ -1145,6 +1150,7 @@ class JRockAgent:
     _IMAGINED_CALL_READ_PREFIXES: tuple[str, ...] = (
         "status", "pnl", "p&l", "settings", "symbols", "trades history",
         "trades_history", "tpsl history", "tpsl_history", "positions history",
+        "history",
     )
 
     #: AGENT_BARE mappings an imagined call may reach with no arguments.
@@ -1698,8 +1704,14 @@ class JRockAgent:
         )
         return render_balance(report)
 
-    async def cmd_positions(self) -> str:
+    async def cmd_positions(self, rest: str = "") -> str:
         from .trader.errors import BitunixAPIError
+        # The model's own phrasing ("/positions history") and the operator's
+        # both reach the real history view - silently returning the CURRENT
+        # positions here is exactly how "history position" ended up answered
+        # with "no open positions".
+        if "history" in rest.lower():
+            return await self.cmd_history(rest)
         if not self._has_bitunix_keys():
             return missing_keys_message()
         try:
@@ -1720,6 +1732,12 @@ class JRockAgent:
                 f"margin={p.get('margin')} uPnL={p.get('unrealizedPNL')} "
                 f"mode={p.get('marginMode')}")
         return "\n".join(lines)
+
+    async def cmd_history(self, rest: str = "") -> str:
+        """The past: closed positions, TP/SL events, trades - engine-rendered."""
+        rest = (rest or "").strip()
+        line = f"history {rest}" if rest else "history"
+        return await self.engine.command(line)
 
     async def cmd_orders(self) -> str:
         from .trader.errors import BitunixAPIError
