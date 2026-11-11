@@ -727,9 +727,13 @@ RULES: list[tuple[str, re.Pattern, object]] = [
         r".*"
         r")", re.I), _b_exits),
     ("smalltalk", re.compile(
-        r"^\s*(hi|hello|hey|yo|hiya|howdy|good\s+(morning|afternoon|evening)|"
+        r"^\s*(?:hi|hello|hey|yo|hiya|howdy|"
+        r"good\s+(?:morning|afternoon|evening)|"
         r"thanks|thank you|thx|ty|cheers|are you there|you there|"
-        r"what'?s up|what'?s going on|how are you)\b", re.I), _b_smalltalk),
+        r"what'?s up|what'?s going on|how are you)"
+        r"(?:\s+(?:there|everyone|all|guys|team|bot|rock|j\+rock|jrock|"
+        r"friend|my\s+friend))?"
+        r"[\s!,.?]*$", re.I), _b_smalltalk),
 
     # --- help, in the many ways a person asks for it
     ("help", re.compile(

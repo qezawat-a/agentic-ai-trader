@@ -209,6 +209,14 @@ FREE_MODEL_INTENT = re.compile(
     r"|\bfree\b.*\bmodel\b.*\b(only|please|now)\b"
     r"|\buse\s+(a\s+)?free\s+model\b", re.I)
 
+#: Free models - especially the tiny ones - sometimes answer in an imagined
+#: tool-calling DSL instead of words:
+#:   <|tool_call_start|>[/-partial_ladder_off()]<|tool_call_end|>
+#: Printing that junk at the operator is what a bot does. The agent runs the
+#: request through the real grammar and answers with the result.
+_TOOL_TOKEN_RE = re.compile(r"<\|[^|>]*\|>")
+_TOOL_CALL_RE = re.compile(r"\[\s*/[^\[\]]*\]")
+
 
 @dataclass
 class ToolResult:
@@ -1103,6 +1111,85 @@ class JRockAgent:
         if len(self._history) > self.HISTORY_TURNS * 4:
             del self._history[: len(self._history) - self.HISTORY_TURNS * 2]
 
+    @staticmethod
+    def _tool_call_command(matched: str) -> str | None:
+        """Turn an imagined tool call into real command text.
+
+        `[/-partial_ladder_off()]` -> `partial ladder off`,
+        `[/tpsl()]` -> `tpsl`, `[/leverage(25)]` -> `leverage 25`.
+        Returns None when the shape is not a command at all, so normal
+        markdown like `[text](url)` survives untouched.
+        """
+        body = matched.strip()
+        if not (body.startswith("[") and body.endswith("]")):
+            return None
+        body = body[1:-1].strip()          # drop the brackets
+        body = body.lstrip("/-").strip()   # drop the imagined slash and dash
+        m = re.match(r"([A-Za-z0-9_ /-]+?)\s*\(([^()]*)\)$", body)
+        if not m:
+            return None
+        cmd = m.group(1).strip().replace("_", " ")
+        if not re.fullmatch(r"[A-Za-z0-9_ /-]+", cmd):
+            return None
+        args = m.group(2).strip()
+        if args:
+            args = re.sub(r"[\"']", "", args).replace(",", " ")
+            cmd = f"{cmd} {args}"
+        return cmd
+
+    async def _route_tool_call(self, text: str) -> str | None:
+        """Run an imagined tool call through the SAME surfaces a human uses.
+
+        Engine grammar first, then the deterministic NLU. It never reaches
+        the model, so a junk reply cannot loop back into another model call,
+        and a destructive call gets the same confirm prompt a person gets.
+        """
+        low = text.strip().lower()
+        if not low:
+            return None
+        if low.split()[0] in AGENT_BARE:
+            return await self.handle(low)
+        if self.engine.looks_like_command(low):
+            return await self.engine.command(low)
+        resolved = nlu.parse(low)
+        if isinstance(resolved, nlu.Clarification):
+            return self._render_clarification(resolved)
+        if isinstance(resolved, nlu.Intent) and resolved.command != "smalltalk":
+            return await self._act_on_intent(resolved)
+        return None
+
+    async def _postprocess_model_reply(self, out: str) -> str:
+        """Execute the tool calls the model imagined, answer with results.
+
+        The model's prose stays; each `<|tool_call_start|>[/cmd()]<|tool_call_end|>`
+        block (and each bare `[/cmd()]`) is replaced by what the command
+        actually returns. A reply that is ONLY junk still produces the
+        command's real output - never the raw syntax.
+        """
+        if not out or ("[/" not in out and "<|" not in out):
+            return out
+        matches = list(_TOOL_CALL_RE.finditer(out))
+        results: dict[str, str] = {}
+        for m in matches:
+            raw = m.group(0)
+            if raw in results:
+                continue
+            cmd = self._tool_call_command(raw)
+            results[raw] = ""
+            if cmd is not None:
+                reply = await self._route_tool_call(cmd)
+                if reply:
+                    results[raw] = f"\n{reply.strip()}\n"
+        if matches:
+            out = _TOOL_CALL_RE.sub(
+                lambda m: results.get(m.group(0), ""), out)
+        out = _TOOL_TOKEN_RE.sub("", out)
+        out = re.sub(r"\n{3,}", "\n\n", out).strip()
+        if out:
+            return out
+        return ("That model answered in a tool-call syntax I could not run. "
+                "Type the command directly (type help), or ask again.")
+
     async def chat(self, text: str) -> str:
         """Send free text to the configured model.
 
@@ -1161,6 +1248,7 @@ class JRockAgent:
         verdict = diagnose_empty(parsed, status)
         if not verdict.is_empty:
             out = parsed["choices"][0]["message"]["content"].strip()
+            out = await self._postprocess_model_reply(out)
             self.memory.episode("chat", text[:120], out[:120], ok=True)
             self._remember_turn(text, out)
             return out
