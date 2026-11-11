@@ -332,6 +332,8 @@ SETTINGS_VISIBLE = {
     "timeframes": "timeframes:",
     "min_confidence": "min confidence:",
     "tf_min_confidence": "tf min confidence:",
+    "trend_gate": "trend gate:",
+    "trend_gate_timeframe": "trend gate timeframe:",
     "tpsl_method": "tpsl method:",
     "partial_tp_ladder": "partial ladder:",
     "account_tp_usdt": "account TP/SL",

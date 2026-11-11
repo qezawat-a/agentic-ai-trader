@@ -2105,6 +2105,9 @@ class JRockAgent:
             f"timeframes: {','.join(s.timeframes)}",
             f"min confidence: {s.min_confidence}  "
             f"tf min confidence: {s.tf_min_confidence}",
+            f"trend gate: {'on' if s.trend_gate else 'off'}  "
+            f"trend gate timeframe: "
+            f"{self.engine._gate_timeframe() or '(none)'}",
             f"reversal: {'on' if s.reversal else 'off'}  "
             f"reversal confidence: {s.reversal_confidence}",
             f"scan interval: {s.scan_interval}s  "

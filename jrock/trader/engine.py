@@ -98,6 +98,14 @@ class EngineState:
     timeframes: list[str] = field(default_factory=lambda: ["1m", "3m", "5m", "15m"])
     min_confidence: float = 70.0
     tf_min_confidence: float = 60.0
+    #: The TREND GATE: the strategies are momentum chasers - they buy
+    #: strength, and in a failing pump they buy the top four times in a row.
+    #: The gate refuses a signal whose direction is fought by the biggest
+    #: configured timeframe: a LONG with 15m SHORT votes never enters.
+    #: The profitable trades all rode a trend the big TF agreed with; the
+    #: dump-chases all fought it. OFF restores the old behaviour.
+    trend_gate: bool = True
+    trend_gate_timeframe: str = "15m"
     last_scan_ts: float = 0.0
     last_report_ts: float = 0.0
     scans: int = 0
@@ -263,6 +271,7 @@ class TraderEngine:
         "tpsl_method", "partial_tp_ladder",
         "account_tp_usdt", "account_sl_usdt",
         "min_stop_ticks",
+        "trend_gate", "trend_gate_timeframe",
     )
 
     def _state_snapshot(self) -> dict[str, Any]:
@@ -936,7 +945,49 @@ class TraderEngine:
                 f"{wait}s (reentry_cooldown_sec) so the same signal cannot "
                 f"open and close it again in a loop")
 
+    def _gate_timeframe(self) -> str:
+        """The timeframe the trend gate watches.
+
+        The configured gate TF when the scan set includes it; otherwise the
+        BIGGEST timeframe the engine actually scans (the list is ordered
+        ascending). Empty when there is nothing to watch.
+        """
+        tf = (self.state.trend_gate_timeframe or "").strip()
+        if tf and tf in self.state.timeframes:
+            return tf
+        return self.state.timeframes[-1] if self.state.timeframes else ""
+
+    def _trend_gate_blocks(self, agg: Aggregate) -> str | None:
+        """Why the trend gate refuses this signal, or None to allow it.
+
+        The gate is asymmetric by design: it does not demand agreement on
+        the big TF (that would block most entries), it only refuses a
+        signal the big TF is actively FIGHTING - a LONG with SHORT votes on
+        the gate timeframe, or a SHORT with LONG votes there.
+        """
+        if not self.state.trend_gate:
+            return None
+        gate_tf = self._gate_timeframe()
+        if not gate_tf:
+            return None
+        opposing = (getattr(agg, "votes_short", [])
+                    if agg.direction == "LONG"
+                    else getattr(agg, "votes_long", [])) or []
+        fights = [v for v in opposing if getattr(v, "timeframe", "") == gate_tf]
+        if not fights:
+            return None
+        strongest = max(fights, key=lambda v: v.confidence)
+        against = "SHORT" if agg.direction == "LONG" else "LONG"
+        return (f"trend gate: {agg.direction} refused - the {gate_tf} picture "
+                f"fights it ({strongest.strategy} says {against} there, "
+                f"conf {strongest.confidence:.0f})")
+
     async def try_enter(self, agg: Aggregate) -> dict:
+        gate_refusal = self._trend_gate_blocks(agg)
+        if gate_refusal:
+            self.state.notes.append(gate_refusal)
+            log.info("entry refused: %s", gate_refusal)
+            return {"ok": False, "reason": gate_refusal}
         ctx, err = await self._entry_context(agg)
         if err is not None:
             return err
@@ -2502,6 +2553,7 @@ class TraderEngine:
             f"scan_interval={s.scan_interval}s report_interval={s.report_interval}s "
             f"reversal={s.reversal} reversal_conf={s.reversal_confidence} "
             f"reentry_cooldown={s.reentry_cooldown_sec}s",
+            f"trend_gate={s.trend_gate} tf={self._gate_timeframe() or '(none)'}",
             f"min_stop_ticks={s.min_stop_ticks} "
             f"taker_fee={self.s.taker_fee_rate * 100:g}% "
             f"margin_safety={self.s.margin_safety_pct:g}%",
@@ -2519,7 +2571,7 @@ class TraderEngine:
         "scans interval", "breakeven threshold",
         "trailing trigger", "liq sl distance", "min agreeing", "timeframes",
         "min confidence", "tf min confidence", "positions history", "close position",
-        "min stop ticks",
+        "min stop ticks", "trend gate",
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
         "margin amount", "margin add", "margin reduce",
         "leverage", "risk ",
@@ -2630,7 +2682,7 @@ class TraderEngine:
                          "tpsl history", "symbols", "positions history",
                          "engine on", "engine off", "scan on", "scan off",
                          "report on", "report off", "start trading",
-                         "stop trading", "autotrade")
+                         "stop trading", "autotrade", "trend gate")
         # A numeric command takes a number, optionally preceded by a unit word
         # ("leverage to 20", "risk pct 1.5", "min confidence 70").
         if p in self._NUMERIC_ARG_COMMANDS:
@@ -2661,6 +2713,9 @@ class TraderEngine:
             return rest.strip("= ").lower() in ("true", "false", "1", "0",
                                                 "on", "off", "yes", "no")
         if p == "mid management":
+            return True
+        if p == "trend gate":
+            # bare = read; on/off; "timeframe 15m" - all valid shapes
             return True
         if p == "timeframes":
             return bool(re.search(r"\d+[mhd]", rest, re.I))
@@ -2841,6 +2896,24 @@ class TraderEngine:
                 return f"TF min confidence = {s.tf_min_confidence}."
             except (ValueError, IndexError):
                 return "Usage: Tf min confidence 60"
+        if low.startswith("trend gate"):
+            rest = arg("trend gate").strip().lower()
+            if rest.startswith("timeframe"):
+                tf = rest[len("timeframe"):].strip()
+                if tf:
+                    s.trend_gate_timeframe = tf
+                    gate = self._gate_timeframe()
+                    return (f"Trend gate timeframe = {tf} "
+                            f"(watching {gate or 'nothing - the scan set is empty'}).")
+                return "Usage: trend gate timeframe 15m"
+            if rest in ("on", "off", "true", "false", "1", "0", "yes", "no"):
+                s.trend_gate = rest in ("on", "true", "1", "yes")
+                return (f"Trend gate = {'ON' if s.trend_gate else 'OFF'} - "
+                        f"{'a signal the ' + (self._gate_timeframe() or 'big') + ' timeframe fights never enters.'
+                        if s.trend_gate else 'the engine chases again, as before'}.")
+            return (f"Trend gate = {'ON' if s.trend_gate else 'OFF'}  "
+                    f"timeframe = {self._gate_timeframe() or '(none)'}\n"
+                    f"Usage: trend gate on|off | trend gate timeframe 15m")
         return None
 
     def _explain_breakeven(self) -> str:
