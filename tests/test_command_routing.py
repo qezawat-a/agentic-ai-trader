@@ -279,3 +279,26 @@ def test_reset_clears_the_conversation_memory_only(tmp_path):
     out = _run(a.handle("/reset"))
     assert "conversation memory cleared" in out, out
     assert a._history == []
+
+
+def test_settings_show_the_margin_target_and_the_cooldown(tmp_path):
+    """The setting that decides the size must be on screen.
+
+    MARGIN_AMOUNT_PCT is the sizing AUTHORITY when it is set (risk_pct is then
+    ignored) - so /settings has to show it, and say which one is in force.
+    The re-entry cooldown is new and belongs there too.
+    """
+    a = _agent(tmp_path)
+    a.engine.state.margin_amount_pct = 35.0
+    a.engine.state.risk_pct = 0.0
+    out = _run(a.handle("/settings"))
+    assert "margin per trade: 35% of the available balance" in out, out
+    assert "not applied while the margin target is set" in out, out
+    assert "re-entry cooldown:" in out, out
+
+    # with the margin target off, risk is the sizing authority
+    a.engine.state.margin_amount_pct = 0.0
+    a.engine.state.risk_pct = 1.5
+    out = _run(a.handle("/settings"))
+    assert "margin per trade: off" in out, out
+    assert "risk per trade: 1.5%" in out, out

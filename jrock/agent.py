@@ -1785,17 +1785,25 @@ class JRockAgent:
         `settings SYMBOL` additionally shows that one symbol's configured
         margin mode and leverage. A token that is not a tradable pair is
         dropped with a warning instead of being sent (which would 20015).
-        """
-        if not self._has_bitunix_keys():
-            return missing_keys_message()
 
+        The local configuration is shown even when the exchange cannot be
+        read: the margin target, the thresholds and the intervals are the
+        operator's own settings and they are what they asked to see.
+        """
         tokens = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
         syms = [t for t in tokens if t not in self.SETTINGS_KEYWORDS]
 
         lines = ["=== account trading settings ==="]
-        lines.append(await self._settings_position_mode())
+        if self._has_bitunix_keys():
+            lines.append(await self._settings_position_mode())
+        else:
+            lines.append("position mode: ? (no API keys - the exchange was not read)")
         lines.extend(self._settings_config_lines())
-        await self._settings_per_symbol(syms, lines)
+        if syms:
+            if not self._has_bitunix_keys():
+                lines.append("per-symbol settings: skipped (no API keys)")
+            else:
+                await self._settings_per_symbol(syms, lines)
         return "\n".join(lines)
 
     async def _settings_position_mode(self) -> str:
@@ -1815,11 +1823,23 @@ class JRockAgent:
         """The account-level config: margin mode, leverage and the rest of the
         engine's trading parameters. No per-symbol listing."""
         s = self.engine.state
+        # The margin target is the SIZING AUTHORITY when it is set, and risk_pct
+        # is then ignored - so both must be on screen, or the operator cannot
+        # see which number decides the size of the next position.
+        if s.margin_amount_pct > 0:
+            margin_line = (f"margin per trade: {s.margin_amount_pct:g}% of the "
+                           f"available balance (0 = off)")
+            risk_line = (f"risk per trade: {s.risk_pct:g}% "
+                         f"(not applied while the margin target is set)")
+        else:
+            margin_line = "margin per trade: off (sized by risk per trade)"
+            risk_line = f"risk per trade: {s.risk_pct:g}%"
         return [
             f"margin mode: {s.margin_mode}",
             f"leverage: {s.leverage}x",
             f"max open positions: {s.max_open_positions}",
-            f"risk per trade: {s.risk_pct}%",
+            margin_line,
+            risk_line,
             f"breakeven: {s.breakeven_pct}%  "
             f"trailing trigger: {s.trailing_trigger_roi_pct}% ROI  "
             f"liq SL distance: {s.liq_sl_distance_pct}%",
@@ -1828,7 +1848,8 @@ class JRockAgent:
             f"min confidence: {s.min_confidence}  "
             f"tf min confidence: {s.tf_min_confidence}",
             f"scan interval: {s.scan_interval}s  "
-            f"report interval: {s.report_interval}s",
+            f"report interval: {s.report_interval}s  "
+            f"re-entry cooldown: {s.reentry_cooldown_sec}s",
             f"tpsl method: {s.tpsl_method}  "
             f"partial ladder: {s.partial_tp_ladder or 'off'} "
             f"(account TP/SL {s.account_tp_usdt:g}/{s.account_sl_usdt:g} USDT)",

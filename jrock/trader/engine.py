@@ -2329,7 +2329,8 @@ class TraderEngine:
             f"min_agreeing={s.min_agreeing} timeframes={','.join(s.timeframes)} "
             f"min_conf={s.min_confidence} tf_min_conf={s.tf_min_confidence}",
             f"scan_interval={s.scan_interval}s report_interval={s.report_interval}s "
-            f"reversal={s.reversal} reversal_conf={s.reversal_confidence}",
+            f"reversal={s.reversal} reversal_conf={s.reversal_confidence} "
+            f"reentry_cooldown={s.reentry_cooldown_sec}s",
             f"min_stop_ticks={MIN_STOP_TICKS} "
             f"taker_fee={self.s.taker_fee_rate * 100:g}% "
             f"margin_safety={self.s.margin_safety_pct:g}%",
