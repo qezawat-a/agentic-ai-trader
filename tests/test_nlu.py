@@ -64,8 +64,8 @@ def _run(coro):
     ("show me the status", "status"),
     ("what is the engine status", "status"),
     # tpsl
-    ("show me the tp/sl", "tpsl"),
-    ("show me the tpsl", "tpsl"),
+    ("show me the tp/sl", "/exits"),
+    ("show me the tpsl", "/exits"),
     # price / funding / symbols
     ("what is the price of BTCUSDT", "price BTCUSDT"),
     ("show me the funding rate", "funding"),

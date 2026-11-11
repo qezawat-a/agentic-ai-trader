@@ -79,6 +79,7 @@ AGENT COMMANDS
   /price [SYMBOL]           last / mark price for your symbols
   /funding [SYMBOL]         current funding rate (or: /funding history SYMBOL)
   /tpsl                     the 4 TP/SL methods: show/set, pending, history, cancel
+  /exits                    the exits RIGHT NOW: breakeven, trailing, per position
                             PARTIAL ladder: "partial ladder 40@1,35@2,25@3" |
                             "partial ladder off"
   /batch                    batch-order status (orderList max 5, symbol required)
@@ -193,7 +194,7 @@ FREE_TEXT_WORDS: tuple[str, ...] = (
 # engine syntax ("leverage 20"); bare they are a read ("leverage").
 QUERY_COMMANDS: frozenset[str] = frozenset({
     "/leverage", "/margin", "/symbols", "/price", "/funding", "/status", "/pnl",
-    "/tpsl", "/batch",
+    "/tpsl", "/exits", "/batch",
 })
 
 #: Modules that are PROGRAMS, not libraries: they own stdout. `print()` in
@@ -548,6 +549,8 @@ class JRockAgent:
             self._history.clear()
             return (f"conversation memory cleared ({n} turns). The long-term "
                     f"memory is untouched (/memory).")
+        if cmd == "/exits":
+            return self._exits_state()
         if cmd == "/models":
             return await self.cmd_models(rest)
         if cmd == "/set_model":
@@ -928,7 +931,15 @@ class JRockAgent:
     #: letting the prompt grow without bound.
     HISTORY_TURNS = 12
 
-    def _system_prompt(self) -> str:
+    def _live_state_brief(self) -> str:
+        """The engine's live state for THIS turn. Never raises."""
+        try:
+            return self.engine.live_brief()
+        except Exception as e:  # noqa: BLE001 - a blind prompt is better than
+            log.debug("live state unavailable: %s", e)      # no prompt at all
+            return ""
+
+    def _system_prompt(self, live_state: str = "") -> str:
         """The system prompt: the soul file, plus how to actually converse.
 
         Two defects made the agent feel like a command parser rather than
@@ -962,7 +973,35 @@ class JRockAgent:
         parts = [soul.strip()] if soul.strip() else []
         parts.append(self._conversation_contract())
         parts.append(self._capability_section())
+        if live_state.strip():
+            parts.append(self._live_state_section(live_state))
         return "\n\n".join(parts)
+
+    def _live_state_section(self, live_state: str) -> str:
+        """The section that turns the model from a bot into an agent.
+
+        It says three things: this is the operator's live state, it is the
+        TRUTH (the engine's own numbers), and it must be used to answer -
+        not to be summarised back as a dump.
+        """
+        return (
+            "## The operator's live state (right now)\n"
+            "This is the engine's own state, read a moment ago. It is the "
+            "TRUTH about the account, the positions and the settings - more "
+            "authoritative than anything you remember.\n"
+            "\n"
+            + live_state.strip() + "\n"
+            "\n"
+            "- Use these numbers to ANSWER the question. Do not ask the user "
+            "to run a command for something you can already see here, and do "
+            "not paste this block back at them.\n"
+            "- If the state says breakeven is armed, or the trailing stop is "
+            "active on a position, SAY SO with the numbers - that is usually "
+            "the whole answer.\n"
+            "- If the state does NOT contain what was asked about, say plainly "
+            "that you cannot see it and name the one command that would show "
+            "it. Never invent a value."
+        )
 
     def _conversation_contract(self) -> str:
         """The conversational half of the prompt: how to read intent and reply."""
@@ -1087,7 +1126,11 @@ class JRockAgent:
             model = res.selected
             self.model = model
 
-        system = self._system_prompt()
+        # The live state goes into THIS turn's prompt, not into a static
+        # system prompt: the agent must know the operator's actual position
+        # and settings right now, or it answers blind - quoting command
+        # syntax instead of answering the question.
+        system = self._system_prompt(live_state=self._live_state_brief())
         level = self.thinking_level
         max_tokens = self._max_tokens_for(level)
         reasoning = self.reasoning_params(model)
@@ -1103,9 +1146,17 @@ class JRockAgent:
         url = f"{self.s.base_url.rstrip('/')}/chat/completions"
         status, body, parsed = await self._post_chat(url, payload)
 
+        # A rate-limited free provider is a WAIT, not a dead end: one retry
+        # after a short backoff usually gets through. A real agent absorbs
+        # that instead of dumping an HTTP error at the operator.
+        if status == 429:
+            log.info("chat: provider rate-limited, retrying once in %ss",
+                     self.RATE_LIMIT_BACKOFF_SEC)
+            await asyncio.sleep(self.RATE_LIMIT_BACKOFF_SEC)
+            status, body, parsed = await self._post_chat(url, payload)
+
         if status != 200:
-            return (f"Model call failed: HTTP {status}: {body[:400]}\n"
-                    f"You said: {text!r}")
+            return self._model_unavailable_reply(status, body, text)
 
         verdict = diagnose_empty(parsed, status)
         if not verdict.is_empty:
@@ -1128,6 +1179,48 @@ class JRockAgent:
 
         self.memory.episode("chat", text[:120], f"EMPTY:{verdict.cause}", ok=False)
         return render_empty(verdict, level, max_tokens)
+
+    #: How long to wait before the single retry when the provider is
+    #: rate-limiting us. The free models come back in seconds.
+    RATE_LIMIT_BACKOFF_SEC = 4.0
+
+    def _model_unavailable_reply(self, status: int, body: str,
+                                 text: str) -> str:
+        """What the agent says when the model cannot be reached.
+
+        NOT a raw HTTP dump. The operator gets: what went wrong in one
+        sentence, and then WHAT THE AGENT CAN STILL TELL THEM - the live
+        state is in hand, so the agent answers from it instead of going
+        silent. That is the difference between an agent and a bot: the bot
+        says "HTTP 429" and stops.
+        """
+        reason = self._classify_model_error(status, body)
+        brief = self._live_state_brief()
+        parts = [reason]
+        if brief:
+            parts.append("Here is the state I can see right now:\n"
+                         + brief)
+        parts.append("Ask again in a moment, or use a command: "
+                     "/status /positions /tpsl /settings")
+        return "\n\n".join(parts)
+
+    def _classify_model_error(self, status: int, body: str) -> str:
+        """One honest sentence about a failed model call."""
+        low = (body or "").lower()
+        if status == 429 or "rate limit" in low or "rate-limit" in low:
+            return ("The model provider is rate-limiting requests right now "
+                    "(HTTP 429) - I could not send your message to it.")
+        if status in (401, 403):
+            return (f"The model provider rejected my key (HTTP {status}) - "
+                    f"check API_KEY in .env.")
+        if status == 404:
+            return ("The configured model is not available at this provider "
+                    "(HTTP 404) - check MODEL in .env.")
+        if status >= 500:
+            return (f"The model provider is having a bad moment (HTTP "
+                    f"{status}) - I could not send your message to it.")
+        return (f"The model call failed (HTTP {status}). I could not send "
+                f"your message to the model.")
 
     def _chat_payload(self, text: str, system: str, model: str,
                       max_tokens: int, reasoning: dict) -> dict:
@@ -1725,6 +1818,25 @@ class JRockAgent:
             "read: /tpsl pending [SYMBOL] | /tpsl history [SYMBOL]",
             "      /tpsl cancel SYMBOL ORDER_ID",
         ])
+
+    def _exits_state(self) -> str:
+        """The answer to "why don't you do the breakeven & trailing".
+
+        The live state FIRST - what is armed, on which position, and whether
+        it has fired - and the method reference only as a footnote. The
+        operator asked about their position; a page of syntax is a
+        documentation answer to a trading question.
+        """
+        try:
+            live = self.engine.exits_brief()
+        except Exception as e:  # noqa: BLE001 - never lose the answer
+            log.debug("exits brief unavailable: %s", e)
+            live = ""
+        if not live:
+            return self._tpsl_overview()
+        # Short. The operator asked about their position; the method
+        # reference is one line away, not twenty lines in the answer.
+        return live + ("\n\n(the four TP/SL methods: /tpsl)")
 
     async def cmd_batch(self, rest: str = "") -> str:
         """Batch order status. Official: symbol AND orderList required, max 5."""

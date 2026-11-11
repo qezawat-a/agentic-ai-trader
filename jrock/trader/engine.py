@@ -2124,6 +2124,137 @@ class TraderEngine:
                 self.state.errors.append(f"report_loop: {type(e).__name__}: {e}")
             await asyncio.sleep(max(5, self.state.report_interval))
 
+    def exits_brief(self) -> str:
+        """The exit state of every position, answered plainly.
+
+        The operator asked "why don't you do the breakeven & trailing" and
+        got a page of METHOD REFERENCE - which is a documentation answer to a
+        question about their position. This is the answer to the question:
+        what is armed, on which position, and has it fired yet.
+        """
+        s = self.state
+        lines = [
+            "=== the exits, right now ===",
+            f"armed: breakeven at +{s.breakeven_pct:g}% ROI, "
+            f"trailing from +{s.trailing_trigger_roi_pct:g}% ROI, "
+            f"liq SL distance {s.liq_sl_distance_pct:g}%",
+            f"mid management (the loop that moves them): "
+            f"{'ON' if s.mid_management else 'OFF'}",
+        ]
+        if not self.positions:
+            lines.append("no open position - nothing is being managed")
+            return "\n".join(lines)
+        for st in self.positions.values():
+            price = self._cached_price(st.symbol)
+            roi = (roi_pct(st.entry, price, st.side, st.leverage)
+                   if price > 0 else 0.0)
+            if st.breakeven_done:
+                be = f"MOVED to the entry {st.entry:g}"
+            elif s.mid_management:
+                be = f"waiting (needs +{s.breakeven_pct:g}% ROI)"
+            else:
+                be = "OFF (mid management is off)"
+            if st.trailing_active:
+                trail = (f"ACTIVE at {st.trailing_stop:g}"
+                         if st.trailing_stop else "ACTIVE")
+            elif s.mid_management:
+                trail = f"waiting (needs +{s.trailing_trigger_roi_pct:g}% ROI)"
+            else:
+                trail = "OFF (mid management is off)"
+            lines.append(
+                f"{st.symbol} {st.side} qty={st.qty:g} entry={st.entry:g} | "
+                f"now {price or '?'} | ROI {roi:+.2f}% | "
+                f"SL {st.sl:g} TP {st.tp:g} liq {st.liq:g}")
+            lines.append(f"  breakeven: {be}")
+            lines.append(f"  trailing:  {trail}"
+                         + (f" (peak ROI {st.peak_roi:.2f}%)" if st.peak_roi else ""))
+        return "\n".join(lines)
+
+    def live_brief(self) -> str:
+        """The engine's live state in one compact block - WHAT THE AGENT SEES.
+
+        Without this the model answers blind. Asked "why don't you do
+        breakeven and trailing" it had no idea whether they were armed, on
+        which position, at what ROI - so it fell back to quoting command
+        syntax, which is exactly what makes an agent feel like a bot. An
+        agent that knows the operator's live position can answer the question
+        in one sentence, in their language, with their numbers.
+
+        Sync on purpose: it is built from what the engine already tracks
+        (state, positions, the last scan's signals, the price cache), so it
+        costs no API call and cannot fail on a flaky exchange. Anything it
+        does not know is left out rather than guessed.
+        """
+        s = self.state
+        lines: list[str] = []
+        lines.append(
+            f"ENGINE: engine_on={s.engine_on} scan_on={s.scan_on} "
+            f"autotrade={s.autotrade} mid_management={s.mid_management} "
+            f"| symbols: {','.join(s.symbols) or 'none'}")
+
+        sizing = (f"margin target {s.margin_amount_pct:g}% of balance "
+                  f"(risk_pct {s.risk_pct:g}% NOT applied)"
+                  if s.margin_amount_pct > 0
+                  else f"risk {s.risk_pct:g}% of equity per trade")
+        lines.append(
+            f"SETTINGS: leverage {s.leverage}x | margin mode {s.margin_mode} | "
+            f"{sizing} | breakeven at +{s.breakeven_pct:g}% ROI | "
+            f"trailing from +{s.trailing_trigger_roi_pct:g}% ROI | "
+            f"liq SL distance {s.liq_sl_distance_pct:g}% | "
+            f"max {s.max_open_positions} position(s) | "
+            f"re-entry cooldown {s.reentry_cooldown_sec}s | "
+            f"TP/SL {s.tpsl_method}"
+            + (f" (ladder {s.partial_tp_ladder})" if s.partial_tp_ladder else ""))
+
+        # --- the positions, with the exit state that decides the answer
+        if self.positions:
+            lines.append(f"POSITIONS ({len(self.positions)}):")
+            for st in self.positions.values():
+                price = self._cached_price(st.symbol)
+                roi = (roi_pct(st.entry, price, st.side, st.leverage)
+                       if price > 0 else 0.0)
+                exits = []
+                if st.breakeven_done:
+                    exits.append(f"breakeven ALREADY MOVED to entry {st.entry}")
+                else:
+                    exits.append("breakeven not reached yet")
+                if st.trailing_active:
+                    exits.append(f"trailing ACTIVE at {st.trailing_stop}")
+                elif st.peak_roi:
+                    exits.append(f"trailing not active (peak ROI {st.peak_roi:.2f}%)")
+                else:
+                    exits.append("trailing not active")
+                lines.append(
+                    f"- {st.symbol} {st.side} qty {st.qty:g} entry {st.entry} | "
+                    f"now {price or '?'} | ROI {roi:+.2f}% | "
+                    f"SL {st.sl} TP {st.tp} liq {st.liq} | " + " | ".join(exits))
+        else:
+            lines.append("POSITIONS: none open")
+
+        # --- the last scan's signals
+        if self.last_aggregates:
+            sigs = []
+            for sym, agg in self.last_aggregates.items():
+                sigs.append(f"{sym} {agg.direction} {agg.confidence:.1f}% "
+                            f"({agg.agreeing} agree)")
+            lines.append("LAST SCAN SIGNALS: " + "; ".join(sigs))
+        else:
+            lines.append("LAST SCAN SIGNALS: none yet (no scan has completed)")
+
+        # --- what went wrong, so the agent can explain it instead of guessing
+        if s.errors:
+            last = s.errors[-1]
+            lines.append(f"PROBLEMS ({len(s.errors)}): last: {last}")
+        return "\n".join(lines)
+
+    def _cached_price(self, symbol: str) -> float:
+        """The last known price, without an API call."""
+        try:
+            q = self.price_cache.peek(symbol)
+        except Exception:  # noqa: BLE001 - the brief must never raise
+            return 0.0
+        return float(q.price) if q is not None else 0.0
+
     async def report(self) -> str:
         lines = [f"=== J+Rock report {time.strftime('%H:%M:%S')} ==="]
         for sym in self.state.symbols:

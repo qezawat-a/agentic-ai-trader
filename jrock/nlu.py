@@ -200,6 +200,25 @@ def _b_help(t: str) -> Intent:
     return Intent("help", "help", 0.95, describe="show the command list")
 
 
+def _b_engine_state(t: str) -> Intent:
+    """Is the engine running? A state question, not a command to switch it."""
+    return Intent("engine_state", "status", 0.9,
+                  describe="show whether the engine is running")
+
+
+def _b_exits(t: str) -> Intent:
+    """The exit state of the account: TP/SL, breakeven, trailing.
+
+    This is the question the operator actually asked - "why don't you do the
+    breakeven & trailing" - and it has an exact answer in the engine. It must
+    NOT reach the model, which has no engine access and answers with prose.
+    """
+    # The same intent name as the English "show me the tpsl" rule: it is the
+    # same question, and the agent routes both the same way.
+    return Intent("tpsl_read", "/exits", 0.93,
+                  describe="show the TP/SL, breakeven and trailing state")
+
+
 def _b_symbols(t: str) -> Intent:
     syms = _symbols_in(t)
     return Intent("symbols", f"symbols {syms[0]}" if syms else "symbols", 0.85,
@@ -658,6 +677,55 @@ RULES: list[tuple[str, re.Pattern, object]] = [
         r"outlook)\b.*\b([A-Z]{2,10}USDT)\b", re.I), _b_analysis),
 
     # --- small talk: a greeting must never "do nothing"
+    # "قیمت BTCUSDT" / "قیمت بیت کوین چقدره"
+    ("price", re.compile(
+        r"(قیمت|نرخ)\s*(بیت\s*کوین|بیت\u200cکوین|[A-Za-z]{2,15}USDT|تتر|اتریوم)?"
+        r".*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|هست)?",
+        re.I), _b_price),
+    # "تنظیمات رو نشون بده"
+    ("settings", re.compile(
+        # No bare "چه" here: it would swallow every Persian question that
+        # starts with "what" ("چه کارایی می‌تونی بکنی؟" is a help question).
+        r"(تنظیمات|تنظیم|کانفیگ|پیکربندی)"
+        r".*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|دارم|هست|رو|را)?", re.I), _b_settings),
+    # "اینجین روشنه؟" / "موتور خاموشه؟"
+    ("engine_state", re.compile(
+        r"(انجین|اینجین|موتور|اسکنر|اسکن)"
+        r".*(روشن|خاموش|فعال|غیرفعال|کار\s*می\u200cکند|هست)"
+        r"|(روشن|خاموش)\s*(هست|هسته|است|هستند)?\s*[.؟?]*$", re.I), _b_engine_state),
+    # "سفارش باز دارم؟"
+    ("orders", re.compile(
+        r"(سفارش|سفارش\u200cها|اوردر|اردر|پوزیشن\u200cهای\u200cباز)"
+        r".*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|دارم|هست|باز)",
+        re.I), _b_orders),
+    # "استاپ لاس و تی پی اس ال" / "حد سود و ضرر رو بگو" - the EXITS.
+    # This is the question the operator actually asked: "why don't you do
+    # the breakeven & trailing".
+    ("exits", re.compile(
+        # The operator MIXES languages: "چرا breakeven و trailing انجام نمی‌دهی".
+        # So the exit words and the question words are matched in BOTH
+        # languages, and the question may come on either side.
+        #
+        # It matches a QUESTION about the exits, or a bare noun phrase naming
+        # them ("استاپ لاس و تی پی اس ال") - but NEVER an action sentence:
+        # "close the position with a trailing stop" must stay a CLOSE.
+        r"(?!(?:.*\b(?:ببند|بستن|کلوز|بفروش|بخر|بذار|بذار|باز\s*کن|تنظیم\s*کن|"
+        r"کم\s*کن|برسان|close|sell|buy|open|set|cancel)\b))"
+        r"(?:"
+        r"(چرا|چطور|چقدر|چند|چیه|چیست|بگو|نشون|نمایش|کجا|چرایی|"
+        r"why|what|how|where|are\s+you|do\s+you|did\s+you)"
+        r".*(breakeven|break[- ]?even|trailing|tp\s*/?\s*sl|stop\s*loss|take\s*profit|"
+        r"استاپ|حد\s*ضرر|حد\s*سود|تی\s*پی\s*اس|تی\u200cپی\u200cاس|بریک|تریلینگ|تریل)"
+        r"|"
+        r"(breakeven|break[- ]?even|trailing|tp\s*/?\s*sl|stop\s*loss|take\s*profit|"
+        r"استاپ|حد\s*ضرر|حد\s*سود|تی\s*پی\s*اس|تی\u200cپی\u200cاس|بریک|تریلینگ|تریل)"
+        r".*(چرا|چطور|چقدر|چند|چیه|چیست|بگو|نشون|نمایش|کجا|"
+        r"why|what|how|where|are\s+you|do\s+you|is\s+the|did\s+you)"
+        r"|"
+        r"^\s*(?:استاپ|حد|تی\u200c?پی\u200c?اس|بریک|تریلینگ|تریل|بربیک|بیک|"
+        r"breakeven|trailing|tp\s*/?\s*sl|stop\s*loss)"
+        r".*"
+        r")", re.I), _b_exits),
     ("smalltalk", re.compile(
         r"^\s*(hi|hello|hey|yo|hiya|howdy|good\s+(morning|afternoon|evening)|"
         r"thanks|thank you|thx|ty|cheers|are you there|you there|"
@@ -739,14 +807,19 @@ RULES: list[tuple[str, re.Pattern, object]] = [
         r"(مارجین|حاشیه\s*نقد|مارجین\s*هر\s*معامله).*"
         r"(\d+(?:\.\d+)?)\s*(درصد|٪|%)?", re.I), _b_margin_amount_set),
     ("balance", re.compile(
-        r"(موجودی|بالانس|سرمایه|مانده\s*حساب|چقدر\s*پول)"
+        # "بیالانس" is how the operator actually writes it; "بالانس" is the
+        # textbook spelling. Both must answer.
+        r"(موجودی|ب(?:ی)?الانس|بیلنص|سرمایه|مانده\s*حساب|چقدر\s*پول)"
         r".*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|دارم|هست)"
         r"|(چقدر|چند)\s*(پول|موجودی|بالانس)\s*(دارم|هست|داری)", re.I), _b_balance),
     ("positions", re.compile(
         r"^(?!.*(ببند|بستن|خروج|کلوز))"
         r".*(پوزیشن|پوزیشن\u200cها|معامله|معامله\u200cها|پوزیشن\u200cهام)"
         r".*(چیه|چیست|بگو|نشون|نمایش|دارم|هست|چطور|چطوره|وضعیت)"
-        r"|(پوزیشن|معامله)\s*(هام|هایم|ها)\s*(چیه|چطوره|چطور)", re.I), _b_positions),
+        r"|(پوزیشن|معامله)\s*(هام|هایم|ها)\s*(چیه|چطوره|چطور)"
+        # a bare plural ("پوزیشن ها") IS the question about the positions
+        r"|^\s*(پوزیشن|پوزیشن\u200cها|معامله|معامله\u200cها)\s*(ها|هام|هایم)?\s*[.؟?]*\s*$",
+        re.I), _b_positions),
     ("close_position", re.compile(
         r"(ببند|بستن|کلوز|خروج|بسته)\s*(کن|کنید)?.*"
         r"(پوزیشن|معامله|پوزیشنمو|پوزیشنمو|همه)"
@@ -759,7 +832,9 @@ RULES: list[tuple[str, re.Pattern, object]] = [
         r"(همه|تمام|کل)\s*(ی|ی\s*)?(پوزیشن|معامله|پوزیشن\u200cها)"
         r".*(ببند|بستن|کلوز|خروج)", re.I), _b_close_all),
     ("pnl", re.compile(
-        r"(سود|ضرر|سودم|ضررم|پی\s*ال|پی\u200cال|پروفیت|لاس)"
+        # "حد سود و ضرر" is the EXIT limits, not the PnL - the lookbehind
+        # keeps a limit question out of the PnL rule.
+        r"(?<!حد\s)(سود|ضرر|سودم|ضررم|پی\s*ال|پی\u200cال|پروفیت|لاس)"
         r".*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|دارم|هست|کردم)"
         r"|(چقدر|چند)\s*(سود|ضرر)\s*(کردم|دارم|هست)", re.I), _b_pnl_strong),
     ("status", re.compile(
@@ -768,11 +843,14 @@ RULES: list[tuple[str, re.Pattern, object]] = [
         r"|(ربات|موتور|سیستم|انجین)\s*(روشن|فعال|کار\s*می\u200cکند|خاموش)", re.I),
      _b_status),
     ("leverage_read", re.compile(
-        r"(اهرم|لوریج|لوریج\u200cم|اهرمم).*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش)"
-        r"|(چقدر|چند)\s*(اهرم|لوریج)", re.I), _b_leverage_read),
+        r"(اهرم|لوریج|لوریج\u200cم|اهرمم|لورنس|اهرم\u200cم).*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش)"
+        r"|(چقدر|چند)\s*(اهرم|لوریج|لورنس)", re.I), _b_leverage_read),
     ("leverage_set", re.compile(
-        r"(اهرم|لوریج)\s*(رو|را)?\s*(\d+)\s*(برسان|کن|بذار|بزار|تنظیم)"
-        r"|(اهرم|لوریج)\s*(رو|را)?\s*(\d+)", re.I), _b_leverage_set),
+        r"(اهرم|لوریج|لورنس|اهرم\u200cم)\s*(رو|را)?\s*(\d+)\s*(برسان|کن|بذار|بزار|تنظیم)"
+        r"|(اهرم|لوریج|لورنس|اهرم\u200cم)\s*(رو|را)?\s*(\d+)"
+        # "لورنس رو کم کن" - the direction without a number: ask for the value
+        r"|(اهرم|لوریج|لورنس|اهرم\u200cم)\s*(رو|را)?\s*(ببر|کم|زیاد|بالا|پایین|برسان|تنظیم)",
+        re.I), _b_leverage_set),
     ("risk_set", re.compile(
         r"(ریسک)\s*(رو|را)?\s*(\d+(?:\.\d+)?)\s*(درصد|٪|%)?"
         r"|(ریسک)\s*(رو|را)?\s*(برسان|کن|ببر|بالا|پایین)", re.I), _b_risk_set),
