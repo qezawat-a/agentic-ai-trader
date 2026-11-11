@@ -116,6 +116,11 @@ class EngineState:
     # --- ACCOUNT TP/SL thresholds (USDT). 0 disables a side.
     account_tp_usdt: float = 0.0
     account_sl_usdt: float = 0.0
+    #: The minimum stop distance in ticks. Was the module constant
+    #: MIN_STOP_TICKS (still the default); the operator can raise it when
+    #: the exchange rejects a stop that sits too close to the mark
+    #: (30029/30031) or when a volatile symbol needs more room.
+    min_stop_ticks: int = MIN_STOP_TICKS
 
 
 @dataclass
@@ -257,6 +262,7 @@ class TraderEngine:
         "scans",
         "tpsl_method", "partial_tp_ladder",
         "account_tp_usdt", "account_sl_usdt",
+        "min_stop_ticks",
     )
 
     def _state_snapshot(self) -> dict[str, Any]:
@@ -973,10 +979,10 @@ class TraderEngine:
         if mark_now > 0:
             mark = ctx.mark = mark_now
         plan.sl = clamp_sl(side=side, sl=plan.sl, entry=price, mark=mark,
-                           rules=rules, min_ticks=MIN_STOP_TICKS,
+                           rules=rules, min_ticks=self.state.min_stop_ticks,
                            liq=plan.liq)
         plan.tp = clamp_tp(side=side, tp=plan.tp, entry=price, mark=mark,
-                           rules=rules, min_ticks=MIN_STOP_TICKS)
+                           rules=rules, min_ticks=self.state.min_stop_ticks)
 
         # --- which TP goes on the entry order.
         partial_method, rungs, tp_for_order = self._entry_exits(ctx)
@@ -1054,7 +1060,7 @@ class TraderEngine:
         max_lev_for_stop = max_leverage_for_stop(
             entry=worst_entry, mark=ctx.mark, side=ctx.side,
             maintenance_margin_rate=lev_tier.maintenance_margin_rate,
-            rules=ctx.rules, min_ticks=MIN_STOP_TICKS)
+            rules=ctx.rules, min_ticks=self.state.min_stop_ticks)
 
         if max_lev_for_stop <= 0:
             msg = (f"{ctx.sym}: no stop-loss can fit at any leverage - the mark "
@@ -1155,7 +1161,7 @@ class TraderEngine:
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
                 breakeven_pct=self.state.breakeven_pct,
                 trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                mark=ctx.mark, min_stop_ticks=MIN_STOP_TICKS,
+                mark=ctx.mark, min_stop_ticks=self.state.min_stop_ticks,
             )
         except TpSlSideError as e:
             self.state.errors.append(f"tpsl {ctx.sym}: {e}")
@@ -1272,7 +1278,7 @@ class TraderEngine:
                     liq_sl_distance_pct=self.state.liq_sl_distance_pct,
                     breakeven_pct=self.state.breakeven_pct,
                     trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                    mark=ctx.mark, min_stop_ticks=MIN_STOP_TICKS,
+                    mark=ctx.mark, min_stop_ticks=self.state.min_stop_ticks,
                 )
             except TpSlSideError as e:
                 self.state.errors.append(f"tpsl {ctx.sym}: {e}")
@@ -1343,7 +1349,7 @@ class TraderEngine:
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
                 breakeven_pct=self.state.breakeven_pct,
                 trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-                mark=ctx.mark, min_stop_ticks=MIN_STOP_TICKS,
+                mark=ctx.mark, min_stop_ticks=self.state.min_stop_ticks,
             )
         except TpSlSideError as e:
             self.state.errors.append(f"tpsl {ctx.sym}: {e}")
@@ -1472,7 +1478,7 @@ class TraderEngine:
                 slPrice=plan.sl, slStopType=trigger_type, slOrderType="MARKET",
                 rules=ctx.rules, known_symbols=set(self.rules) or None,
                 mark_price=ctx.mark, entry_price=ctx.price,
-                min_stop_ticks=MIN_STOP_TICKS,
+                min_stop_ticks=self.state.min_stop_ticks,
                 **await self._trade_side_fields("OPEN"),
             )
         except OrderValidationError as e:
@@ -1898,7 +1904,7 @@ class TraderEngine:
         """
         violations = validate_tpsl_side(
             symbol=sym, side=side, entry=entry, mark=mark, sl=sl, tp=tp,
-            rules=rules, min_ticks=MIN_STOP_TICKS)
+            rules=rules, min_ticks=self.state.min_stop_ticks)
         if violations:
             self.state.errors.append(
                 "manage TP/SL refused locally: " + "; ".join(violations))
@@ -1998,7 +2004,7 @@ class TraderEngine:
         if not should_breakeven(st, roi, self.state.breakeven_pct):
             return None
         sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
-                      rules=rules, min_ticks=MIN_STOP_TICKS,
+                      rules=rules, min_ticks=self.state.min_stop_ticks,
                       liq=st.liq or None)
         if not self._tpsl_side_ok(sym, side, entry, mark, sl=sl, tp=st.tp, rules=rules):
             return None
@@ -2034,7 +2040,7 @@ class TraderEngine:
         if new_stop is None:
             return None
         sl = clamp_sl(side=side, sl=new_stop, entry=entry, mark=mark,
-                      rules=rules, min_ticks=MIN_STOP_TICKS,
+                      rules=rules, min_ticks=self.state.min_stop_ticks,
                       liq=st.liq or None)
         if not self._tpsl_side_ok(sym, side, entry, mark, sl=sl, tp=st.tp, rules=rules):
             return None
@@ -2496,7 +2502,7 @@ class TraderEngine:
             f"scan_interval={s.scan_interval}s report_interval={s.report_interval}s "
             f"reversal={s.reversal} reversal_conf={s.reversal_confidence} "
             f"reentry_cooldown={s.reentry_cooldown_sec}s",
-            f"min_stop_ticks={MIN_STOP_TICKS} "
+            f"min_stop_ticks={s.min_stop_ticks} "
             f"taker_fee={self.s.taker_fee_rate * 100:g}% "
             f"margin_safety={self.s.margin_safety_pct:g}%",
             f"scans={s.scans} errors={len(s.errors)}",
@@ -2513,6 +2519,7 @@ class TraderEngine:
         "scans interval", "breakeven threshold",
         "trailing trigger", "liq sl distance", "min agreeing", "timeframes",
         "min confidence", "tf min confidence", "positions history", "close position",
+        "min stop ticks",
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
         "margin amount", "margin add", "margin reduce",
         "leverage", "risk ",
@@ -2520,6 +2527,7 @@ class TraderEngine:
         # always armed with their own Readouts)
         "tpsl method", "partial ladder",
         "account tp usdt", "account sl usdt",
+        "min stop ticks",
     )
 
     def looks_like_command(self, line: str) -> bool:
@@ -2557,6 +2565,15 @@ class TraderEngine:
     #: either fails or invents a confirmation - and the old value is still
     #: there after a restart. That reads as "everything reset".
     COMMAND_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
+        # A leading "set " is a verb, not part of the grammar:
+        # "Set partial ladder 25@1,25@2,25@3" is the ladder setter.
+        # EXCEPT when what follows is a setter the NLU treats as DESTRUCTIVE
+        # ("set leverage to 5x" keeps its confirm prompt) - leave those
+        # intact so the sentence keeps flowing through NLU.
+        (re.compile(r"^\s*set\s+(?!leverage\b|leverage\s+mode\b|risk\b|risk\s+"
+                    r"per\s+trade\b|margin\s+amount\b|margin\s+per\s+trade\b|"
+                    r"margin\s+mode\b|position\s+mode\b|close\b|autotrade\b)"),
+         ""),
         (re.compile(r"^risk[ _]pct\s+(.+)$"), r"risk \1"),
         (re.compile(r"^risk per trade\s+(.+)$"), r"risk \1"),
         (re.compile(r"^margin_amount_pct\s+(.+)$"), r"margin amount \1"),
@@ -2565,14 +2582,26 @@ class TraderEngine:
         (re.compile(r"^breakeven\s+([\d.]+)$"), r"breakeven threshold \1"),
         (re.compile(r"^scan interval\s+(.+)$"), r"scans interval \1"),
         (re.compile(r"^reentry[ _]cooldown\s+(.+)$"), r"reentry cooldown \1"),
+        # The min-stop setter: "min stop tick 4", "min stop 4" - the old
+        # constant had NO command at all, so the request fell through to the
+        # model and, with the model down, produced an error dump.
+        (re.compile(r"^min stop ticks?\s+([\d.]+)$"), r"min stop ticks \1"),
+        (re.compile(r"^min stop\s+([\d.]+)$"), r"min stop ticks \1"),
     )
 
     def _normalize_command(self, low: str) -> str:
-        """Rewrite the operator's wording into the canonical grammar."""
-        for pattern, replacement in self.COMMAND_ALIASES:
-            m = pattern.match(low)
-            if m:
-                return pattern.sub(replacement, low)
+        """Rewrite the operator's wording into the canonical grammar.
+
+        An alias can CHAIN ("set min stop tick 4" -> "min stop tick 4" ->
+        "min stop ticks 4"), so the rewrite is repeated until a pass makes
+        no change - bounded, so aliases cannot ping-pong.
+        """
+        for _ in range(3):
+            before = low
+            for pattern, replacement in self.COMMAND_ALIASES:
+                low = pattern.sub(replacement, low)
+            if low == before:
+                break
         return low
 
     #: Commands whose argument is a bare number (optionally with a unit word).
@@ -2582,6 +2611,7 @@ class TraderEngine:
         "liq sl distance", "min agreeing", "min confidence",
         "tf min confidence", "account tp usdt", "account sl usdt",
         "margin amount", "reversal_confidence", "reentry cooldown",
+        "min stop ticks",
     )
 
     def _is_command_argument(self, prefix: str, rest: str) -> bool:
@@ -2781,6 +2811,18 @@ class TraderEngine:
                 return f"Min agreeing strategies = {s.min_agreeing}."
             except (ValueError, IndexError):
                 return "Usage: Min agreeing strategies 3"
+        if low.startswith("min stop ticks"):
+            try:
+                n = int(float(arg("min stop ticks").split()[-1]))
+            except (ValueError, IndexError):
+                return "Usage: min stop ticks 4"
+            if not 1 <= n <= 50:
+                return ("Min stop ticks must be 1..50 "
+                        f"({n} rejected; the current value is {s.min_stop_ticks}).")
+            s.min_stop_ticks = n
+            return (f"Min stop ticks = {n} (the stop must clear the entry "
+                    f"by at least this many ticks; was {MIN_STOP_TICKS} before "
+                    f"the first change).")
         if low.startswith("timeframes"):
             tfs = [t.strip() for t in arg("timeframes").replace("=", " ").split(",") if t.strip()]
             if tfs:

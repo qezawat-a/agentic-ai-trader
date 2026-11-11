@@ -336,6 +336,7 @@ SETTINGS_VISIBLE = {
     "partial_tp_ladder": "partial ladder:",
     "account_tp_usdt": "account TP/SL",
     "account_sl_usdt": "account TP/SL",
+    "min_stop_ticks": "min stop ",
 }
 
 # The fields that are engine internals, not operator settings.
@@ -380,6 +381,10 @@ SETTING_ALIASES = [
     ("breakeven 12",        "breakeven_pct", 12.0),
     ("scan interval 15",    "scan_interval", 15),
     ("reentry cooldown 120", "reentry_cooldown_sec", 120),
+    ("min stop tick 4",     "min_stop_ticks", 4),
+    ("min stop ticks 6",    "min_stop_ticks", 6),
+    ("min stop 4",          "min_stop_ticks", 4),
+    ("set min stop tick 4", "min_stop_ticks", 4),
 ]
 
 

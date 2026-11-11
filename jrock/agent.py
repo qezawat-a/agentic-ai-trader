@@ -845,10 +845,11 @@ class JRockAgent:
         if name == "MIN_STOP_TICKS":
             from .trader.engine import MIN_STOP_TICKS
             return (
-                f"MIN_STOP_TICKS = {MIN_STOP_TICKS}\n"
-                f"  Fixed in code (jrock/trader/engine.py), not an env knob.\n"
+                f"MIN_STOP_TICKS = {self.engine.state.min_stop_ticks} "
+                f"(built-in default {MIN_STOP_TICKS})\n"
                 f"  It is the minimum gap, in PRICE TICKS, that a TP/SL must keep\n"
                 f"  from the reference (mark/entry) price. 1 tick = 10^-quotePrecision.\n"
+                f"  SET IT: 'min stop ticks 6' (accepted range 1..50, persisted).\n"
                 f"  Higher = safer against 30029/30031 but a wider stop.\n"
                 f"  Lower = tighter stop, more likely to be rejected by the exchange.\n")
         if name == "TAKER_FEE_RATE":
@@ -2085,7 +2086,7 @@ class JRockAgent:
         (fees, margin safety, the minimum stop)."""
         s = self.engine.s
         return [
-            f"engine parameters: min stop {MIN_STOP_TICKS} ticks  "
+            f"engine parameters: min stop {self.engine.state.min_stop_ticks} ticks  "
             f"taker fee {s.taker_fee_rate * 100:g}%  "
             f"margin safety {s.margin_safety_pct:g}%",
         ]

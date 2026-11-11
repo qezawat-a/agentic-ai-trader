@@ -233,12 +233,39 @@ def _extract_balance(text: str) -> float | None:
 async def probe_model(session: aiohttp.ClientSession, base_url: str, api_key: str,
                       model: str, timeout: float = 25.0,
                       free: bool = False) -> ModelProbe:
+    """Probe one model, once tightly and once generously.
+
+    Reasoning-style models burn a tight token budget on thinking, and the
+    provider answers HTTP 500 "empty response content" - the model is fine,
+    the probe was too tight. Those failures get ONE retry with a 200-token
+    budget before the model is declared dead.
+    """
+    p = await _probe_once(session, base_url, api_key, model, timeout, free, 5)
+    if p.works:
+        return p
+    if _looks_empty_content(p):
+        retry = await _probe_once(session, base_url, api_key, model,
+                                  timeout, free, 200)
+        if retry.works:
+            return retry
+    return p
+
+
+def _looks_empty_content(p: ModelProbe) -> bool:
+    if p.status == "empty-content":
+        return True
+    return p.status == "500" and "empty response" in (p.error or "").lower()
+
+
+async def _probe_once(session: aiohttp.ClientSession, base_url: str,
+                      api_key: str, model: str, timeout: float,
+                      free: bool, max_tokens: int) -> ModelProbe:
     p = ModelProbe(id=model, score=score_model(model), free=free)
     url = f"{base_url.rstrip('/')}/chat/completions"
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
-        "max_tokens": 5,
+        "max_tokens": max_tokens,
         "temperature": 0,
     }
     t0 = time.perf_counter()
@@ -254,12 +281,16 @@ async def probe_model(session: aiohttp.ClientSession, base_url: str, api_key: st
                     p.status = "bad-json"
                     p.error = f"200 but non-JSON: {text[:160]}"
                     return p
-                if d.get("choices"):
+                choice = (d.get("choices") or [{}])[0]
+                content = ((choice.get("message") or {}).get("content") or "")
+                if content.strip():
                     p.works = True
                     p.status = "ok"
                 else:
-                    p.status = "no-choices"
-                    p.error = f"200 but no choices: {text[:160]}"
+                    p.status = "empty-content"
+                    p.error = (f"200 but the content is empty "
+                               f"(finish={choice.get('finish_reason')}, "
+                               f"max_tokens={max_tokens})")
             elif r.status == 402:
                 p.status = "402"
                 p.balance = _extract_balance(text)
@@ -357,7 +388,7 @@ async def _run_probes(session: aiohttp.ClientSession, base_url: str,
     return probes, balance, False
 
 
-async def autoset_model(base_url: str, api_key: str, max_probe: int = 8,
+async def autoset_model(base_url: str, api_key: str, max_probe: int = 12,
                         concurrency: int = 4, free_only: bool | None = None,
                         max_paid_probe: int = 3) -> AutoSetResult:
     """Probe models and pick the best working one.
@@ -437,7 +468,14 @@ def _failure(base_url: str, probes: list[ModelProbe], listed: int, free_count: i
     if balance is not None:
         lines.append(f"ACCOUNT BALANCE IS {balance} - add credits or use a free model.")
     lines.append("")
-    lines.append(res.table())
+    # The full table belongs to the `models` command. The chat error shows the
+    # first few rows only - a 40-line dump on every message is noise, not help.
+    table = res.table().splitlines()
+    if len(table) > 6:
+        lines += table[:6]
+        lines.append(f"  ... and {len(table) - 6} more (run 'models' for the full list)")
+    else:
+        lines.append(res.table())
     lines.append("")
     if balance is not None and balance <= 0:
         lines.append("Next action: top up at your provider's billing page, or run with "
