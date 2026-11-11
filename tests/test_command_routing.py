@@ -344,6 +344,7 @@ SETTINGS_VISIBLE = {
 # The fields that are engine internals, not operator settings.
 SETTINGS_INTERNAL = {
     "last_scan_ts", "last_report_ts", "scans", "errors", "notes",
+    "manage_last_ok",
 }
 
 

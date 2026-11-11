@@ -100,6 +100,48 @@ def test_short_stop_is_always_above_both(entry, mark):
                               mark=mark, sl=sl, tp=None, rules=AKE) == []
 
 
+@pytest.mark.parametrize("entry,mark", [
+    (0.005000, 0.005060),   # long in profit: a trail stop above the entry
+    (0.005000, 0.005300),   # long deep in profit
+])
+def test_profit_side_long_stop_may_sit_above_the_entry(entry, mark):
+    """The trailing ratchet's whole point is a stop ABOVE the entry. The
+    default clamp caps a LONG stop at the breakeven level (entry - min
+    ticks) - correct for a loss-side SL, fatal for a profit lock: ROI +31%
+    with the stop still at the original level, live."""
+    want = mark * 0.997  # a profit-lock stop just under the mark
+    sl = clamp_sl(side="LONG", sl=want, entry=entry, mark=mark, rules=AKE,
+                  profit_side=True)
+    assert sl > entry, f"the profit lock was clamped back below the entry: {sl}"
+    assert sl < mark
+    assert validate_tpsl_side(symbol="AKEUSDT", side="LONG", entry=entry,
+                              mark=mark, sl=sl, tp=None, rules=AKE,
+                              sl_profit_side=True) == []
+
+
+def test_profit_side_short_stop_may_sit_below_the_entry():
+    entry, mark = 0.005000, 0.004940  # short in profit
+    want = mark * 1.003
+    sl = clamp_sl(side="SHORT", sl=want, entry=entry, mark=mark, rules=AKE,
+                  profit_side=True)
+    assert sl < entry, f"the short's profit lock sat above the entry: {sl}"
+    assert sl > mark
+    assert validate_tpsl_side(symbol="AKEUSDT", side="SHORT", entry=entry,
+                              mark=mark, sl=sl, tp=None, rules=AKE,
+                              sl_profit_side=True) == []
+
+
+def test_profit_side_never_lets_a_stop_cross_the_mark():
+    """A crashing mark still wins: the stop must stay on the mark's side."""
+    entry, mark = 0.005000, 0.004800
+    sl = clamp_sl(side="LONG", sl=0.0049, entry=entry, mark=mark, rules=AKE,
+                  profit_side=True)
+    assert sl < mark
+    assert validate_tpsl_side(symbol="AKEUSDT", side="LONG", entry=entry,
+                              mark=mark, sl=sl, tp=None, rules=AKE,
+                              sl_profit_side=True) == []
+
+
 def test_short_stop_is_strictly_beyond_the_limit_not_on_it():
     """A stop exactly ON the limit is still rejected (30023/30031)."""
     entry, mark = 0.005051, 0.005040

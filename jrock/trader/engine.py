@@ -77,6 +77,13 @@ class EngineState:
     reversal: bool = False
     reversal_confidence: float = 70.0
     mid_management: bool = True
+    #: Volatile health of the manage loop: time.time() of the last FULL,
+    #: successful cycle. 0 = never ran. The report uses it to say, loudly,
+    #: whether the breakeven/trailing machinery is actually ALIVE - a dead
+    #: loop used to leave the report claiming "both always on" while no
+    #: stop had moved for hours (peak_roi frozen at 17% while live ROI
+    #: was 31%).
+    manage_last_ok: float = 0.0
     symbols: list[str] = field(default_factory=lambda: ["BTCUSDT"])
     leverage: int = 10
     margin_mode: str = "ISOLATION"
@@ -1944,7 +1951,8 @@ class TraderEngine:
 
     def _tpsl_side_ok(self, sym: str, side: str, entry: float, mark: float, *,
                       sl: float | None, tp: float | None,
-                      rules: PairRules) -> bool:
+                      rules: PairRules,
+                      sl_profit_side: bool = False) -> bool:
         """Last gate before a managed TP/SL is sent.
 
         `clamp_sl`/`clamp_tp` already put the prices on the correct side; this
@@ -1955,7 +1963,8 @@ class TraderEngine:
         """
         violations = validate_tpsl_side(
             symbol=sym, side=side, entry=entry, mark=mark, sl=sl, tp=tp,
-            rules=rules, min_ticks=self.state.min_stop_ticks)
+            rules=rules, min_ticks=self.state.min_stop_ticks,
+            sl_profit_side=sl_profit_side)
         if violations:
             self.state.errors.append(
                 "manage TP/SL refused locally: " + "; ".join(violations))
@@ -1985,7 +1994,31 @@ class TraderEngine:
         # Management state (breakeven_done / trailing_stop / peak_roi) must hit
         # the disk even if the process is killed a moment later.
         self.persist_positions()
+        self.state.manage_last_ok = time.time()
         return actions
+
+    def _manage_state_line(self) -> str:
+        """Is the loop that moves the stops actually alive - answered plainly.
+
+        The report used to say "breakeven armed, trailing armed - both always
+        on" while the loop that does the moving sat dead (or mid_management
+        was off): peak_roi frozen at 17% while live ROI was 31%, stops never
+        ratcheted. "Armed" means nothing if the machine is not running; this
+        line says whether it is running, and what to type when it is not.
+        """
+        s = self.state
+        if not s.mid_management:
+            return ("management loop: OFF (mid management off) - your "
+                    "breakeven/trailing will NOT move. "
+                    "Turn it on: mid management on")
+        if not s.manage_last_ok:
+            return ("management loop: NOT RUNNING yet - your exits are not "
+                    "being moved. Start the engine: engine on")
+        age = time.time() - s.manage_last_ok
+        if age > max(60, s.scan_interval * 4):
+            return (f"management loop: STALLED {age:.0f}s ago - your exits "
+                    f"may not be moving. Restart: engine off, then engine on")
+        return f"management loop: running (last cycle {age:.0f}s ago)"
 
     async def _manage_account_tpsl(self, positions: list[dict]) -> dict | None:
         """ACCOUNT TP/SL: the whole futures account is the control unit.
@@ -2090,10 +2123,28 @@ class TraderEngine:
         new_stop = next_trailing_stop(st, price, atr_val)
         if new_stop is None:
             return None
+        # The trailing ratchet only guards against loosening vs the PREVIOUS
+        # trailing stop - its first candidate (price - 1.5*ATR) can fall well
+        # BELOW the entry, and writing it would UNDO the breakeven protection
+        # the position already earned (observed live: be=moved with the stop
+        # put back 3.5% under the entry). Once the breakeven has fired, the
+        # floor is exactly the stop the breakeven path writes (the entry
+        # minus the exchange's minimum tick distance) - never looser.
+        if st.breakeven_done:
+            be_floor = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
+                                rules=rules,
+                                min_ticks=self.state.min_stop_ticks,
+                                liq=st.liq or None)
+            if be_floor is not None:
+                if side.upper() in ("LONG", "BUY"):
+                    new_stop = max(new_stop, be_floor)
+                else:
+                    new_stop = min(new_stop, be_floor)
         sl = clamp_sl(side=side, sl=new_stop, entry=entry, mark=mark,
                       rules=rules, min_ticks=self.state.min_stop_ticks,
-                      liq=st.liq or None)
-        if not self._tpsl_side_ok(sym, side, entry, mark, sl=sl, tp=st.tp, rules=rules):
+                      liq=st.liq or None, profit_side=True)
+        if not self._tpsl_side_ok(sym, side, entry, mark, sl=sl, tp=st.tp,
+                                  rules=rules, sl_profit_side=True):
             return None
         try:
             await self.client.modify_position_tp_sl_order(
@@ -2227,8 +2278,7 @@ class TraderEngine:
             f"armed: breakeven at +{s.breakeven_pct:g}% ROI, "
             f"trailing from +{s.trailing_trigger_roi_pct:g}% ROI, "
             f"liq SL distance {s.liq_sl_distance_pct:g}%",
-            f"mid management (the loop that moves them): "
-            f"{'ON' if s.mid_management else 'OFF'}",
+            self._manage_state_line(),
         ]
         if not self.positions:
             lines.append("no open position - nothing is being managed")
@@ -2403,7 +2453,8 @@ class TraderEngine:
                  f"software: breakeven armed at +{self.state.breakeven_pct:g}% ROI, "
                  f"trailing armed from +{self.state.trailing_trigger_roi_pct:g}% ROI "
                  f"(both always on - they fire when the position's ROI passes the "
-                 f"threshold) | {self.account_cfg().describe()}"]
+                 f"threshold) | {self.account_cfg().describe()}",
+                 self._manage_state_line()]
 
         # one line per managed position: what is armed, and by which method
         for st in self.positions.values():

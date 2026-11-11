@@ -573,7 +573,8 @@ def tpsl_bounds(*, side: str, entry: float, mark: float,
 
 def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
              rules: "PairRules", min_ticks: int = 3,
-             liq: float | None = None) -> float:
+             liq: float | None = None,
+             profit_side: bool = False) -> float:
     """Force a stop-loss onto the correct side of BOTH entry and mark.
 
     This is THE single place a stop-loss price is made safe, and every path that
@@ -586,6 +587,14 @@ def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
     ceiled, so rounding can only ever move the stop FURTHER from the mark. Plain
     nearest-rounding can move it back across the mark by up to half a tick,
     which is exactly the 30029/30031 rejection.
+
+    `profit_side` marks a TRAILING stop - a stop that has earned the right to
+    sit on the profit side of the entry. Without it the entry cap
+    (`min(entry, mark)` for a LONG) clamps every stop back DOWN to the
+    breakeven level, so a LONG's profit-lock ratchet could never rise above
+    the entry no matter how far the price ran (observed live: ROI +31% with
+    the stop still at the original level). The exchange only requires the
+    trigger to be on the mark's side; the entry cap is a loss-side choice.
     """
     p = max(0, int(rules.quote_precision))
     d = min_stop_distance(rules, min_ticks)
@@ -602,7 +611,7 @@ def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
     # honouring it would push the stop across the mark and cause the very
     # rejection this function exists to prevent.
     if is_long:
-        limit = min(entry, mark) - d
+        limit = (mark if profit_side else min(entry, mark)) - d
         out = floor_price(min(sl, limit), p)
         if out >= limit:
             out = floor_price(limit - tick, p)
@@ -610,7 +619,7 @@ def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
             out = ceil_price(liq + d, p)
         return out
 
-    limit = max(entry, mark) + d
+    limit = (mark if profit_side else max(entry, mark)) + d
     out = ceil_price(max(sl, limit), p)
     if out <= limit:
         out = ceil_price(limit + tick, p)
@@ -645,7 +654,8 @@ def clamp_tp(*, side: str, tp: float, entry: float, mark: float,
 def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
                        sl: float | None, tp: float | None,
                        rules: "PairRules", min_ticks: int = 3,
-                       liq: float | None = None) -> list[str]:
+                       liq: float | None = None,
+                       sl_profit_side: bool = False) -> list[str]:
     """Return a list of human-readable violations (empty == valid).
 
     Covers the documented exchange rules:
@@ -653,6 +663,10 @@ def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
         30022/30023  SL on the wrong side of mark
         30026-30033  TP/SL on the wrong side of last price
         30024/30025  SL on the wrong side of the liquidation price
+
+    `sl_profit_side` matches clamp_sl's `profit_side` for a TRAILING stop:
+    the SL's entry cap is lifted (the mark side still holds), so a profit
+    lock above the entry does not get flagged as a violation.
     """
     is_long = side.upper() in ("LONG", "BUY")
     d = min_stop_distance(rules, min_ticks)
@@ -668,7 +682,7 @@ def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
 
     if sl is not None:
         if is_long:
-            limit = min(entry, mark) - d
+            limit = (mark if sl_profit_side else min(entry, mark)) - d
             if sl >= limit:
                 out.append(
                     f"SL {sl:.{rules.quote_precision}f} must be BELOW "
@@ -681,7 +695,7 @@ def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
                     f"SL {sl:.{rules.quote_precision}f} must be ABOVE the "
                     f"liquidation price {liq:.{rules.quote_precision}f} for a LONG")
         else:
-            limit = max(entry, mark) + d
+            limit = (mark if sl_profit_side else max(entry, mark)) + d
             if sl <= limit:
                 out.append(
                     f"SL {sl:.{rules.quote_precision}f} must be ABOVE "
