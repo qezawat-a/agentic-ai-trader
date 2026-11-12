@@ -144,7 +144,7 @@ def _setting_fields(agent: JRockAgent) -> list[dict]:
         ("tf_min_confidence", "tf min confidence", s.tf_min_confidence),
         ("universe_rank", "universe auto rank", s.universe_rank),
         ("universe_sizing", "universe size", s.universe_sizing),
-        ("min_24h_volume_usd", "min 24h volume usd", s.min_24h_volume_usd),
+        ("min_24h_volume_usdt", "min 24h volume usd", s.min_24h_volume_usdt),
         ("scan_interval", "scan interval (s)", s.scan_interval),
         ("report_interval", "report interval (s)", s.report_interval),
         ("reversal_confidence", "reversal confidence", s.reversal_confidence),

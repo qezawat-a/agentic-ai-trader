@@ -346,7 +346,7 @@ SETTINGS_VISIBLE = {
     "min_stop_ticks": "min stop ",
     "universe_rank": "universe rank:",
     "universe_sizing": "universe sizing:",
-    "min_24h_volume_usd": "min 24h volume:",
+    "min_24h_volume_usdt": "min 24h volume:",
 }
 
 # The fields that are engine internals, not operator settings.

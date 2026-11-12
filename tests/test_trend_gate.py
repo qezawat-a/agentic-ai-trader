@@ -161,7 +161,7 @@ def test_trend_gate_commands(tmp_path):
 def test_trend_gate_persists(tmp_path):
     a = _agent(tmp_path)
     _run(a.handle("trend gate off"))
-    b = JRockAgent(Settings(bitunix_api_key="k", bitunix_api_secret="s"))
+    b = JRockAgent(Settings(trend_gate=False, bitunix_api_key="k", bitunix_api_secret="s"))
     b.engine.data_dir = tmp_path
     assert b.engine.state.trend_gate is False
 

@@ -139,7 +139,7 @@ class EngineState:
     #: How many top-ranked symbols to keep in the auto universe (1..200). 0 = off.
     universe_sizing: int = 0
     #: Minimum 24h quote volume (USDT) for a symbol to qualify for the auto universe.
-    min_24h_volume_usd: float = 0.0
+    min_24h_volume_usdt: float = 0.0
     #: PARTIAL ladder spec, "share@R" pairs, e.g. "40@1,35@2,25@3".
     partial_tp_ladder: str = "40@1,35@2,25@3"
     # --- ACCOUNT TP/SL thresholds (USDT). 0 disables a side.
@@ -217,7 +217,8 @@ class TraderEngine:
             account_sl_usdt=settings.account_sl_usdt,
             universe_rank=settings.universe_rank,
             universe_sizing=settings.universe_sizing,
-            min_24h_volume_usd=settings.min_24h_volume_usd,
+            min_24h_volume_usdt=settings.min_24h_volume_usdt,
+            trend_gate=settings.trend_gate,
         )
 
     def _init_runtime(self, settings: Settings, store: Store | None) -> None:
@@ -297,7 +298,7 @@ class TraderEngine:
         "scans",
         "tpsl_method", "partial_tp_ladder",
         "account_tp_usdt", "account_sl_usdt",
-        "min_stop_ticks", "universe_rank", "universe_sizing", "min_24h_volume_usd",
+        "min_stop_ticks", "universe_rank", "universe_sizing", "min_24h_volume_usdt",
     )
 
     def _state_snapshot(self) -> dict[str, Any]:
@@ -889,7 +890,7 @@ class TraderEngine:
             return "GAINER"
         if lastPrice < price:
             return "LOSER"
-        if baseVol or float(baseVol) >= self.state.min_24h_volume_usd:
+        if baseVol or float(baseVol) >= self.state.min_24h_volume_usdt:
             return "VOLUME"
         if baseVol and abs(baseVol - price) > 0:
             return "MOVER"
@@ -922,7 +923,7 @@ class TraderEngine:
             quoteVol = float(r.get("quoteVol") or 0)
             candidates.append((sym, lastPrice, markPrice, openPrice, quoteVol, baseVol))
 
-        min_vol = self.state.min_24h_volume_usd
+        min_vol = self.state.min_24h_volume_usdt
         filtered = [c for c in candidates if min_vol <= 0 or c[4] >= min_vol]
         method = (self.state.universe_rank or "").upper()
 
@@ -2764,7 +2765,7 @@ class TraderEngine:
             f"reentry_cooldown={s.reentry_cooldown_sec}s",
             f"trend_gate={s.trend_gate} tf={self._gate_timeframe() or '(none)'}",
             f"universe_rank={s.universe_rank} universe_sizing={s.universe_sizing} "
-            f"min_24h_volume_usd={s.min_24h_volume_usd:g} scans={s.scans} errors={len(s.errors)}",
+            f"min_24h_volume_usd={s.min_24h_volume_usdt:g} scans={s.scans} errors={len(s.errors)}",
             f"min_stop_ticks={s.min_stop_ticks} "
             f"taker_fee={self.s.taker_fee_rate * 100:g}% "
             f"margin_safety={self.s.margin_safety_pct:g}%",
@@ -3074,16 +3075,16 @@ class TraderEngine:
             return f"Universe sizing = {s.universe_sizing}."
         if low.startswith("universe volume"):
             try:
-                s.min_24h_volume_usd = float(arg("universe volume").split()[-1])
+                s.min_24h_volume_usdt = float(arg("universe volume").split()[-1])
             except (ValueError, IndexError):
                 return "Usage: universe volume 1000000"
-            return (f"Universe min 24h volume = {s.min_24h_volume_usd:g} USDT.")
+            return (f"Universe min 24h volume = {s.min_24h_volume_usdt:g} USDT.")
         if low.startswith("universe volume usd"):
             try:
-                s.min_24h_volume_usd = float(arg("universe volume usd").split()[-1])
+                s.min_24h_volume_usdt = float(arg("universe volume usd").split()[-1])
             except (ValueError, IndexError):
                 return "Usage: universe volume usd 1000000"
-            return (f"Universe min 24h volume = {s.min_24h_volume_usd:g} USDT.")
+            return (f"Universe min 24h volume = {s.min_24h_volume_usdt:g} USDT.")
         if low == "universe rank auto":
             s.universe_rank = "AUTO"
             s.universe_sizing = 0

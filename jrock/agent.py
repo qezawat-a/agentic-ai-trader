@@ -1580,6 +1580,7 @@ class JRockAgent:
             return "\n".join(lines)
 
         self.thinking_level = lvl
+        mirror_env(ROOT / ".env", "THINKING_LEVEL", lvl)
         params = self.reasoning_params()
         self.memory.fact("thinking_level", lvl)
         self.perms.audit.write("set_thinking_level", value=lvl)
@@ -2209,7 +2210,7 @@ class JRockAgent:
             f"(account TP/SL {s.account_tp_usdt:g}/{s.account_sl_usdt:g} USDT)",
             f"engine_on={s.engine_on} scan_on={s.scan_on} "
             f"universe rank: {s.universe_rank} universe sizing: {s.universe_sizing} "
-            f"min 24h volume: {s.min_24h_volume_usd:g}",
+            f"min 24h volume: {s.min_24h_volume_usdt:g}",
             f"autotrade={s.autotrade} report_on={s.report_on} "
             f"mid_management={s.mid_management}",
         ]

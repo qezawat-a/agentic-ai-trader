@@ -208,16 +208,19 @@ class Settings:
     #: How many top-ranked symbols to keep in the auto universe (1..200). 0 = off.
     universe_sizing: int = 0
     #: Minimum 24h quote volume (USDT) for a symbol to qualify for the auto universe.
-    min_24h_volume_usd: float = 0.0
+    min_24h_volume_usdt: float = 0.0
+    #: Trend gate: whether technical trend filters block signals on weak
+    #: setups. Persisted across engine restarts; True by default.
+    trend_gate: bool = True
+    #: Extra headroom reserved when sizing, as a percent of available balance.
+    #: Covers the price move between sizing and the request landing. 0 disables.
+    margin_safety_pct: float = 2.0
     #: Taker fee rate charged on a MARKET order, as a fraction of notional.
     #: Bitunix USDT-M futures VIP 0 is 0.0006 (0.06%). The engine must reserve
     #: this on top of the initial margin, because the exchange deducts both from
     #: the available balance at once - sizing to margin == balance is what
     #: produced 20003 Insufficient balance.
     taker_fee_rate: float = 0.0006
-    #: Extra headroom reserved when sizing, as a percent of available balance.
-    #: Covers the price move between sizing and the request landing. 0 disables.
-    margin_safety_pct: float = 2.0
 
     # ---------------------------------------------------------------- TP/SL methods
     #: Which of the two NATIVE Bitunix TP/SL methods the engine uses at entry.
@@ -297,7 +300,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         thinking_level=level_from_env(),
         universe_rank=_f("UNIVERSE_RANK", ""),
         universe_sizing=_i("UNIVERSE_SIZING", 0),
-        min_24h_volume_usd=_f("MIN_24H_VOLUME_USD", 0.0),
+        min_24h_volume_usdt=_f("MIN_24H_VOLUME_USD", 0.0),
         agent_max_steps=_i("AGENT_MAX_STEPS", 128),
         agent_thinking=(os.getenv("AGENT_THINKING") or "max").strip().lower(),
         agent_autonomous_sec=_i("AGENT_AUTONOMOUS_SEC", 15),
