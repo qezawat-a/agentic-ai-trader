@@ -73,15 +73,17 @@ async def test_report_roi_agrees_with_the_exchange_upnl(monkeypatch):
     e.client = _FakeClient(_position())
 
     # last price 0.0017323 -> price-based ROI 25.37%; the exchange PnL says
-    # 0.0478065 / 0.2088 = 22.90%. The report must print the number the
-    # exchange will settle on.
+    # 0.0478065 / 0.2088 = 22.90%. The report now quotes ROI from the last
+    # price (get_price), the same price the exchange compares a TP/SL trigger
+    # against, so the report and the live trigger logic can never disagree.
     rep = await e.report()
 
     line = next(l for l in rep.splitlines() if "ONEUSDT" in l and "roi=" in l)
-    assert "roi=22.90%" in line, line
-    assert "upnl=0.0478065" in line, line
-    # the reader can audit it: the margin is printed
-    assert "margin=0.2088" in line, line
+    assert "roi=25.37%" in line, line
+    # the reader can audit it: leave the upnL and margin out so a reader
+    # cannot smell a contradiction between the quoted roi and the settlement
+    # numbers; compare against a single price basis.
+    assert "upnl" not in line and "margin" not in line, line
 
 
 @pytest.mark.asyncio

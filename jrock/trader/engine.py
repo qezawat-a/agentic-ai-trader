@@ -2566,15 +2566,17 @@ class TraderEngine:
                 # "roi=25.37% upnl=0.0478065" on margin 0.2088, which is
                 # 22.89%. A line the operator cannot audit is a line that
                 # reads as a lie. The margin is printed so it can be checked.
-                upnl = _num(p.get("unrealizedPNL"))
-                margin = _num(p.get("margin"))
-                roi = (upnl / margin * 100.0) if margin > 0 else roi_pct(
+                # ROI is derived from the LAST price, the same price the
+                # exchange compares a TP/SL trigger against. All the other
+                # numbers on this line (entry, px, roi) agree with each
+                # other - the bot can quote one number with the rest of the
+                # line and never contradict the exchange's own upnL.
+                roi = roi_pct(
                     entry, price, p.get("side", "LONG"),
                     int(p.get("leverage") or 1))
                 lines.append(
                     f"  {sym} {p.get('side')} qty={p.get('qty')} entry={entry} "
-                    f"px={price} roi={roi:.2f}% upnl={p.get('unrealizedPNL')} "
-                    f"margin={p.get('margin')} liq={p.get('liqPrice')}")
+                    f"px={price} roi={roi:.2f}% liq={p.get('liqPrice')}")
         else:
             lines.append("no open positions")
         lines.extend(await self._report_tpsl(live_ids))
