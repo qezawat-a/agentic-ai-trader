@@ -2424,6 +2424,17 @@ class TraderEngine:
             if st.trailing_active:
                 trail = (f"ACTIVE at {st.trailing_stop:g}"
                          if st.trailing_stop else "ACTIVE")
+                if st.trailing_stop:
+                    # Same honesty rule as the report: "ACTIVE" reads as "a
+                    # profit is being trailed". When the stop is at/below the
+                    # entry the ATR trail is wider than the profit and the
+                    # breakeven floor is what is holding it.
+                    is_long = st.side.upper() in ("LONG", "BUY")
+                    at_floor = (st.trailing_stop <= st.entry if is_long
+                                else st.trailing_stop >= st.entry)
+                    if at_floor:
+                        trail += (" (floor: the ATR trail is wider than the "
+                                  "profit, so it holds at breakeven)")
             elif s.mid_management:
                 trail = f"waiting (needs +{s.trailing_trigger_roi_pct:g}% ROI)"
             else:
@@ -2615,6 +2626,18 @@ class TraderEngine:
                 be = "OFF(mid management off)"
             if st.trailing_active:
                 trail = f"on@{st.trailing_stop:g}" if st.trailing_stop else "on"
+                if st.trailing_stop:
+                    # "on" is technically true but reads as "locking in profit".
+                    # When the stop sits at/below the entry the trail is wider
+                    # than the profit and the breakeven floor is what is
+                    # actually holding it - say so instead of letting the
+                    # operator believe a profit is being trailed.
+                    is_long = st.side.upper() in ("LONG", "BUY")
+                    at_floor = (st.trailing_stop <= st.entry if is_long
+                                else st.trailing_stop >= st.entry)
+                    if at_floor:
+                        trail += (" (floor: the ATR trail is wider than the "
+                                  "profit, so it holds at breakeven)")
             elif self.state.mid_management:
                 trail = f"waiting(+{self.state.trailing_trigger_roi_pct:g}%)"
             else:

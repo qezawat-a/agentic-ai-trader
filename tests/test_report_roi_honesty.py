@@ -170,3 +170,26 @@ def test_a_successful_entry_is_not_reported_as_an_error():
     assert "leverage ONEUSDT" in joined_errors, joined_errors
 
 
+def test_trailing_stop_at_the_floor_says_so():
+    """'trail=on' must not read as 'a profit is being trailed'.
+
+    Live paste: trail=on@0.0017146 on an entry of 0.0017149 - the stop is
+    BELOW the entry, because the 1.5*ATR trail distance is wider than the
+    profit and the breakeven floor binds. The line has to say that.
+    """
+    e = _engine()
+    st = PositionState(position_id="P1", symbol="ONEUSDT", side="LONG",
+                       entry=0.0017149, qty=3045, leverage=25,
+                       sl=0.0017146, tp=0.0017698, liq=0.0016548,
+                       breakeven_done=True, trailing_active=True,
+                       trailing_stop=0.0017146)
+    e.positions["P1"] = st
+    e.price_cache.put_rest("ONEUSDT", 0.0017323)
+    e._last_marks["ONEUSDT"] = 0.0017306
+
+    brief = e.exits_brief()
+    line = next(l for l in brief.splitlines() if "trailing:" in l)
+    assert "floor" in line, line
+
+
+
