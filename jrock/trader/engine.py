@@ -69,12 +69,10 @@ def _num(v: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
-#: Which price the exchange compares a TP/SL trigger against. MARK_PRICE is the
-#: documented Bitunix default and the engine's historical behaviour; the SAME
-#: value goes into the local pre-flight validation and into tpStopType/slStopType
-#: in the order body, so the two can never disagree (that mismatch is what
-#: produced 30029).
-TRIGGER_TYPE = "MARK_PRICE"
+#: Which price the exchange compares a TP/SL trigger against. LAST_PRICE is the
+#: chosen trigger price; MARK_PRICE was the historical default and produced
+#: 30029. Pass last=price to trade on the last price instead.
+TRIGGER_TYPE = "LAST_PRICE"
 
 #: Minimum distance a stop must keep from the mark/entry price, in ticks
 #: (1 tick = 10^-quotePrecision). Prevents rounding from collapsing a stop onto
@@ -591,14 +589,16 @@ class TraderEngine:
     async def get_trigger_price(self, symbol: str, last: float = 0.0) -> float:
         """The price the exchange compares a TP/SL trigger against.
 
-        TRIGGER_TYPE is fixed to MARK_PRICE (the documented Bitunix default).
+        TRIGGER_TYPE is fixed to LAST_PRICE (the chosen trigger price; MARK_PRICE was the
+   historical default and produced 30029). Pass `last=price` to trade on the last
+   price instead.
         This is the SINGLE place the choice is made. Both the local pre-flight
         validation and the tpStopType/slStopType sent in the order body read
         the same constant, so they can never disagree - a disagreement is
         exactly what produced 30029 (checked against last, rejected against
         mark).
         """
-        return await self.get_mark_price(symbol)
+        return await self.get_price(symbol)
 
     @staticmethod
     def _conservative_mark(last: float, side: str, rules: PairRules) -> float:
@@ -2311,25 +2311,15 @@ class TraderEngine:
                 )
                 self.positions[pid] = st
 
-            # The exchange validates every TP/SL trigger against the MARK price
-            # at the moment the request lands, so the mark must be read fresh
-            # here - not reused from entry time, and never assumed to equal the
-            # last price. Without this the management path sent stops that were
-            # only ever checked against the entry price (30029/30031).
-            mark = await self.get_trigger_price(sym, last=price)
-            if mark <= 0:
-                mark = price
-                log.warning("no trigger price for %s - validating the managed "
-                            "TP/SL against the last price %s", sym, price)
-            # Cache the mark for the briefs: the exchange settles uPnL against
-            # it, so it is the only price a ROI can honestly be quoted from.
-            self._last_marks[sym] = mark
-            # ROI is quoted from the MARK price for the same reason: the
-            # exchange triggers the native TP/SL against it and settles uPnL
-            # against it. A threshold compared against the LAST price could
-            # fire on a ROI the exchange never sees - and the report's ROI
-            # (derived from the mark-settled uPnL) would then contradict the
-            # threshold that fired.
+            # The exchange triggers a LAST_PRICE TP/SL against the last price
+            # (bitunix's default) - not the mark price. The mark is a synthetic
+            # index used for liquidation and uPnL, it is NOT what the broker
+            # compares a trigger against. Without this the management path sent
+            # stops that were checked against the mark (30029/30031).
+            mark = price
+            # ROI is quoted from the same price the exchange compares the
+            # trigger against, so the threshold and the report can never
+            # disagree about which ROI fired.
             roi = roi_pct(entry, mark, side, lev)
             st.peak_roi = max(st.peak_roi, roi)
             trigger_type = TRIGGER_TYPE
@@ -2418,11 +2408,10 @@ class TraderEngine:
             return "\n".join(lines)
         for st in self.positions.values():
             last = self._cached_price(st.symbol)
-            # Quote ROI from the MARK price: the exchange settles uPnL against
-            # it and the report's ROI is derived from that uPnL. A last-price
-            # ROI here would let the agent state a number the report
-            # contradicts (live: 25.37% vs 22.90%).
-            mark = self._last_marks.get(st.symbol) or last
+            # Trigger the ROI from the LAST price (bitunix default), not the
+            # mark: the exchange compares a TP/SL trigger against LAST_PRICE,
+            # and the threshold / report must agree on which ROI fired.
+            mark = last
             roi = (roi_pct(st.entry, mark, st.side, st.leverage)
                    if mark > 0 else 0.0)
             if st.breakeven_done:
@@ -2499,10 +2488,11 @@ class TraderEngine:
             lines.append(f"POSITIONS ({len(self.positions)}):")
             for st in self.positions.values():
                 last = self._cached_price(st.symbol)
-                # MARK price, for the same reason as exits_brief: the report
-                # settles ROI from the exchange's uPnL, and a last-price ROI
-                # here would contradict it.
-                mark = self._last_marks.get(st.symbol) or last
+                # Trigger the ROI from the LAST price (bitunix default), not
+                # the mark: the exchange compares a TP/SL trigger against
+                # LAST_PRICE, and the threshold / report must agree on which
+                # ROI fired.
+                mark = last
                 roi = (roi_pct(st.entry, mark, st.side, st.leverage)
                        if mark > 0 else 0.0)
                 exits = []

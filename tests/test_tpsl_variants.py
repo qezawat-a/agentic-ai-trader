@@ -145,7 +145,7 @@ def test_trigger_type_is_fixed_to_mark_price():
     pre-flight validation and the wire. One constant, one meaning.
     """
     from jrock.trader.engine import TRIGGER_TYPE
-    assert TRIGGER_TYPE == "MARK_PRICE"
+    assert TRIGGER_TYPE == "LAST_PRICE"
 
 
 def test_order_unit_defaults_to_quantity():

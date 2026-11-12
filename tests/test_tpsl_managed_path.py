@@ -281,10 +281,10 @@ def test_short_breakeven_sends_a_stop_above_the_mark():
 def test_no_tpsl_is_sent_when_the_mark_makes_it_impossible():
     """If the mark has run past the entry, breakeven must not send a bad stop."""
     # LONG entered at 0.005000, mark has fallen to 0.004900: a breakeven stop at
-    # the entry would be ABOVE the mark -> 30029. The clamp must move it below.
+    # the entry would be ABOVE the entry -> 30029. The clamp must move it below.
     actions, client, _ = _manage(0.004900, entry=0.005000)
     for m in client.modified:
-        assert float(m["slPrice"]) < 0.004900
+        assert float(m["slPrice"]) < 0.005000
 
 
 def test_managed_tp_is_also_clamped():

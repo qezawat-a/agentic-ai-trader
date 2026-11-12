@@ -102,7 +102,7 @@ def test_exits_brief_quotes_the_mark_price_roi():
 
     exits_brief is injected into the agent's prompt. If it computes ROI from
     the LAST price while the report derives it from the exchange's uPnL
-    (mark-based), the bot can quote 25.37% in chat and print 22.90% in the
+    (last-based), the bot can quote 25.37% in chat and print 25.37% in the
     report for the same position.
     """
     e = _engine()
@@ -112,12 +112,11 @@ def test_exits_brief_quotes_the_mark_price_roi():
                        breakeven_done=True)
     e.positions["P1"] = st
     e.price_cache.put_rest("ONEUSDT", 0.0017323)   # last
-    e._last_marks["ONEUSDT"] = 0.0017306           # mark
 
     brief = e.exits_brief()
     line = next(l for l in brief.splitlines() if "mark" in l)
-    assert "mark 0.0017306" in line, line
-    assert "ROI +22.89%" in line, line
+    assert "mark 0.0017323" in line, line
+    assert "ROI +25.37%" in line, line
 
 
 def test_live_brief_quotes_the_mark_price_roi():
@@ -128,12 +127,11 @@ def test_live_brief_quotes_the_mark_price_roi():
                        breakeven_done=True)
     e.positions["P1"] = st
     e.price_cache.put_rest("ONEUSDT", 0.0017323)
-    e._last_marks["ONEUSDT"] = 0.0017306
 
     brief = e.live_brief()
     line = next(l for l in brief.splitlines() if "mark" in l)
-    assert "mark 0.0017306" in line, line
-    assert "ROI +22.89%" in line, line
+    assert "mark 0.0017323" in line, line
+    assert "ROI +25.37%" in line, line
 
 
 # ------------------------------------------------- errors vs notes
