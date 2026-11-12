@@ -2229,7 +2229,7 @@ class TraderEngine:
 
     async def _apply_trailing(self, st: PositionState, sym: str, pid: str,
                               side: str, entry: float, mark: float, *,
-                              rules: PairRules, roi: float, price: float,
+                              rules: PairRules, roi: float,
                               trigger_type: str) -> dict | None:
         """Ratchet the stop behind the price once the ROI passes the trigger."""
         if not should_trail(st, roi, self.state.trailing_trigger_roi_pct):
@@ -2237,10 +2237,14 @@ class TraderEngine:
         try:
             candles = await self.get_candles(sym, "5m", 60)
             a = atr(candles, 14)
-            atr_val = a[-1] if a and a[-1] else price * 0.002
+            atr_val = a[-1] if a and a[-1] else mark * 0.002
         except Exception:  # noqa: BLE001
-            atr_val = price * 0.002
-        new_stop = next_trailing_stop(st, price, atr_val)
+            atr_val = mark * 0.002
+        # The trail distance is measured from the MARK price: that is the
+        # price the exchange triggers the stop against, so a stop derived
+        # from the last price could sit on the wrong side of the mark and
+        # trigger immediately (or be rejected by 30029/30031).
+        new_stop = next_trailing_stop(st, mark, atr_val)
         if new_stop is None:
             return None
         # The trailing ratchet only guards against loosening vs the PREVIOUS
@@ -2296,7 +2300,6 @@ class TraderEngine:
             if price <= 0:
                 return actions
             lev = int(p.get("leverage") or self.state.leverage)
-            roi = roi_pct(entry, price, side, lev)
 
             st = self.positions.get(pid)
             if st is None:
@@ -2307,7 +2310,6 @@ class TraderEngine:
                     opened_ts=time.time(),
                 )
                 self.positions[pid] = st
-            st.peak_roi = max(st.peak_roi, roi)
 
             # The exchange validates every TP/SL trigger against the MARK price
             # at the moment the request lands, so the mark must be read fresh
@@ -2322,6 +2324,14 @@ class TraderEngine:
             # Cache the mark for the briefs: the exchange settles uPnL against
             # it, so it is the only price a ROI can honestly be quoted from.
             self._last_marks[sym] = mark
+            # ROI is quoted from the MARK price for the same reason: the
+            # exchange triggers the native TP/SL against it and settles uPnL
+            # against it. A threshold compared against the LAST price could
+            # fire on a ROI the exchange never sees - and the report's ROI
+            # (derived from the mark-settled uPnL) would then contradict the
+            # threshold that fired.
+            roi = roi_pct(entry, mark, side, lev)
+            st.peak_roi = max(st.peak_roi, roi)
             trigger_type = TRIGGER_TYPE
             rules = self.rules.get(sym)
             if rules is None:
@@ -2345,7 +2355,7 @@ class TraderEngine:
 
             # 2) trailing
             action = await self._apply_trailing(
-                st, sym, pid, side, entry, mark, rules=rules, roi=roi, price=price,
+                st, sym, pid, side, entry, mark, rules=rules, roi=roi,
                 trigger_type=trigger_type)
             if action:
                 actions.append(action)
@@ -2606,8 +2616,9 @@ class TraderEngine:
                  f"method: {method}",
                  f"software: breakeven armed at +{self.state.breakeven_pct:g}% ROI, "
                  f"trailing armed from +{self.state.trailing_trigger_roi_pct:g}% ROI "
-                 f"(both always on - they fire when the position's ROI passes the "
-                 f"threshold) | {self.account_cfg().describe()}",
+                 f"(both always on - they fire when the position's MARK-price ROI "
+                 f"passes the threshold, the same basis as the report's roi and "
+                 f"the exchange's own trigger) | {self.account_cfg().describe()}",
                  self._manage_state_line()]
 
         # one line per managed position: what is armed, and by which method
