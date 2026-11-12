@@ -122,6 +122,7 @@ TRADER ENGINE COMMANDS
   tpsl method POSITION|PARTIAL
   partial ladder 40@1,35@2,25@3     partial ladder off
   account tp usdt 100               account sl usdt 50
+  universe rank GAINERS|LOOSERS|VOLUME|MOVERS | universe sizing N | universe volume N
   margin add BTCUSDT 100            margin reduce BTCUSDT 50
 
 ENV SETTINGS (in .env, read at startup)
@@ -398,6 +399,64 @@ class JRockAgent:
         lvl = normalize_level(value) or DEFAULT_LEVEL
         self.store.set("thinking_level", lvl)
         self.s.thinking_level = lvl
+
+    # ----------------------------------------------------------- agent settings
+    @property
+    def agent_max_steps(self) -> int:
+        """Store > .env > default (128). Steps any agentic loop may take."""
+        stored = self.store.get("agent_max_steps")
+        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+            return int(stored)
+        return int(self.s.agent_max_steps or 128)
+
+    @agent_max_steps.setter
+    def agent_max_steps(self, value: int) -> None:
+        v = max(0, int(value))
+        self.store.set("agent_max_steps", v)
+        self.s.agent_max_steps = v
+
+    @property
+    def agent_thinking(self) -> str:
+        """Store > .env > default (max). Reasoning level for agentic work."""
+        stored = normalize_level(self.store.get("agent_thinking"))
+        if stored:
+            return stored
+        lvl = normalize_level(self.s.agent_thinking) or "max"
+        return lvl
+
+    @agent_thinking.setter
+    def agent_thinking(self, value: str) -> None:
+        lvl = normalize_level(value) or "max"
+        self.store.set("agent_thinking", lvl)
+        self.s.agent_thinking = lvl
+
+    @property
+    def agent_autonomous_sec(self) -> int:
+        """Store > .env > default (15). Seconds between autonomous iterations."""
+        stored = self.store.get("agent_autonomous_sec")
+        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+            return int(stored)
+        return int(self.s.agent_autonomous_sec or 15)
+
+    @agent_autonomous_sec.setter
+    def agent_autonomous_sec(self, value: int) -> None:
+        v = max(0, int(value))
+        self.store.set("agent_autonomous_sec", v)
+        self.s.agent_autonomous_sec = v
+
+    @property
+    def agent_rate_limit_window(self) -> int:
+        """Store > .env > default (128). Rate-limit window in seconds."""
+        stored = self.store.get("agent_rate_limit_window")
+        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+            return int(stored)
+        return int(self.s.agent_rate_limit_window or 128)
+
+    @agent_rate_limit_window.setter
+    def agent_rate_limit_window(self, value: int) -> None:
+        v = max(0, int(value))
+        self.store.set("agent_rate_limit_window", v)
+        self.s.agent_rate_limit_window = v
         mirror_env(ROOT / ".env", "THINKING_LEVEL", lvl)
 
     def reasoning_params(self, model: str | None = None) -> dict:
@@ -511,6 +570,10 @@ class JRockAgent:
         ok, msg = await self.engine.client.verify_credentials()
         lines.append(f"Bitunix: {'OK' if ok else 'FAIL'} - {msg}")
         lines.append(f"Thinking: {self.thinking_level}")
+        lines.append(f"Agent settings: max_steps={self.agent_max_steps} "
+                     f"thinking={self.agent_thinking} "
+                     f"autonomous_sec={self.agent_autonomous_sec} "
+                     f"rate_limit_window={self.agent_rate_limit_window}s")
         # Start the feed BEFORE printing the banner, so the banner reports the
         # real connection state instead of a guess.
         if self.s.market_data_source == "ws":
@@ -788,6 +851,16 @@ class JRockAgent:
             return self._explain_setting(intent.command.split()[-1])
         if intent.command.startswith("__place__"):
             return await self._place_from_nlu(intent)
+        # Universe auto-ranking intents: the builder may have returned a
+        # clarification (empty command, needs a value) or a concrete command.
+        if intent.name in ("universe_rank", "universe_volume",
+                           "universe_sizing", "universe_rank_on"):
+            if intent.command:
+                return await self.handle(intent.command)
+            return (f"I can set universe auto-ranking ({intent.describe}). "
+                    f"Try: 'universe rank GAINERS | LOOSERS | VOLUME | MOVERS', "
+                    f"'universe sizing N', 'universe volume N', "
+                    f"or 'universe rank auto'.")
         # Everything else is a real command string: reuse the existing router.
         return await self.handle(intent.command)
 
@@ -2135,6 +2208,8 @@ class JRockAgent:
             f"partial ladder: {s.partial_tp_ladder or 'off'} "
             f"(account TP/SL {s.account_tp_usdt:g}/{s.account_sl_usdt:g} USDT)",
             f"engine_on={s.engine_on} scan_on={s.scan_on} "
+            f"universe rank: {s.universe_rank} universe sizing: {s.universe_sizing} "
+            f"min 24h volume: {s.min_24h_volume_usd:g}",
             f"autotrade={s.autotrade} report_on={s.report_on} "
             f"mid_management={s.mid_management}",
         ]
@@ -2147,6 +2222,11 @@ class JRockAgent:
             f"engine parameters: min stop {self.engine.state.min_stop_ticks} ticks  "
             f"taker fee {s.taker_fee_rate * 100:g}%  "
             f"margin safety {s.margin_safety_pct:g}%",
+            "agent settings: "
+            f"max_steps={self.agent_max_steps} "
+            f"thinking={self.agent_thinking} "
+            f"autonomous_sec={self.agent_autonomous_sec} "
+            f"rate_limit_window={self.agent_rate_limit_window}s",
         ]
 
     @staticmethod

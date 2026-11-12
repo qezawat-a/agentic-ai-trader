@@ -437,6 +437,38 @@ def _b_what_is(t: str) -> Intent:
                   describe="explain a setting")
 
 
+def _b_universe_rank(t: str) -> Intent:
+    """A natural-language request about universe auto-ranking (rank/sizing/volume)."""
+    low = t.lower()
+    if "volume" in low:
+        n = _num_after(t, "volume", "to", "at")
+        if n is None:
+            return Intent("universe_volume", "", 0.5, needs="volume threshold",
+                          describe="set the universe 24h volume floor")
+        return Intent("universe_volume",
+                      f"universe volume {int(n)}", 0.9,
+                      describe=f"set universe min 24h volume to {int(n)} USDT")
+    if "sizing" in low:
+        n = _num_after(t, "sizing", "to", "at")
+        if n is None:
+            return Intent("universe_sizing", "", 0.5, needs="sizing number",
+                          describe="set universe sizing")
+        return Intent("universe_sizing", f"universe sizing {int(n)}", 0.9,
+                      describe=f"set universe sizing to {int(n)} symbols")
+    # universe rank GAINERS/LOSERS/VOLUME/MOVERS
+    for name in ("gainers", "loosers", "volume", "movers"):
+        if name in low:
+            return Intent("universe_rank", f"universe rank {name.upper()}", 0.9,
+                          describe=f"rank the auto universe by {name.upper()}")
+    return Intent("universe_rank", "", 0.5, needs="GAINERS|LOOSERS|VOLUME|MOVERS",
+                  describe="set the universe auto-rank method")
+
+
+def _b_universe_rank_on(t: str) -> Intent:
+    return Intent("universe_rank_on", "universe rank auto", 0.9,
+                  describe="turn universe auto-ranking ON")
+
+
 def _b_smalltalk(t: str) -> Intent:
     """A greeting, thanks, or "are you there".
 
@@ -673,6 +705,14 @@ RULES: list[tuple[str, re.Pattern, object]] = [
     #     ("settings look wrong", "symbols are not working")
     ("settings", re.compile(r"\bsettings?\b", re.I), _b_settings),
     ("symbols", re.compile(r"\bsymbols?\b", re.I), _b_symbols),
+
+    # --- universe auto-ranking
+    ("universe_rank_set", re.compile(
+        r"\b(universe rank|universe sizing|universe volume)\b", re.I),
+     _b_universe_rank),
+    ("universe_rank_on", re.compile(
+        r"\b(universe rank|universe auto)\b.*\b(auto|on|enable|start)\b", re.I),
+     _b_universe_rank_on),
 
     # --- risk, as a question or a concern (the setter needs a number)
     ("risk_read", re.compile(
@@ -1083,6 +1123,10 @@ def _options_for(intent: Intent) -> list[str]:
         return ["set margin mode to ISOLATION", "set margin mode to CROSS", "never mind"]
     if intent.name == "position_mode":
         return ["set position mode to HEDGE", "set position mode to ONE_WAY", "never mind"]
+    if intent.name in ("universe_rank", "universe_volume", "universe_sizing",
+                       "universe_rank_on"):
+        return ["universe rank GAINERS", "universe sizing 50",
+                "universe volume 1000000", "never mind"]
     return ["never mind"]
 
 

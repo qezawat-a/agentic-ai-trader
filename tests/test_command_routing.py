@@ -121,6 +121,11 @@ REAL_COMMANDS = [
     "timeframes 1m,5m,15m",
     "reversal true",
     "reversal false",
+    "universe rank GAINERS",
+    "universe sizing 50",
+    "universe volume 1000000",
+    "universe rank auto",
+    "universe rank off",
 ]
 
 
@@ -339,6 +344,9 @@ SETTINGS_VISIBLE = {
     "account_tp_usdt": "account TP/SL",
     "account_sl_usdt": "account TP/SL",
     "min_stop_ticks": "min stop ",
+    "universe_rank": "universe rank:",
+    "universe_sizing": "universe sizing:",
+    "min_24h_volume_usd": "min 24h volume:",
 }
 
 # The fields that are engine internals, not operator settings.

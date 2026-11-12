@@ -141,6 +141,17 @@ class Settings:
     scan_interval: int = 30
     report_interval: int = 30
     thinking_level: str = "medium"
+    # Agent-level settings (distinct from THINKING_LEVEL, which only steers the
+    # model's chat reasoning). These govern the agent's own autonomous behaviour:
+    #   AGENT_MAX_STEPS   - cap on steps in any agentic loop (self-heal, review)
+    #   AGENT_THINKING    - how hard the agent reasons on agentic work
+    #                       (code review, bug_fix, self-heal, autopsy) vs. chat
+    #   AGENT_AUTONOMOUS_SEC - seconds between autonomous iterations
+    #   AGENT_RATE_LIMIT_WINDOW - rate-limit window (in seconds) for agent calls
+    agent_max_steps: int = 128
+    agent_thinking: str = "max"
+    agent_autonomous_sec: int = 15
+    agent_rate_limit_window: int = 128
     # rest | ws. Defaults to rest: the public WS layer is live-verified, but the
     # private (position/order/balance) login handshake has never been verified
     # against the real server, so we do not silently switch the engine onto it.
@@ -189,6 +200,15 @@ class Settings:
     #: restores the pre-existing behaviour (size purely by risk_pct, capped by
     #: the whole spendable balance).
     margin_amount_pct: float = 10.0
+    #: Universe auto-ranking: "" disables it; one of GAINERS / LOOSERS / VOLUME / MOVERS.
+    #: When SYMBOLS=AUTO is set, the scan loop fetches all tickers via the public
+    #: get_tickers endpoint, filters by MIN_24H_VOLUME_USD, ranks by this method,
+    #: and scans the top UNIVERSE_SIZING symbols instead of the static watchlist.
+    universe_rank: str = ""
+    #: How many top-ranked symbols to keep in the auto universe (1..200). 0 = off.
+    universe_sizing: int = 0
+    #: Minimum 24h quote volume (USDT) for a symbol to qualify for the auto universe.
+    min_24h_volume_usd: float = 0.0
     #: Taker fee rate charged on a MARKET order, as a fraction of notional.
     #: Bitunix USDT-M futures VIP 0 is 0.0006 (0.06%). The engine must reserve
     #: this on top of the initial margin, because the exchange deducts both from
@@ -268,13 +288,20 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         breakeven_pct=_f("TRADE_BREAKEVEN_PCT", 0.6),
         trailing_trigger_roi_pct=_f("TRADE_TRAILING_TRIGGER_ROI_PCT", 25.0),
         liq_sl_distance_pct=_f("TRADE_LIQ_SL_DISTANCE_PCT", 50.0),
-        min_agreeing=_i("TRADE_MIN_AGREEING", 3),
+        min_agreeing=_i("TRADE_MIN_AGREING", 3),
         timeframes=tfs or ["1m", "3m", "5m", "15m"],
         min_confidence=_f("TRADE_MIN_CONFIDENCE", 70.0),
         tf_min_confidence=_f("TRADE_TF_MIN_CONFIDENCE", 60.0),
         scan_interval=_i("TRADE_SCAN_INTERVAL", 30),
         report_interval=_i("TRADE_REPORT_INTERVAL", 30),
         thinking_level=level_from_env(),
+        universe_rank=_f("UNIVERSE_RANK", ""),
+        universe_sizing=_i("UNIVERSE_SIZING", 0),
+        min_24h_volume_usd=_f("MIN_24H_VOLUME_USD", 0.0),
+        agent_max_steps=_i("AGENT_MAX_STEPS", 128),
+        agent_thinking=(os.getenv("AGENT_THINKING") or "max").strip().lower(),
+        agent_autonomous_sec=_i("AGENT_AUTONOMOUS_SEC", 15),
+        agent_rate_limit_window=_i("AGENT_RATE_LIMIT_WINDOW", 128),
         market_data_source=_market_data_source(),
         leverage_auto_reduce=_b("LEVERAGE_AUTO_REDUCE", True),
         order_unit=_order_unit(),

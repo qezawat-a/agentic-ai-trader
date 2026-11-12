@@ -56,7 +56,6 @@ log = logging.getLogger("jrock.engine")
 
 
 def _fmt_ms_ts(ts: Any) -> str:
-    """Render a millisecond unix timestamp as a short local time, or '?'."""
     try:
         return datetime.fromtimestamp(float(ts) / 1000).strftime("%m-%d %H:%M")
     except (TypeError, ValueError, OSError, OverflowError):
@@ -99,9 +98,6 @@ class EngineState:
     position_mode: str = "ONE_WAY"
     max_open_positions: int = 3
     #: Seconds the engine waits before re-entering a symbol it just closed.
-    #: Without it, a signal that keeps firing re-opens the position the
-    #: moment it closes: two market fills a minute apart, each paying the
-    #: taker fee twice, for a trade that never had time to work.
     reentry_cooldown_sec: int = 60
     risk_pct: float = 1.0
     #: Share of the spendable balance one position may lock as margin (%).
@@ -135,6 +131,15 @@ class EngineState:
     # (breakeven + ratchet) and ACCOUNT (thresholds below) are always armed in
     # the manage loop and need no selector.
     tpsl_method: str = "POSITION"
+    # --- universe auto-ranking
+    #: One of GAINERS / LOOSERS / VOLUME / MOVERS; "" disables ranking.
+    #: When SYMBOLS=AUTO and engine is on, the scan loop replaces the
+    #: static watchlist with the top symbols ranked by this method.
+    universe_rank: str = ""
+    #: How many top-ranked symbols to keep in the auto universe (1..200). 0 = off.
+    universe_sizing: int = 0
+    #: Minimum 24h quote volume (USDT) for a symbol to qualify for the auto universe.
+    min_24h_volume_usd: float = 0.0
     #: PARTIAL ladder spec, "share@R" pairs, e.g. "40@1,35@2,25@3".
     partial_tp_ladder: str = "40@1,35@2,25@3"
     # --- ACCOUNT TP/SL thresholds (USDT). 0 disables a side.
@@ -210,6 +215,9 @@ class TraderEngine:
             partial_tp_ladder=settings.partial_tp_ladder,
             account_tp_usdt=settings.account_tp_usdt,
             account_sl_usdt=settings.account_sl_usdt,
+            universe_rank=settings.universe_rank,
+            universe_sizing=settings.universe_sizing,
+            min_24h_volume_usd=settings.min_24h_volume_usd,
         )
 
     def _init_runtime(self, settings: Settings, store: Store | None) -> None:
@@ -228,6 +236,9 @@ class TraderEngine:
         #: symbols the exchange says cannot be traded (error 20015). Scanned
         #: once, then skipped: retrying them every cycle was pure noise.
         self._untradable: dict[str, str] = {}
+        #: auto-ranked universe symbols (SYMBOLS=AUTO) that the WS feed must
+        #: price each cycle. Empty when universe ranking is off.
+        self._auto_symbols: list[str] = []
         self.last_aggregates: dict[str, Aggregate] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
@@ -286,8 +297,7 @@ class TraderEngine:
         "scans",
         "tpsl_method", "partial_tp_ladder",
         "account_tp_usdt", "account_sl_usdt",
-        "min_stop_ticks",
-        "trend_gate", "trend_gate_timeframe",
+        "min_stop_ticks", "universe_rank", "universe_sizing", "min_24h_volume_usd",
     )
 
     def _state_snapshot(self) -> dict[str, Any]:
@@ -463,9 +473,15 @@ class TraderEngine:
                 f"msgs={sum(st['counts'].values())} tpsl_events={st['tpsl_events']}")
 
     def _feed_symbols(self) -> list[str]:
-        """Every symbol the engine needs a price for."""
+        """Every symbol the engine needs a price for.
+
+        Includes the auto-ranked universe symbols (SYMBOLS=AUTO) so the WS
+        feed prices them instead of leaving the scan loop to poll REST.
+        """
         out: list[str] = []
-        for s in list(self.state.symbols) + [p.symbol for p in self.positions.values()]:
+        for s in (list(self.state.symbols)
+                  + list(self._auto_symbols)
+                  + [p.symbol for p in self.positions.values()]):
             u = (s or "").upper()
             if u and u not in out:
                 out.append(u)
@@ -864,11 +880,84 @@ class TraderEngine:
         with self.signals_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
 
+    def _universe_rank(self, sym: str, price: float, mark: float,
+                       lastPrice: float | None, baseVol: float | None) -> str:
+        """Classify a symbol for UNIVERSE_RANK (GAINER/LOSER/VOLUME/MOVER)."""
+        if not sym or not lastPrice or not mark or not baseVol:
+            return "NONE"
+        if lastPrice > price:
+            return "GAINER"
+        if lastPrice < price:
+            return "LOSER"
+        if baseVol or float(baseVol) >= self.state.min_24h_volume_usd:
+            return "VOLUME"
+        if baseVol and abs(baseVol - price) > 0:
+            return "MOVER"
+        return "NONE"
+
+    async def _universe_symbols(self) -> list[str]:
+        """Return up to universe_sizing top symbols ranked by UNIVERSE_RANK.
+
+        Fetches every ticker from the public get_tickers endpoint, filters by
+        MIN_24H_VOLUME_USD (USDT-denominated quoteVol), ranks by the chosen
+        UNIVERSE_RANK method (GAINERS / LOSERS / VOLUME / MOVERS), and keeps
+        the top UNIVERSE_SIZING symbols.
+        """
+        if not self.state.universe_rank or self.state.universe_sizing == 0:
+            return []
+        try:
+            tickers = await self.client.get_tickers()
+        except Exception:
+            return []
+        rows = tickers if isinstance(tickers, list) else []
+        candidates = []
+        for r in rows:
+            sym = (r.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            lastPrice = float(r.get("lastPrice") or 0)
+            markPrice = float(r.get("markPrice") or 0)
+            openPrice = float(r.get("open") or 0)
+            baseVol = float(r.get("baseVol") or 0)
+            quoteVol = float(r.get("quoteVol") or 0)
+            candidates.append((sym, lastPrice, markPrice, openPrice, quoteVol, baseVol))
+
+        min_vol = self.state.min_24h_volume_usd
+        filtered = [c for c in candidates if min_vol <= 0 or c[4] >= min_vol]
+        method = (self.state.universe_rank or "").upper()
+
+        if method == "GAINERS":
+            ranked = [c for c in filtered if c[1] > c[3]]
+            ranked.sort(key=lambda c: c[1] - c[3], reverse=True)
+        elif method == "LOSERS":
+            ranked = [c for c in filtered if c[1] < c[3]]
+            ranked.sort(key=lambda c: c[3] - c[1], reverse=True)
+        elif method == "VOLUME":
+            ranked = sorted(filtered, key=lambda c: c[4], reverse=True)
+        elif method == "MOVERS":
+            ranked = sorted(filtered, key=lambda c: abs(c[1] - c[3]), reverse=True)
+        else:
+            ranked = []
+        return [c[0] for c in ranked[: self.state.universe_sizing]]
+
     async def _scan_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 if self.state.scan_on:
-                    for sym in self.state.symbols:
+                    # SYMBOLS=AUTO: rank every tradable pair by UNIVERSE_RANK
+                    # and scan the top UNIVERSE_SIZING instead of the static
+                    # watchlist.
+                    syms = list(self.state.symbols)
+                    if self.state.universe_rank and self.state.universe_sizing:
+                        auto = await self._universe_symbols()
+                        if auto:
+                            self._auto_symbols = auto
+                            syms = auto
+                        else:
+                            self._auto_symbols = []
+                    else:
+                        self._auto_symbols = []
+                    for sym in syms:
                         # per symbol: one broken symbol must not cost the
                         # others their scan in the same cycle
                         try:
@@ -2674,6 +2763,8 @@ class TraderEngine:
             f"reversal={s.reversal} reversal_conf={s.reversal_confidence} "
             f"reentry_cooldown={s.reentry_cooldown_sec}s",
             f"trend_gate={s.trend_gate} tf={self._gate_timeframe() or '(none)'}",
+            f"universe_rank={s.universe_rank} universe_sizing={s.universe_sizing} "
+            f"min_24h_volume_usd={s.min_24h_volume_usd:g} scans={s.scans} errors={len(s.errors)}",
             f"min_stop_ticks={s.min_stop_ticks} "
             f"taker_fee={self.s.taker_fee_rate * 100:g}% "
             f"margin_safety={self.s.margin_safety_pct:g}%",
@@ -2699,6 +2790,8 @@ class TraderEngine:
         # always armed with their own Readouts)
         "tpsl method", "partial ladder",
         "account tp usdt", "account sl usdt",
+        "universe rank", "universe sizing", "universe volume", "universe volume usd",
+        "universe rank auto", "universe rank off",
         "min stop ticks",
     )
 
@@ -2854,6 +2947,11 @@ class TraderEngine:
                                             "enabled", "disabled", "start", "stop")
         if p == "report":
             return rest.split()[0].lower() in ("on", "off", "interval")
+        if p == "universe rank":
+            return rest.strip().lower() in ("gainers", "loosers", "volume",
+                                              "movers", "auto", "off")
+        if p in ("universe sizing", "universe volume", "universe volume usd"):
+            return bool(re.search(r"-?\d+(?:\.\d+)?", rest))
         return False
 
     async def command(self, line: str) -> str:
@@ -2958,6 +3056,43 @@ class TraderEngine:
                         f"(the same symbol cannot be re-entered faster than this).")
             except (ValueError, IndexError):
                 return "Usage: reentry cooldown sec 60"
+        # ---- universe commands ----
+        if low.startswith("universe rank"):
+            val = arg("universe rank").strip().upper()
+            if val in ("GAINERS", "LOSERS", "VOLUME", "MOVERS"):
+                s.universe_rank = val
+                return f"Universe rank = {s.universe_rank}."
+            return ("Universe rank is one of: GAINERS, LOOSERS, VOLUME, MOVERS "
+                    f"(current: {s.universe_rank}); AUTO turns on automatic ranking.")
+        if low.startswith("universe sizing"):
+            try:
+                s.universe_sizing = int(arg("universe sizing").split()[-1])
+            except (ValueError, IndexError):
+                return "Usage: universe sizing 50"
+            if not 1 <= s.universe_sizing <= 200:
+                return f"Universe sizing must be 1..200 ({s.universe_sizing} rejected)."
+            return f"Universe sizing = {s.universe_sizing}."
+        if low.startswith("universe volume"):
+            try:
+                s.min_24h_volume_usd = float(arg("universe volume").split()[-1])
+            except (ValueError, IndexError):
+                return "Usage: universe volume 1000000"
+            return (f"Universe min 24h volume = {s.min_24h_volume_usd:g} USDT.")
+        if low.startswith("universe volume usd"):
+            try:
+                s.min_24h_volume_usd = float(arg("universe volume usd").split()[-1])
+            except (ValueError, IndexError):
+                return "Usage: universe volume usd 1000000"
+            return (f"Universe min 24h volume = {s.min_24h_volume_usd:g} USDT.")
+        if low == "universe rank auto":
+            s.universe_rank = "AUTO"
+            s.universe_sizing = 0
+            return "Universe auto-ranking ON (top symbols by engine rank)."
+        if low == "universe rank off":
+            s.universe_rank = ""
+            s.universe_sizing = 0
+            return "Universe auto-ranking OFF."
+        # ---- end universe commands ----
         if low.startswith("reversal"):
             val = arg("reversal").strip("= ").lower()
             s.reversal = val in ("true", "1", "on", "yes")
