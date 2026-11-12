@@ -61,6 +61,14 @@ def _fmt_ms_ts(ts: Any) -> str:
     except (TypeError, ValueError, OSError, OverflowError):
         return "?"
 
+
+def _num(v: Any, default: float = 0.0) -> float:
+    """Best-effort float from an exchange string field ('' / None -> default)."""
+    try:
+        return float(v or default)
+    except (TypeError, ValueError):
+        return default
+
 #: Which price the exchange compares a TP/SL trigger against. MARK_PRICE is the
 #: documented Bitunix default and the engine's historical behaviour; the SAME
 #: value goes into the local pre-flight validation and into tpStopType/slStopType
@@ -175,6 +183,9 @@ class _EntryContext:
     notional: float = 0.0
     plan: Any = None
     notes: list[str] = field(default_factory=list)
+    #: safety decisions (a leverage clamp the exchange forced) - reported as
+    #: errors, unlike the routine `notes`.
+    warnings: list[str] = field(default_factory=list)
 
 
 class TraderEngine:
@@ -241,6 +252,10 @@ class TraderEngine:
         #: price each cycle. Empty when universe ranking is off.
         self._auto_symbols: list[str] = []
         self.last_aggregates: dict[str, Aggregate] = {}
+        #: symbol -> the MARK price last read by the manage loop. The report
+        #: settles ROI against the exchange's uPnL (mark-based); the briefs use
+        #: this so the agent cannot quote a LAST-price ROI that contradicts it.
+        self._last_marks: dict[str, float] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
         # --- market data: one cache, one optional WS feed, one REST counter.
@@ -1211,7 +1226,10 @@ class TraderEngine:
         # The ONLY reasons to use a different leverage for one order are the two
         # the exchange itself imposes: no room for a stop, or a tier cap.
         ctx.leverage = int(self.state.leverage)
-        ctx.notes: list[str] = []
+        # `notes` (routine) and `warnings` (exchange-forced leverage clamps)
+        # are separate so a successful entry does not read as "errors: 1".
+        ctx.notes = []
+        ctx.warnings = []
 
         lev_tier = tier_for_leverage(ctx.tiers, ctx.leverage) or pick_tier(ctx.tiers, 0.0)
         max_lev_for_stop = max_leverage_for_stop(
@@ -1266,7 +1284,7 @@ class TraderEngine:
                 "the liquidation price and the mark %s (entry %s) - "
                 "using %dx for this order (the setting is unchanged)",
                 ctx.sym, ctx.leverage, ctx.mark, ctx.price, max_lev_for_stop)
-            ctx.notes.append(
+            ctx.warnings.append(
                 f"leverage {ctx.sym}: {ctx.leverage}x leaves no room for a "
                 f"stop-loss (mark {ctx.mark:.{ctx.rules.quote_precision}f}, entry "
                 f"{ctx.price:.{ctx.rules.quote_precision}f}); using "
@@ -1300,7 +1318,7 @@ class TraderEngine:
                        f"no usable tier. Lower the leverage.")
                 self.state.errors.append(f"preflight {ctx.sym}: {msg}")
                 return {"ok": False, "reason": msg}
-            ctx.notes.append(
+            ctx.warnings.append(
                 f"leverage {ctx.sym}: {ctx.leverage}x is above the exchange maximum "
                 f"{max_lev}x for this symbol; using {max_lev}x for this order")
             ctx.leverage = max_lev
@@ -1407,7 +1425,7 @@ class TraderEngine:
                 msg = f"{ctx.sym}: {tier_msg}"
                 self.state.errors.append(f"preflight {ctx.sym}: {msg}")
                 return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
-            ctx.notes.append(
+            ctx.warnings.append(
                 f"leverage {ctx.sym}: {ctx.leverage}x exceeds the exchange tier cap "
                 f"{cap}x for a {ctx.notional:.2f} USDT position; using {cap}x "
                 f"for this order")
@@ -1451,11 +1469,14 @@ class TraderEngine:
     def _preflight_balance(self, ctx: _EntryContext) -> dict | None:
         """The margin, the balance and the engine's own bounds."""
         # A tier/leverage CLAMP is a safety decision, not a routine note: it
-        # stays in `errors` so it cannot be hidden. The routine margin-budget
-        # sizing note below goes to `notes` instead - it used to be reported
-        # as a failure, which buried the real errors behind noise.
-        for note in ctx.notes:
+        # goes to `errors` so it cannot be hidden. The routine margin-budget
+        # sizing note goes to `notes` instead - it used to be reported as a
+        # failure, which buried the real errors behind noise AND made a
+        # successful entry read as "errors: 1" in the report.
+        for note in ctx.warnings:
             self.state.errors.append(note)
+        for note in ctx.notes:
+            self.state.notes.append(note)
 
         margin_real = margin_required(ctx.notional, ctx.leverage)
         # Opening a MARKET order costs the initial margin AND a taker fee, and
@@ -2298,6 +2319,9 @@ class TraderEngine:
                 mark = price
                 log.warning("no trigger price for %s - validating the managed "
                             "TP/SL against the last price %s", sym, price)
+            # Cache the mark for the briefs: the exchange settles uPnL against
+            # it, so it is the only price a ROI can honestly be quoted from.
+            self._last_marks[sym] = mark
             trigger_type = TRIGGER_TYPE
             rules = self.rules.get(sym)
             if rules is None:
@@ -2383,9 +2407,14 @@ class TraderEngine:
             lines.append("no open position - nothing is being managed")
             return "\n".join(lines)
         for st in self.positions.values():
-            price = self._cached_price(st.symbol)
-            roi = (roi_pct(st.entry, price, st.side, st.leverage)
-                   if price > 0 else 0.0)
+            last = self._cached_price(st.symbol)
+            # Quote ROI from the MARK price: the exchange settles uPnL against
+            # it and the report's ROI is derived from that uPnL. A last-price
+            # ROI here would let the agent state a number the report
+            # contradicts (live: 25.37% vs 22.90%).
+            mark = self._last_marks.get(st.symbol) or last
+            roi = (roi_pct(st.entry, mark, st.side, st.leverage)
+                   if mark > 0 else 0.0)
             if st.breakeven_done:
                 be = f"MOVED to the entry {st.entry:g}"
             elif s.mid_management:
@@ -2401,7 +2430,7 @@ class TraderEngine:
                 trail = "OFF (mid management is off)"
             lines.append(
                 f"{st.symbol} {st.side} qty={st.qty:g} entry={st.entry:g} | "
-                f"now {price or '?'} | ROI {roi:+.2f}% | "
+                f"now {last or '?'} mark {mark:g} | ROI {roi:+.2f}% | "
                 f"SL {st.sl:g} TP {st.tp:g} liq {st.liq:g}")
             lines.append(f"  breakeven: {be}")
             lines.append(f"  trailing:  {trail}"
@@ -2448,9 +2477,13 @@ class TraderEngine:
         if self.positions:
             lines.append(f"POSITIONS ({len(self.positions)}):")
             for st in self.positions.values():
-                price = self._cached_price(st.symbol)
-                roi = (roi_pct(st.entry, price, st.side, st.leverage)
-                       if price > 0 else 0.0)
+                last = self._cached_price(st.symbol)
+                # MARK price, for the same reason as exits_brief: the report
+                # settles ROI from the exchange's uPnL, and a last-price ROI
+                # here would contradict it.
+                mark = self._last_marks.get(st.symbol) or last
+                roi = (roi_pct(st.entry, mark, st.side, st.leverage)
+                       if mark > 0 else 0.0)
                 exits = []
                 if st.breakeven_done:
                     exits.append(f"breakeven ALREADY MOVED to entry {st.entry}")
@@ -2464,7 +2497,7 @@ class TraderEngine:
                     exits.append("trailing not active")
                 lines.append(
                     f"- {st.symbol} {st.side} qty {st.qty:g} entry {st.entry} | "
-                    f"now {price or '?'} | ROI {roi:+.2f}% | "
+                    f"now {last or '?'} mark {mark:g} | ROI {roi:+.2f}% | "
                     f"SL {st.sl} TP {st.tp} liq {st.liq} | " + " | ".join(exits))
         else:
             lines.append("POSITIONS: none open")
@@ -2514,12 +2547,23 @@ class TraderEngine:
                 sym = p.get("symbol")
                 entry = float(p.get("avgOpenPrice") or 0)
                 price = await self.get_price(sym)
-                roi = roi_pct(entry, price, p.get("side", "LONG"),
-                              int(p.get("leverage") or 1))
+                # ROI is derived from the exchange's OWN unrealizedPNL and
+                # margin, so roi and upnl on this line are the same number seen
+                # two ways. roi_pct() reads the LAST price while the exchange
+                # settles uPnL against the MARK price, so the two disagreed
+                # whenever the spread was non-zero - observed live as
+                # "roi=25.37% upnl=0.0478065" on margin 0.2088, which is
+                # 22.89%. A line the operator cannot audit is a line that
+                # reads as a lie. The margin is printed so it can be checked.
+                upnl = _num(p.get("unrealizedPNL"))
+                margin = _num(p.get("margin"))
+                roi = (upnl / margin * 100.0) if margin > 0 else roi_pct(
+                    entry, price, p.get("side", "LONG"),
+                    int(p.get("leverage") or 1))
                 lines.append(
                     f"  {sym} {p.get('side')} qty={p.get('qty')} entry={entry} "
                     f"px={price} roi={roi:.2f}% upnl={p.get('unrealizedPNL')} "
-                    f"liq={p.get('liqPrice')}")
+                    f"margin={p.get('margin')} liq={p.get('liqPrice')}")
         else:
             lines.append("no open positions")
         lines.extend(await self._report_tpsl(live_ids))
