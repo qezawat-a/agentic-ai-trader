@@ -815,9 +815,9 @@ Configurable bounds (all default `0` = disabled, so behaviour is unchanged):
 | `ORDER_UNIT` | `QUANTITY` (default), `NOTIONAL` or `COST` |
 
 Anything else that protects a stop is fixed in code, not configurable: the
-trigger is always `MARK_PRICE`, a stop keeps a minimum gap of `MIN_STOP_TICKS`
-(3) price ticks from the mark, and the mark is re-read before every TP/SL
-write. One knob, one meaning.
+trigger is always `LAST_PRICE`, a stop keeps a minimum gap of `MIN_STOP_TICKS`
+(3) price ticks from the trigger price, and the trigger price is re-read before
+every TP/SL write. One knob, one meaning.
 
 Verify against live data: `python scripts/verify_tpsl_side.py`
 
@@ -1055,12 +1055,12 @@ no-op, so historical behaviour is unchanged.
 
 ### Which price the trigger is compared against
 
-`MARK_PRICE`, fixed in code (`engine.py` `TRIGGER_TYPE`) and read in exactly
+`LAST_PRICE` (Bitunix's default), fixed in code (`engine.py` `TRIGGER_TYPE`) and read in exactly
 one place - `get_trigger_price()`. Both the local pre-flight validation and the
 `tpStopType`/`slStopType` sent on the wire read that same constant, so they
-cannot drift apart. It is not an env knob: the exchange validates a TP/SL
-against the mark at the moment the request lands (30029/30031), and a LAST_PRICE
-setting only moved the mismatch to the user.
+cannot drift apart. The exchange validates a TP/SL against the chosen trigger
+price at the moment the request lands, and using `LAST_PRICE` matches the
+engine's own management logic and the report's ROI basis.
 
 ---
 
