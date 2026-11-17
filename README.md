@@ -1,5 +1,7 @@
 # J+Rock
 
+[English](README.md) | [فارسی](README_FA.md)
+
 An honest, relentless agentic coding assistant with a **Bitunix USDT-M futures
 trading engine** built into its body and soul.
 
@@ -8,8 +10,9 @@ trading engine** built into its body and soul.
 - **Self-healing**: inspects, diagnoses and fixes bugs in its own code and the engine.
   Every self-edit is permission-gated (`auto accept edit on|off`).
 - **Learning loop**: user feedback + past episodes stored and recalled.
-- **Trader engine**: 36 REST endpoints, public + private WebSocket, 16 unique
-  strategies across 5 categories, multi-timeframe aggregation, agent-decided TP/SL.
+- **Trader engine**: 37 REST endpoints (39 documented), public + private WebSocket,
+  16 unique strategies across 5 categories, multi-timeframe aggregation,
+  agent-decided TP/SL, automatic symbol ranking.
 
 ---
 
@@ -198,6 +201,9 @@ min confidence 70                   tf min confidence 60
 close position [SYMBOL]             margin mode ISOLATION|CROSS
 position mode HEDGE|ONE_WAY         symbols BTCUSDT,ETHUSDT
 max open positions 3                leverage 10 | risk 1.0
+universe rank GAINERS|LOSERS|VOLUME|MOVERS
+universe sizing 20                  universe volume 1000000
+universe rank auto                  universe rank off
 ```
 
 ---
@@ -235,6 +241,53 @@ modules. `tests/test_strategies.py` asserts this.
 - confidence = TF-weighted mean + agreement bonus + multi-TF bonus − conflict penalty
 - one strategy agreeing on 3 timeframes is still **one** strategy (multi-TF raises
   confidence, not the count)
+
+---
+
+## Universe auto-ranking
+
+Instead of scanning a fixed watchlist, the engine can select its own symbols
+from the whole tradable universe. It fetches every ticker from the public
+`get_tickers` endpoint, filters by 24h quote volume, ranks by the chosen method,
+and scans the top `UNIVERSE_SIZING` symbols.
+
+| Method | Ranks by |
+|---|---|
+| `GAINERS` | percent change since the 24h open, highest first |
+| `LOSERS` | percent change since the 24h open, lowest first |
+| `VOLUME` | 24h quote volume in USDT, highest first |
+| `MOVERS` | absolute percent change since the 24h open, highest first |
+
+`GAINERS` / `LOSERS` / `MOVERS` rank by **percent**, not by absolute price
+change: a $60 move in BTC is not a bigger move than +30% in a cheap pair. A
+stale ticker whose last price is 0 is ignored instead of being ranked as a
+-100% loser.
+
+```
+universe rank GAINERS|LOSERS|VOLUME|MOVERS   # choose the method
+universe sizing 20                          # scan the top 20 (1..200)
+universe volume 1000000                     # 24h quote-volume floor in USDT
+universe rank auto                          # on; keep the method, VOLUME if none
+universe rank off                           # off (the configured size is kept)
+```
+
+The legacy spelling `LOOSERS` is still accepted, but the canonical method is
+`LOSERS`. `universe rank auto` does **not** zero the size; when the size is 0 it
+says so instead of pretending to scan.
+
+Configuration lives in `.env`:
+
+| Variable | Meaning |
+|---|---|
+| `UNIVERSE_RANK` | `GAINERS` \| `LOSERS` \| `VOLUME` \| `MOVERS`; empty = off |
+| `UNIVERSE_SIZING` | how many top-ranked symbols to scan (1..200; `0` = off) |
+| `MIN_24H_VOLUME_USD` | 24h quote-volume floor in USDT; `0` = no floor |
+
+Ranking is active only when **both** a method and a non-zero size are set (the
+runtime value stored in `data/state.json` wins over `.env`). While it is active
+it replaces the static `TRADE_SYMBOLS` watchlist for scanning; the WS feed still
+prices the configured symbols and any open positions. `/settings` shows
+`universe rank`, `universe sizing` and `min 24h volume`.
 
 ---
 
@@ -278,7 +331,7 @@ jrock/
     telegram_bot.py      Telegram front-end: long polling, same router
     self_heal.py         pytest -> review -> exact-string fixes -> push
     trader/
-      client.py          REST client, double-SHA256 signing, 36 endpoints
+      client.py          REST client, double-SHA256 signing, 37 endpoints
       ws.py              public/private WS, auto-reconnect, signed login
       errors.py          full official error-code table
       api_reference.py   machine-readable endpoint contracts
@@ -290,7 +343,7 @@ jrock/
       strategies/        16 strategies in 5 category modules
   docs/bitunix/          local copy of the official API docs
   soul/jrock.soul.md     the persona
-  tests/                 1058 tests
+  tests/                 1290 tests
 ```
 
 ---
@@ -561,7 +614,7 @@ through one accessor, `TraderEngine.get_price(symbol)`, which consults a
 
 | Situation | What happens |
 |---|---|
-| cached quote younger than `PRICE_MAX_AGE_SEC` (default 5s) | returned, `source=ws`, **no REST call** |
+| cached quote younger than the price cache's `max_age` (default 5s) | returned, `source=ws`, **no REST call** |
 | no cached quote | REST fallback, counted as a `miss` |
 | cached quote older than the limit | **refused**, warning logged, REST fallback, counted as a `stale_rejection` |
 | WS disconnected | REST fallback; the engine keeps running, never blocks on the socket |
@@ -618,12 +671,12 @@ series by one every 500ms and corrupt every indicator.
 **Staleness is a multiple of the interval, not flat seconds.** A 1m candle is
 legitimately 60s old; a 1d candle is legitimately 24h old. A candle set is
 stale when the newest candle's open time is older than
-`KLINE_MAX_AGE_SEC * interval` (default 2x).
+`KlineCache.max_age_mult` × the interval (default 2×).
 
 | Situation | What happens |
 |---|---|
 | fresh, long-enough, WS-fed series | returned, `source=ws`, **no REST call** |
-| newest candle older than `KLINE_MAX_AGE_SEC * interval` | **refused**, warning, REST fallback, `stale_rejection` |
+| newest candle older than `max_age_mult` × the interval | **refused**, warning, REST fallback, `stale_rejection` |
 | fewer candles than the caller needs | **refused**, REST fallback, `short_series` - a short series produces a wrong signal, which is worse than a slow one |
 | cache holds REST-seeded candles only | REST fallback (we cannot claim it is live) |
 | WS disconnected | REST fallback; the engine keeps running |
@@ -721,8 +774,10 @@ python scripts/verify_restart.py   # the same through the real agent command pat
 python -m pytest -q tests
 ```
 
-772 tests covering indicators, risk math, all 16 strategies (including empty and
-short-data inputs), aggregation rules, TP/SL planning and side validation
+1290 tests covering indicators, risk math, all 16 strategies (including empty and
+short-data inputs), aggregation rules, universe auto-ranking (commands, env
+loading, percent-based GAINERS/LOSERS/MOVERS ranking and volume filtering),
+TP/SL planning and side validation
 (30020-30033), the **running-engine** TP/SL path (breakeven + trailing, the
 second 30029), the order-size pre-flight (20003, tier leverage caps, margin
 bounds), API-reference/client drift, model probing, request signing, CLI
