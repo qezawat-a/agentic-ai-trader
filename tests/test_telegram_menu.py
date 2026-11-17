@@ -121,7 +121,22 @@ def test_help_text_is_generated_from_the_same_list():
     text = tb.render_help()
     for name, desc in tb.COMMANDS:
         assert f"/{name}" in text, name
-        assert desc in text, desc
+        assert tb._e(desc) in text, desc
+
+
+def test_help_html_contains_only_supported_tags():
+    """Telegram rejects the WHOLE message on one unsupported tag.
+
+    `/set_model <id>` used to reach render_help unescaped, so every `/help`
+    failed with "can't parse entities: Unsupported start tag id" and the bot
+    sent nothing at all. Only the tags this bot actually emits may survive.
+    """
+    import re
+    text = tb.render_help()
+    tags = set(re.findall(r"<[^>]*>", text))
+    assert tags <= {"<b>", "</b>", "<code>", "</code>"}, tags
+    assert "&lt;id&gt;" in text
+    assert "<id>" not in text
 
 
 def test_help_constant_matches_render_help():

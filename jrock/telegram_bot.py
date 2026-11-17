@@ -29,6 +29,7 @@ import contextlib
 import html
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -174,7 +175,24 @@ class TelegramBot:
             }
             if keyboard:
                 params["reply_markup"] = REMOVE_KEYBOARD
-            await self.call("sendMessage", **params)
+            try:
+                await self.call("sendMessage", **params)
+            except TelegramError as e:
+                # One stray '<' in dynamic text must never silence a command:
+                # Telegram rejects the ENTIRE message on an unsupported HTML
+                # tag, so retry this chunk once as plain text with the markup
+                # stripped. This is the difference between a readable reply
+                # and the operator seeing nothing at all.
+                if not markdown or "parse entities" not in str(e).lower():
+                    raise
+                params = {
+                    "chat_id": chat_id, "text": _plain(chunk),
+                    "parse_mode": None,
+                    "disable_web_page_preview": True,
+                }
+                if keyboard:
+                    params["reply_markup"] = REMOVE_KEYBOARD
+                await self.call("sendMessage", **params)
         return True
 
 
@@ -201,6 +219,22 @@ def _split(text: str, limit: int) -> list[str]:
 def _e(value: Any) -> str:
     """Escape for Telegram HTML mode - message content is untrusted text."""
     return html.escape("" if value is None else str(value), quote=False)
+
+
+_HTML_TAG = re.compile(
+    r"</?(?:b|strong|i|em|u|s|strike|del|code|pre|a)(?:\s[^>]*)?>",
+    re.IGNORECASE,
+)
+
+
+def _plain(text: str) -> str:
+    """Strip the HTML tags this bot emits, for the plain-text retry.
+
+    Unknown ``<...>`` text is deliberately LEFT ALONE: in plain-text mode it
+    is literal and harmless, and removing it would silently delete content
+    such as ``/set_model <id>``.
+    """
+    return html.unescape(_HTML_TAG.sub("", text))
 
 
 def _money(value: Any, places: int = 2) -> str:
@@ -342,7 +376,10 @@ def render_help() -> str:
     the commands and the topics.
     """
     width = max(len(c) for c, _ in COMMANDS) + 2
-    lines = [f"/{c.ljust(width)}{d}" for c, d in COMMANDS]
+    # Descriptions are plain text, not markup: `/set_model <id>` carries a
+    # literal '<id>', and Telegram's HTML parser rejects the WHOLE message on
+    # an unsupported tag. Escaping here is what keeps /help deliverable.
+    lines = [f"/{c.ljust(width)}{_e(d)}" for c, d in COMMANDS]
     topics = "  ".join(f"/{t}" for t in HELP_TOPICS)
     return (
         "<b>J+Rock bot</b>\n"

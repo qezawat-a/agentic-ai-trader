@@ -478,3 +478,33 @@ def test_report_pushed_to_telegram_carries_the_tpsl_section(monkeypatch):
     assert "-- TP/SL --" in body
     assert "40@1,35@2,25@3" in body
     assert "sl=0.004" in body
+
+
+def test_html_rejection_falls_back_to_plain_text():
+    """One stray '<' must not turn a command into silence.
+
+    Telegram rejects the WHOLE message on an unsupported HTML tag, and the
+    bot used to only log the error. The send path now retries that chunk once
+    as plain text with the markup stripped, so the operator still gets a
+    readable reply.
+    """
+    class RejectingBot(tb.TelegramBot):
+        def __init__(self):
+            self.calls: list[tuple[str, dict]] = []
+
+        async def call(self, method, **params):  # type: ignore[override]
+            self.calls.append((method, params))
+            if len(self.calls) == 1:
+                raise tb.TelegramError(
+                    "sendMessage: Bad Request: can't parse entities: "
+                    'Unsupported start tag "id" (code 400)')
+            return True
+
+    bot = RejectingBot()
+    asyncio.run(bot.send(7, "<b>help</b> /set_model <id>", markdown=True))
+
+    assert len(bot.calls) == 2
+    assert bot.calls[0][1]["parse_mode"] == "HTML"
+    assert bot.calls[1][1]["parse_mode"] is None
+    assert bot.calls[1][1]["text"].strip() == "help /set_model <id>"
+    assert bot.calls[1][1]["reply_markup"] == tb.REMOVE_KEYBOARD
