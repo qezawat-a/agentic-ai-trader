@@ -195,7 +195,7 @@ tpsl method POSITION|PARTIAL        partial ladder 40@1,35@2,25@3
 account tp usdt 100                 account sl usdt 50
 mid management position trigger     reversal=true   reversal_confidence=70
 scans interval sec 30               breakeven threshold pct 0.6
-trailing trigger stop ROI pct 25    liq sl distance pct 50
+trailing trigger stop ROI pct 25    sl distance pct 0 (none)
 min agreeing strategies 3           timeframes 1m,3m,5m,15m
 min confidence 70                   tf min confidence 60
 close position [SYMBOL]             margin mode ISOLATION|CROSS
@@ -293,8 +293,9 @@ prices the configured symbols and any open positions. `/settings` shows
 
 ## TP/SL — the agent decides
 
-You set **two** numbers:
+You set **three** numbers:
 
+- `sl distance pct` — the stop-loss distance from entry, % of price (0 = none). The engine never invents one.
 - `breakeven threshold pct` — move SL to entry once ROI ≥ this
 - `trailing trigger stop ROI pct` — start trailing once ROI ≥ this
 
@@ -304,12 +305,11 @@ Everything else is derived:
    maintenance-margin rate for the position's notional tier:
    - long: `liq = entry * (1 - 1/L + mmr)`
    - short: `liq = entry * (1 + 1/L - mmr)`
-2. **Stop loss** sits `liq sl distance pct` (default 50%) of the way from entry
-   toward liquidation — i.e. it triggers at ~50% of the ROI that liquidation would cost.
+2. **Stop loss** sits exactly `sl distance pct` from the entry — 0 (default) attaches none. `ATR`/`liq`/`ROI` are never used to place it.
 3. **Take profit** = SL distance × R-multiple scaled by signal strength:
    `weak 1.2R · normal 1.8R · strong 2.5R · extreme 3.2R`, nudged by confidence.
-4. **Size** from risk: `qty = (equity × risk_pct) / |entry − stop|`, capped by
-   max notional and rounded **down** to `basePrecision`.
+4. **Leverage** = your setting, checked against the symbol's live tiered risk-limit table (`get_position_tiers`): the tier your selection maps to is the HIGHEST tier whose max leverage covers it, MMR from that tier, and the position value must fit that tier's nominal cap — otherwise the entry is refused (fail-closed).
+5. **Size**: `MARGIN_AMOUNT_PCT` is the sizing authority — `qty = margin × leverage / price`, capped by the balance with the taker fee reserved, floored to `basePrecision`. With `MARGIN_AMOUNT_PCT=0` it falls back to `qty = (equity × risk_pct) / |entry − stop|`.
 
 TP/SL are attached to the entry order (`tpPrice`/`slPrice` on `place_order`) and
 later moved with `modify_position_tp_sl_order` for breakeven and trailing.

@@ -237,6 +237,7 @@ def _manage(mark, **kw):
     s = Settings()
     s.market_data_source = "rest"
     s.breakeven_pct = 0.6
+    s.sl_distance_pct = 2.0
     e = TraderEngine(s)
     e.client = FakeClient(mark, **kw)
 
@@ -292,6 +293,7 @@ def test_managed_tp_is_also_clamped():
     s = Settings()
     s.market_data_source = "rest"
     s.breakeven_pct = 0.6
+    s.sl_distance_pct = 2.0
     e = TraderEngine(s)
     e.client = FakeClient(0.005062)
     e.positions["P1"] = __import__(
@@ -387,6 +389,7 @@ class _Agg:
 def _enter(marks, last=0.005051, leverage=10):
     s = Settings()
     s.market_data_source = "rest"
+    s.sl_distance_pct = 2.0
     e = TraderEngine(s)
     e.client = MovingMarkClient(marks, last=last)
     e.state.leverage = leverage

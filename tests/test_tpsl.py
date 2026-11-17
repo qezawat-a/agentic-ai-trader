@@ -11,7 +11,8 @@ TIERS = [Tier(1, 0, 50000, 125, 0.004), Tier(2, 50000, 200000, 100, 0.005)]
 
 def test_plan_long_sl_below_entry_tp_above():
     p = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
-                  strength="normal", confidence=75, tiers=TIERS, rules=RULES)
+                  strength="normal", confidence=75, tiers=TIERS, rules=RULES,
+                  sl_distance_pct=5.0)
     assert p.sl < 100 < p.tp
     assert p.liq < p.sl < 100
     assert p.rr > 0
@@ -19,24 +20,26 @@ def test_plan_long_sl_below_entry_tp_above():
 
 def test_plan_short_sl_above_entry_tp_below():
     p = plan_tpsl(side="SHORT", entry=100.0, leverage=10, notional=1000,
-                  strength="normal", confidence=75, tiers=TIERS, rules=RULES)
+                  strength="normal", confidence=75, tiers=TIERS, rules=RULES,
+                  sl_distance_pct=5.0)
     assert p.tp < 100 < p.sl
     assert p.liq > p.sl > 100
 
 
-def test_sl_is_halfway_to_liq():
+def test_sl_is_the_configured_distance_from_entry():
     p = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
                   strength="normal", confidence=75, tiers=TIERS, rules=RULES,
-                  liq_sl_distance_pct=50)
-    expected = 100 - (100 - p.liq) * 0.5
-    assert p.sl == pytest.approx(expected, rel=1e-3)
+                  sl_distance_pct=5.0)
+    assert p.sl == pytest.approx(95.0, rel=1e-6)
 
 
 def test_stronger_signal_gives_bigger_tp():
     weak = plan_tpsl(side="LONG", entry=100, leverage=10, notional=1000,
-                     strength="weak", confidence=70, tiers=TIERS, rules=RULES)
+                     strength="weak", confidence=70, tiers=TIERS, rules=RULES,
+                     sl_distance_pct=5.0)
     strong = plan_tpsl(side="LONG", entry=100, leverage=10, notional=1000,
-                       strength="strong", confidence=90, tiers=TIERS, rules=RULES)
+                       strength="strong", confidence=90, tiers=TIERS, rules=RULES,
+                       sl_distance_pct=5.0)
     assert strong.tp > weak.tp
 
 

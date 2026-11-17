@@ -2,7 +2,7 @@ import pytest
 
 from jrock.trader.risk import (PairRules, Tier, liquidation_price, margin_required,
                                pick_tier, position_size_by_risk, qty_from_notional,
-                               roi_pct, round_step, sl_from_liq_distance,
+                               roi_pct, round_step, sl_from_distance,
                                validate_price_protection)
 
 
@@ -32,16 +32,17 @@ def test_liquidation_short_above_entry():
     assert liq > 100
 
 
-def test_sl_halfway_to_liq_long():
-    entry, liq = 100.0, 90.0
-    sl = sl_from_liq_distance(entry, liq, "LONG", 50)
-    assert sl == pytest.approx(95.0)
+def test_sl_distance_long():
+    assert sl_from_distance(100.0, "LONG", 2) == pytest.approx(98.0)
 
 
-def test_sl_halfway_to_liq_short():
-    entry, liq = 100.0, 110.0
-    sl = sl_from_liq_distance(entry, liq, "SHORT", 50)
-    assert sl == pytest.approx(105.0)
+def test_sl_distance_short():
+    assert sl_from_distance(100.0, "SHORT", 2) == pytest.approx(102.0)
+
+
+def test_sl_distance_zero_disables():
+    assert sl_from_distance(100.0, "LONG", 0) == 0.0
+    assert sl_from_distance(100.0, "SHORT", 0) == 0.0
 
 
 def test_roi_pct_leveraged():

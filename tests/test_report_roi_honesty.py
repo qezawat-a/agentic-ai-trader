@@ -158,16 +158,12 @@ def test_a_successful_entry_is_not_reported_as_an_error():
     ctx.notes = ["size ONEUSDT: MARGIN_AMOUNT_PCT=75% -> qty 3045.0 "
                  "(notional 5.2203 USDT, margin 0.2088 USDT at 25x); "
                  "risk at the stop is 0.0469 USDT (16.26% of balance)"]
-    ctx.warnings = ["leverage ONEUSDT: 25x exceeds the exchange tier cap 20x "
-                    "for a 5.22 USDT position; using 20x for this order"]
-
     e._preflight_balance(ctx)
 
-    joined_errors = " ".join(e.state.errors)
     joined_notes = " ".join(e.state.notes)
+    joined_errors = " ".join(e.state.errors)
     assert "size ONEUSDT" in joined_notes, joined_notes
     assert "size ONEUSDT" not in joined_errors, joined_errors
-    assert "leverage ONEUSDT" in joined_errors, joined_errors
 
 
 def test_trailing_stop_at_the_floor_says_so():

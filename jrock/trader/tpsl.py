@@ -1,15 +1,17 @@
 """Agent-decided TP/SL.
 
-The user sets only TWO numbers:
+The user sets the stop-loss distance, breakeven and trailing trigger:
+    sl_distance_pct          - stop `distance_pct` % from entry (0 = none)
     breakeven_pct            - move SL to entry once ROI >= this %
     trailing_trigger_roi_pct - start trailing once ROI >= this %
 
-Everything else is derived by the agent from signal strength:
-    * SL distance is anchored to the liquidation price: the SL sits
-      `liq_sl_distance_pct` (default 50%) of the way from entry to liq.
+Everything else is derived:
+    * SL is placed exactly `sl_distance_pct` from the entry - the app never
+      invents a distance, a fraction of the liquidation distance, or a
+      volatility floor. 0 disables both the stop and the TP.
     * TP is a multiple of the SL distance, scaled by confidence/strength:
         weak 1.2R, normal 1.8R, strong 2.5R, extreme 3.2R
-      and capped so the implied ROI stays sane.
+      (only when a stop is set; there is no distance to scale otherwise).
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ from dataclasses import dataclass
 
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
                    liquidation_price, min_stop_distance, pick_tier,
-                   round_price, sl_from_liq_distance)
+                   round_price, sl_from_distance)
 
 R_MULTIPLE = {"none": 1.0, "weak": 1.2, "normal": 1.8, "strong": 2.5, "extreme": 3.2}
 
@@ -106,7 +108,7 @@ def _roi_pct(p: float, entry: float, side: str, leverage: int) -> float:
 
 def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
               strength: str, confidence: float, tiers: list[Tier],
-              rules: PairRules, liq_sl_distance_pct: float = 50.0,
+              rules: PairRules, sl_distance_pct: float = 0.0,
               breakeven_pct: float = 0.6,
               trailing_trigger_roi_pct: float = 25.0,
               mark: float | None = None,
@@ -127,36 +129,47 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
     d = min_stop_distance(rules, min_stop_ticks)
     ref = mark if (mark is not None and mark > 0) else entry
 
-    sl = sl_from_liq_distance(entry, liq, side, liq_sl_distance_pct)
-    sl = round_price(sl, rules.quote_precision)
+    if sl_distance_pct > 0:
+        sl = sl_from_distance(entry, side, sl_distance_pct)
+        sl = round_price(sl, rules.quote_precision)
+    else:
+        sl = 0.0
+    no_sl = sl <= 0.0
 
     # --- clamp the SL to the correct side of BOTH entry and mark.
     # A high-leverage stop can land within a tick of the mark price; rounding
     # then collapses it onto the mark and the exchange rejects the order.
     # clamp_sl is shared with the running-engine path (breakeven/trailing) so
     # there is exactly one implementation of this rule.
-    sl = clamp_sl(side=side, sl=sl, entry=entry, mark=ref, rules=rules,
-                  min_ticks=min_stop_ticks, liq=liq)
+    if not no_sl:
+        sl = clamp_sl(side=side, sl=sl, entry=entry, mark=ref, rules=rules,
+                      min_ticks=min_stop_ticks, liq=liq)
 
-    # --- feasibility: the stop must fit BETWEEN the liquidation price and the
-    # mark-side limit.
-    _check_stop_side(side=side, liq=liq, sl=sl, entry=entry, ref=ref, d=d,
-                     rules=rules)
+        # --- feasibility: the stop must fit BETWEEN the liquidation price and
+        # the mark-side limit.
+        _check_stop_side(side=side, liq=liq, sl=sl, entry=entry, ref=ref, d=d,
+                         rules=rules)
 
-    sl_dist = abs(entry - sl)
-    tp = _plan_tp(side=side, entry=entry, ref=ref, sl_dist=sl_dist,
-                  strength=strength, confidence=confidence, is_long=is_long,
-                  rules=rules, min_stop_ticks=min_stop_ticks)
+    sl_dist = abs(entry - sl) if not no_sl else 0.0
+    if no_sl:
+        tp = 0.0
+        sl_roi = 0.0
+        tp_roi = 0.0
+        rr = 0.0
+        notes = ["no stop configured (set sl distance pct <pct> - the app never invents one)"]
+    else:
+        tp = _plan_tp(side=side, entry=entry, ref=ref, sl_dist=sl_dist,
+                      strength=strength, confidence=confidence, is_long=is_long,
+                      rules=rules, min_stop_ticks=min_stop_ticks)
+        sl_roi = _roi_pct(sl, entry, side, leverage)
+        tp_roi = _roi_pct(tp, entry, side, leverage)
+        rr = abs(tp_roi / sl_roi) if sl_roi else 0.0
 
-    sl_roi = _roi_pct(sl, entry, side, leverage)
-    tp_roi = _roi_pct(tp, entry, side, leverage)
-    rr = abs(tp_roi / sl_roi) if sl_roi else 0.0
-
-    notes = []
-    if sl_roi and abs(sl_roi) > 60:
-        notes.append(f"SL ROI {sl_roi:.1f}% is wide - consider lower leverage")
-    if tp_roi > 400:
-        notes.append("TP ROI very high; may take long to fill")
+        notes = []
+        if sl_roi and abs(sl_roi) > 60:
+            notes.append(f"SL ROI {sl_roi:.1f}% is wide - consider lower leverage")
+        if tp_roi > 400:
+            notes.append("TP ROI very high; may take long to fill")
 
     return TpSlPlan(
         side=side.upper(), entry=entry, sl=sl, tp=tp, liq=liq,

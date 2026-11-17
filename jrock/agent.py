@@ -113,7 +113,7 @@ TRADER ENGINE COMMANDS
   settings trade                    scan on | scan off
   mid management position trigger   reversal=true  reversal_confidence=70
   scans interval sec 30             breakeven threshold pct 0.6
-  trailing trigger stop ROI pct 25  liq sl distance pct 50
+  trailing trigger stop ROI pct 25  sl distance pct 0
   min agreeing strategies 3         timeframes 1m,3m,5m,15m
   min confidence 70                 tf min confidence 60
   close position [SYMBOL]           margin mode ISOLATION|CROSS
@@ -2193,7 +2193,7 @@ class JRockAgent:
             risk_line,
             f"breakeven: {s.breakeven_pct}%  "
             f"trailing trigger: {s.trailing_trigger_roi_pct}% ROI  "
-            f"liq SL distance: {s.liq_sl_distance_pct}%",
+            f"sl distance: {s.sl_distance_pct}% from entry (0 = none)",
             f"min agreeing strategies: {s.min_agreeing}  "
             f"timeframes: {','.join(s.timeframes)}",
             f"min confidence: {s.min_confidence}  "
@@ -2731,7 +2731,7 @@ class JRockAgent:
             (r"30016|30017|minTradeVolume|qty", "Qty below minTradeVolume or wrong precision: "
                                                "round down to basePrecision."),
             (r"30024|30025|liq price", "SL is on the wrong side of the liquidation price: "
-                                       "recompute with sl_from_liq_distance()."),
+                                       "recompute with sl_from_distance()."),
             (r"30029|30031|SL price must be (less|greater) than mark",
              "SL is on the wrong side of the MARK price. Every TP/SL path now "
              "fetches the mark price fresh and clamps the stop through "

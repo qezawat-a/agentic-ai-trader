@@ -1,25 +1,16 @@
-"""Regression tests for "no valid stop-loss exists" at high leverage.
+"""Regression tests for the tiered-risk-limit model of entries.
 
-The bug (seen live on JCTUSDT):
+The old behaviour clamped the configured leverage to whatever still left a
+stop-loss room between the liquidation price and the mark, then (after v
+history) refused otherwise. The docs model is simpler and does not guess:
 
-    JCTUSDT LONG: no valid stop-loss exists. The stop must sit between the
-    liquidation price 0.015754 and 0.015625 (entry=0.015833, mark=0.015625),
-    keeping 0.000003 clear of both. Lower the leverage or widen the tick.
-
-The engine planned the stop from the ENTRY (the last price, 0.015833) while the
-exchange validates it against the MARK (0.015625). At 100x with a 0.5%
-maintenance margin the liquidation price is only ~0.5% below the entry:
-
-    liq = 0.015833 * (1 - 1/100 + 0.005) = 0.015754
-
-which is ABOVE the mark 0.015625. A LONG stop must be below the mark AND above
-the liquidation price, so the interval (0.015754, 0.015625) is empty - no stop
-can exist. The engine refused the symbol on every scan, forever, even though
-the same signal was perfectly tradable at 55x or below.
-
-The fix: before planning, compute the highest leverage at which a stop still
-fits between the liquidation price and the mark, and clamp to it (or refuse
-with that number when auto-reduce is off).
+* the tiered risk-limit table is required for a LIVE entry; a missing table is
+  a REFUSAL, never a fallback ("unavailable - refusing to trade without the
+  exchange's limits");
+* the tier the SELECTED leverage maps to is the HIGHEST tier whose maximum
+  leverage still covers the selection (Bitunix example: 50x -> tier 3);
+* the position value of the order must fit that tier's nominal cap;
+* otherwise the entry is refused (fail-closed).
 """
 from __future__ import annotations
 
@@ -29,10 +20,11 @@ import pytest
 
 from jrock.config import Settings
 from jrock.trader.engine import TraderEngine
-from jrock.trader.risk import (PairRules, liquidation_price,
-                               max_leverage_for_stop, min_stop_distance)
+from jrock.trader.risk import (PairRules, liquidation_price, min_stop_distance,
+                               pick_tier, round_step, tier_for_leverage,
+                               Tier)
 
-# --- the live JCTUSDT numbers from the screenshot ---------------------------
+# --- the live JCTUSDT numbers from the bug report ---------------------------
 JCT_ENTRY = 0.015833   # last price the engine traded on
 JCT_MARK = 0.015625    # mark price the exchange validates against
 JCT_MMR = 0.005        # maintenance margin rate at the 100x tier
@@ -45,7 +37,7 @@ JCT = PairRules(
 )
 
 
-# --- the helper -------------------------------------------------------------
+# --- liquidation & rounding ------------------------------------------------
 
 def test_liquidation_price_reproduces_the_screenshot():
     """The reported liq price must come out of the documented formula."""
@@ -54,85 +46,42 @@ def test_liquidation_price_reproduces_the_screenshot():
 
 
 def test_100x_has_no_room_for_a_stop():
-    """liq (0.015754) is ABOVE the mark (0.015625): the interval is empty."""
+    """liq (0.015754) is ABOVE the mark (0.015625): at this leverage the
+    desired stop distance does not fit; the user must lower the leverage."""
     liq = liquidation_price(JCT_ENTRY, 100, "LONG", JCT_MMR)
-    assert liq > JCT_MARK, "the screenshot's premise: liq sits above the mark"
+    assert liq > JCT_MARK
 
 
-def test_max_leverage_for_stop_is_below_100x():
-    lev = max_leverage_for_stop(entry=JCT_ENTRY, mark=JCT_MARK, side="LONG",
-                                maintenance_margin_rate=JCT_MMR, rules=JCT,
-                                min_ticks=3)
-    assert 0 < lev < 100
-    # the analytic bound for these numbers is ~55x; the 3-tick clearance the
-    # stop must keep from the mark costs one more step, so 54x is the answer.
-    assert lev == 54
+def test_round_step_does_not_underflow_on_floats():
+    """0.29 * 100 == 28.999999 in binary - the old int() floor gave 0.28."""
+    assert round_step(0.29, 2) == 0.29
+    assert round_step(1.23456, 2) == 1.23
+    assert round_step(0.00019, 4) == 0.0001
 
 
-def test_the_clamped_leverage_actually_leaves_room():
-    """At the returned leverage a stop really does fit - that is the point."""
-    lev = max_leverage_for_stop(entry=JCT_ENTRY, mark=JCT_MARK, side="LONG",
-                                maintenance_margin_rate=JCT_MMR, rules=JCT,
-                                min_ticks=3)
-    liq = liquidation_price(JCT_ENTRY, lev, "LONG", JCT_MMR)
-    d = min_stop_distance(JCT, 3)
-    assert liq < JCT_MARK - d, (
-        f"at {lev}x liq={liq} must stay below mark-d={JCT_MARK - d}")
+def test_pick_tier_raises_on_empty_table():
+    with pytest.raises(ValueError):
+        pick_tier([], 1000.0)
 
 
-def test_one_step_above_the_bound_does_not_fit():
-    """The bound is tight: lev+1 must break the interval."""
-    lev = max_leverage_for_stop(entry=JCT_ENTRY, mark=JCT_MARK, side="LONG",
-                                maintenance_margin_rate=JCT_MMR, rules=JCT,
-                                min_ticks=3)
-    liq = liquidation_price(JCT_ENTRY, lev + 1, "LONG", JCT_MMR)
-    assert liq >= JCT_MARK - min_stop_distance(JCT, 3)
+# --- the docs rule: tier from the SELECTED leverage -------------------------
+
+TIER_TABLE = [
+    Tier(1, 0.0, 5000.0, 125, 0.004),
+    Tier(2, 5000.0, 20000.0, 100, 0.005),
+    Tier(3, 20000.0, 50000.0, 50, 0.01),
+]
 
 
-def test_short_side_mirror():
-    """A SHORT with the mark ABOVE the entry has the same problem, mirrored."""
-    lev = max_leverage_for_stop(entry=0.015625, mark=0.015833, side="SHORT",
-                                maintenance_margin_rate=JCT_MMR, rules=JCT,
-                                min_ticks=3)
-    assert 0 < lev < 100
-    liq = liquidation_price(0.015625, lev, "SHORT", JCT_MMR)
-    assert liq > 0.015833 + min_stop_distance(JCT, 3)
-
-
-def test_no_leverage_works_only_when_the_mark_is_absurdly_far():
-    """For a LONG, lowering the leverage always widens the room (at 1x the
-    liquidation price is ~99.5% below the entry), so the only way NO leverage
-    works is a mark almost at zero - a 99.9% collapse."""
-    lev = max_leverage_for_stop(entry=1.0, mark=0.001, side="LONG",
-                                maintenance_margin_rate=0.005, rules=JCT,
-                                min_ticks=3)
-    assert lev == 0
-
-
-def test_low_leverage_always_has_room():
-    """The whole point of clamping: there is always a leverage that fits."""
-    for mark in (0.99, 0.95, 0.9, 0.5):
-        lev = max_leverage_for_stop(entry=1.0, mark=mark, side="LONG",
-                                    maintenance_margin_rate=0.005, rules=JCT,
-                                    min_ticks=3)
-        assert lev >= 1, f"mark={mark} must still admit some leverage"
-
-
-def test_a_moderate_gap_still_has_a_low_leverage_that_fits():
-    """A 5% gap is not hopeless: 18x still leaves room, so the engine must
-    clamp rather than refuse."""
-    lev = max_leverage_for_stop(entry=1.0, mark=0.95, side="LONG",
-                                maintenance_margin_rate=0.005, rules=JCT,
-                                min_ticks=3)
-    assert lev == 18
-
-
-def test_low_leverage_is_untouched():
-    """10x has plenty of room; the bound must not clamp it."""
-    lev = max_leverage_for_stop(entry=JCT_ENTRY, mark=JCT_MARK, side="LONG",
-                                maintenance_margin_rate=JCT_MMR, rules=JCT,
-                                min_ticks=3)
-    assert lev > 10
+def test_tier_for_leverage_is_the_highest_tier_covering_the_selection():
+    """Bitunix example: 50x with the documented BTCUSDT table -> tier 3."""
+    assert tier_for_leverage(TIER_TABLE, 50).level == 3   # the official example
+    assert tier_for_leverage(TIER_TABLE, 100).level == 2
+    assert tier_for_leverage(TIER_TABLE, 125).level == 1
+    # nothing covers 200x
+    assert tier_for_leverage(TIER_TABLE, 200) is None
+    # 55x is covered only by tier 2 and tier 1 (both allow >= 55) -> tier 2
+    assert tier_for_leverage(TIER_TABLE, 55).level == 2
 
 
 # --- the engine wiring ------------------------------------------------------
@@ -155,8 +104,9 @@ TIERS = [
 
 
 class FakeClient:
-    def __init__(self, equity, mark, last):
+    def __init__(self, equity, mark, last, tiers=None):
         self.equity, self.mark, self.last = equity, mark, last
+        self.tiers = tiers if tiers is not None else TIERS
         self.placed: list[dict] = []
         self.leverage_calls: list[int] = []
 
@@ -172,7 +122,7 @@ class FakeClient:
         return [PAIR]
 
     async def get_position_tiers(self, sym):
-        return TIERS
+        return self.tiers
 
     async def get_pending_positions(self, sym=None):
         return []
@@ -198,12 +148,12 @@ class Agg:
     agreeing = 5
 
 
-def _run(equity, mark, last, leverage, auto_reduce=True):
+def _run(equity, mark, last, leverage, sl_distance_pct=5.0, tiers=None):
     s = Settings()
     s.market_data_source = "rest"
-    s.leverage_auto_reduce = auto_reduce
+    s.sl_distance_pct = sl_distance_pct
     e = TraderEngine(s)
-    e.client = FakeClient(equity, mark, last)
+    e.client = FakeClient(equity, mark, last, tiers=tiers)
     e.state.leverage = leverage
 
     async def go():
@@ -213,68 +163,46 @@ def _run(equity, mark, last, leverage, auto_reduce=True):
     return asyncio.run(go()), e.client
 
 
-def test_engine_does_not_refuse_the_screenshot_case():
-    """The exact live numbers: 100x must no longer produce
-    'no valid stop-loss exists' - the order goes through at a clamped leverage."""
-    r, client = _run(100.0, JCT_MARK, JCT_ENTRY, 100)
+def test_the_screenshot_case_refuses_cleanly_at_100x():
+    """At 100x with this mark no stop exists (liq is above the mark): the
+    engine refuses with the numbers; it does not clamp or pretend."""
+    r, client = _run(100.0, JCT_MARK, JCT_ENTRY, 100, sl_distance_pct=2.0)
+    assert r["ok"] is False
+    assert client.placed == []
+    assert "no valid stop-loss exists" in r["reason"]
+
+
+def test_a_sane_leverage_trades_the_screenshot_case():
+    """At 30x with a 2% stop there is plenty of room: the order goes through."""
+    r, client = _run(100.0, JCT_MARK, JCT_ENTRY, 30, sl_distance_pct=2.0)
     assert r["ok"] is True, r.get("reason")
-    assert "no valid stop-loss exists" not in str(r.get("reason", ""))
     assert len(client.placed) == 1
-    # the leverage actually sent to the exchange is the clamped one
-    assert client.leverage_calls and client.leverage_calls[-1] < 100
+    assert client.leverage_calls and client.leverage_calls[-1] == 30
 
 
-def test_engine_reports_the_clamp_instead_of_silently_changing_it():
-    r, _ = _run(100.0, JCT_MARK, JCT_ENTRY, 100)
-    assert r["ok"] is True
-    assert any("leaves no room for a stop-loss" in e for e in
-               _errors_of(r, JCT_MARK, JCT_ENTRY))
-
-
-def _errors_of(r, mark, entry):
-    """The engine records the clamp as an error line; read it back."""
-    # try_enter returns the plan; the clamp message lives on the engine state,
-    # so re-run and inspect it.
-    s = Settings()
-    s.market_data_source = "rest"
-    e = TraderEngine(s)
-    e.client = FakeClient(100.0, mark, entry)
-    e.state.leverage = 100
-
-    async def go():
-        await e.load_rules(["JCTUSDT"])
-        await e.try_enter(Agg())
-        return list(e.state.errors)
-
-    return asyncio.run(go())
-
-
-def test_auto_reduce_off_refuses_with_the_max_leverage_named():
-    r, client = _run(100.0, JCT_MARK, JCT_ENTRY, 100, auto_reduce=False)
+def test_empty_tier_table_refuses():
+    r, client = _run(100.0, JCT_MARK, JCT_ENTRY, 10, tiers=[])
     assert r["ok"] is False
     assert client.placed == []
-    assert "54x" in r["reason"]
-    assert "LEVERAGE_AUTO_REDUCE" in r["reason"]
+    assert "unavailable" in r["reason"]
 
 
-def test_auto_reduce_off_does_not_claim_insufficient_balance():
-    """This is a leverage/stop problem, not a balance problem - the hint must
-    not send the user chasing 20003."""
-    r, _ = _run(100.0, JCT_MARK, JCT_ENTRY, 100, auto_reduce=False)
-    assert r.get("hint") != "20003 Insufficient balance"
-
-
-def test_sane_leverage_is_not_clamped():
-    r, client = _run(100.0, JCT_MARK, JCT_ENTRY, 10)
-    assert r["ok"] is True
-    assert client.leverage_calls[-1] == 10
-
-
-def test_hopeless_mark_is_refused_with_a_clear_reason():
-    """A mark 99.9% below the entry: no leverage works, and the message says so
-    rather than blaming the balance."""
-    r, client = _run(100.0, JCT_ENTRY * 0.001, JCT_ENTRY, 20)
+def test_selection_exceeding_every_tier_refuses():
+    r, client = _run(100.0, JCT_MARK, JCT_ENTRY, 200)
     assert r["ok"] is False
     assert client.placed == []
-    assert "no stop-loss can fit at any leverage" in r["reason"]
-    assert r.get("hint") != "20003 Insufficient balance"
+
+
+def test_position_value_exceeding_tier_cap_refuses():
+    """100 000 USDT equity at 50x on tier 2 (cap 20000): the tier the 55x
+    selection maps to cannot cover the size -> refuse, never downsize."""
+    r, client = _run(100000.0, JCT_MARK, JCT_ENTRY, 55, sl_distance_pct=2.0)
+    # margin 10% of 100000 = 10000 x 55x = 550000 > tier 2 cap 20000
+    assert r["ok"] is False
+    assert client.placed == []
+
+
+def test_sane_leverage_places_an_order():
+    r, client = _run(100.0, JCT_MARK, JCT_ENTRY, 10, sl_distance_pct=2.0)
+    assert r["ok"] is True
+    assert client.leverage_calls and client.leverage_calls[-1] == 10

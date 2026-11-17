@@ -24,7 +24,7 @@ from jrock.trader.risk import (PairRules, Tier, TpSlSideError, liquidation_price
                                margin_required, min_stop_distance,
                                notional_from_qty, pick_tier,
                                position_size_by_risk, round_price,
-                               sl_from_liq_distance, tick_size,
+                               sl_from_distance, tick_size,
                                validate_tpsl_side)
 from jrock.trader.tpsl import plan_tpsl
 
@@ -69,7 +69,7 @@ def main() -> int:
     print("  SL=0.0051 against mark=0.0051xx, i.e. the mark sat BELOW the stop.")
     lev = 50
     liq = liquidation_price(last, lev, "LONG", 0.003)
-    sl_old = round_price(sl_from_liq_distance(last, liq, "LONG", 50.0),
+    sl_old = round_price(sl_from_distance(last, "LONG", 5.0),
                          rules.quote_precision)
     print(f"  live entry(last)={last}  liq={liq:.6f}  sl={sl_old:.6f}")
     print("  the reported frame, replayed exactly:")
@@ -87,7 +87,7 @@ def main() -> int:
         for side in ("LONG", "SHORT"):
             p = plan_tpsl(side=side, entry=last, leverage=lv, notional=20.0,
                           strength="MEDIUM", confidence=70.0, tiers=TIERS,
-                          rules=rules, mark=mark, min_stop_ticks=3)
+                          rules=rules, sl_distance_pct=5.0, mark=mark, min_stop_ticks=3)
             v = validate_tpsl_side(symbol=SYMBOL, side=side, entry=last, mark=mark,
                                    sl=p.sl, tp=p.tp, rules=rules, liq=p.liq)
             print(f"  lev={lv:2d} {side:5s} sl={p.sl:.6f} tp={p.tp:.6f} "
@@ -110,7 +110,7 @@ def main() -> int:
     for side, order_side in (("LONG", "BUY"), ("SHORT", "SELL")):
         p = plan_tpsl(side=side, entry=last, leverage=10, notional=20.0,
                       strength="MEDIUM", confidence=70.0, tiers=TIERS,
-                      rules=rules, mark=mark, min_stop_ticks=3)
+                      rules=rules, sl_distance_pct=5.0, mark=mark, min_stop_ticks=3)
         b = build_order_body(symbol=SYMBOL, qty=4016, side=order_side,
                              tradeSide="OPEN", orderType="MARKET",
                              tpPrice=p.tp, slPrice=p.sl,

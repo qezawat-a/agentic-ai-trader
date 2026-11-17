@@ -133,7 +133,9 @@ class Settings:
     risk_pct: float = 1.0
     breakeven_pct: float = 0.6
     trailing_trigger_roi_pct: float = 25.0
-    liq_sl_distance_pct: float = 50.0
+    #: Stop-loss distance from the entry, % of price (0 = none).
+    #: The stop is the user's setting; the app never invents one.
+    sl_distance_pct: float = 0.0
     min_agreeing: int = 3
     timeframes: list[str] = field(default_factory=lambda: ["1m", "3m", "5m", "15m"])
     min_confidence: float = 70.0
@@ -156,19 +158,6 @@ class Settings:
     # private (position/order/balance) login handshake has never been verified
     # against the real server, so we do not silently switch the engine onto it.
     market_data_source: str = "rest"
-    #: When the configured leverage leaves no room for a stop-loss between the
-    #: liquidation price and the mark price, clamp the leverage for that order
-    #: to the highest value that still fits instead of refusing the trade.
-    #:
-    #: A stop must sit strictly between the liquidation price and the mark. The
-    #: liquidation price is derived from the ENTRY, and a MARKET order fills at
-    #: the last price, which can be on the far side of the mark. At 100x with a
-    #: 0.5% maintenance margin the liquidation price is only ~0.5% below the
-    #: entry, so a mark 1.3% below the last price puts the liquidation price
-    #: ABOVE the mark - no stop can exist, and the engine refused the symbol on
-    #: every scan forever. With this on, the order is placed at the highest
-    #: leverage that still leaves room for a stop.
-    leverage_auto_reduce: bool = True
     #: Which unit the engine sizes an order in, per the official Bitunix help
     #: article "Explanation of the Order Units in Futures Trading":
     #:   QUANTITY - base-coin quantity (what place_order's `qty` field takes;
@@ -291,7 +280,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         risk_pct=_f("TRADE_RISK_PCT", 1.0),
         breakeven_pct=_f("TRADE_BREAKEVEN_PCT", 0.6),
         trailing_trigger_roi_pct=_f("TRADE_TRAILING_TRIGGER_ROI_PCT", 25.0),
-        liq_sl_distance_pct=_f("TRADE_LIQ_SL_DISTANCE_PCT", 50.0),
+        sl_distance_pct=_f("TRADE_SL_DISTANCE_PCT", 0.0),
         min_agreeing=_i("TRADE_MIN_AGREING", 3),
         timeframes=tfs or ["1m", "3m", "5m", "15m"],
         min_confidence=_f("TRADE_MIN_CONFIDENCE", 70.0),
@@ -307,7 +296,6 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         agent_autonomous_sec=_i("AGENT_AUTONOMOUS_SEC", 15),
         agent_rate_limit_window=_i("AGENT_RATE_LIMIT_WINDOW", 128),
         market_data_source=_market_data_source(),
-        leverage_auto_reduce=_b("LEVERAGE_AUTO_REDUCE", True),
         order_unit=_order_unit(),
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),
         max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
