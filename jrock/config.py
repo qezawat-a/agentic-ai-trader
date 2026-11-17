@@ -200,10 +200,11 @@ class Settings:
     #: restores the pre-existing behaviour (size purely by risk_pct, capped by
     #: the whole spendable balance).
     margin_amount_pct: float = 10.0
-    #: Universe auto-ranking: "" disables it; one of GAINERS / LOOSERS / VOLUME / MOVERS.
-    #: When SYMBOLS=AUTO is set, the scan loop fetches all tickers via the public
-    #: get_tickers endpoint, filters by MIN_24H_VOLUME_USD, ranks by this method,
-    #: and scans the top UNIVERSE_SIZING symbols instead of the static watchlist.
+    #: Universe auto-ranking: "" disables it; one of GAINERS / LOSERS / VOLUME / MOVERS.
+    #: When universe ranking is enabled (UNIVERSE_RANK + UNIVERSE_SIZING), the
+    #: scan loop fetches all tickers via the public get_tickers endpoint, filters
+    #: by MIN_24H_VOLUME_USD, ranks by this method, and scans the top
+    #: UNIVERSE_SIZING symbols instead of the static watchlist.
     universe_rank: str = ""
     #: How many top-ranked symbols to keep in the auto universe (1..200). 0 = off.
     universe_sizing: int = 0
@@ -298,7 +299,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         scan_interval=_i("TRADE_SCAN_INTERVAL", 30),
         report_interval=_i("TRADE_REPORT_INTERVAL", 30),
         thinking_level=level_from_env(),
-        universe_rank=_f("UNIVERSE_RANK", ""),
+        universe_rank=(os.getenv("UNIVERSE_RANK") or "").strip().upper(),
         universe_sizing=_i("UNIVERSE_SIZING", 0),
         min_24h_volume_usdt=_f("MIN_24H_VOLUME_USD", 0.0),
         agent_max_steps=_i("AGENT_MAX_STEPS", 128),

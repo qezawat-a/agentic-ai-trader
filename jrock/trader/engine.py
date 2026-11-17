@@ -138,9 +138,9 @@ class EngineState:
     # the manage loop and need no selector.
     tpsl_method: str = "POSITION"
     # --- universe auto-ranking
-    #: One of GAINERS / LOOSERS / VOLUME / MOVERS; "" disables ranking.
-    #: When SYMBOLS=AUTO and engine is on, the scan loop replaces the
-    #: static watchlist with the top symbols ranked by this method.
+    #: One of GAINERS / LOSERS / VOLUME / MOVERS; "" disables ranking.
+    #: When ranking is enabled (universe_rank + universe_sizing), the scan loop
+    #: replaces the static watchlist with the top symbols ranked by this method.
     universe_rank: str = ""
     #: How many top-ranked symbols to keep in the auto universe (1..200). 0 = off.
     universe_sizing: int = 0
@@ -896,21 +896,6 @@ class TraderEngine:
         with self.signals_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
 
-    def _universe_rank(self, sym: str, price: float, mark: float,
-                       lastPrice: float | None, baseVol: float | None) -> str:
-        """Classify a symbol for UNIVERSE_RANK (GAINER/LOSER/VOLUME/MOVER)."""
-        if not sym or not lastPrice or not mark or not baseVol:
-            return "NONE"
-        if lastPrice > price:
-            return "GAINER"
-        if lastPrice < price:
-            return "LOSER"
-        if baseVol or float(baseVol) >= self.state.min_24h_volume_usdt:
-            return "VOLUME"
-        if baseVol and abs(baseVol - price) > 0:
-            return "MOVER"
-        return "NONE"
-
     async def _universe_symbols(self) -> list[str]:
         """Return up to universe_sizing top symbols ranked by UNIVERSE_RANK.
 
@@ -918,6 +903,11 @@ class TraderEngine:
         MIN_24H_VOLUME_USD (USDT-denominated quoteVol), ranks by the chosen
         UNIVERSE_RANK method (GAINERS / LOSERS / VOLUME / MOVERS), and keeps
         the top UNIVERSE_SIZING symbols.
+
+        GAINERS / LOSERS / MOVERS rank by PERCENT change since the 24h open,
+        not by absolute price change: a $60 move in BTC is not a bigger move
+        than +30% in a cheap pair, and sorting on the raw delta would fill the
+        universe with high-priced symbols regardless of momentum.
         """
         if not self.state.universe_rank or self.state.universe_sizing == 0:
             return []
@@ -940,18 +930,30 @@ class TraderEngine:
 
         min_vol = self.state.min_24h_volume_usdt
         filtered = [c for c in candidates if min_vol <= 0 or c[4] >= min_vol]
-        method = (self.state.universe_rank or "").upper()
+        # LOOSERS is the spelling early builds shipped in the help text; a
+        # persisted state may still carry it, so normalize it instead of
+        # silently returning an empty universe. AUTO means "keep the current
+        # method" - VOLUME (most liquid first) when none is set.
+        method = (self.state.universe_rank or "").strip().upper()
+        method = {"LOOSERS": "LOSERS", "AUTO": "VOLUME"}.get(method, method)
+
+        def pct_change(c: tuple) -> float:
+            open_price = c[3]
+            if open_price <= 0 or c[1] <= 0:
+                return 0.0
+            return (c[1] - open_price) / open_price
 
         if method == "GAINERS":
-            ranked = [c for c in filtered if c[1] > c[3]]
-            ranked.sort(key=lambda c: c[1] - c[3], reverse=True)
+            ranked = [c for c in filtered if pct_change(c) > 0]
+            ranked.sort(key=pct_change, reverse=True)
         elif method == "LOSERS":
-            ranked = [c for c in filtered if c[1] < c[3]]
-            ranked.sort(key=lambda c: c[3] - c[1], reverse=True)
+            ranked = [c for c in filtered if pct_change(c) < 0]
+            ranked.sort(key=pct_change)
         elif method == "VOLUME":
             ranked = sorted(filtered, key=lambda c: c[4], reverse=True)
         elif method == "MOVERS":
-            ranked = sorted(filtered, key=lambda c: abs(c[1] - c[3]), reverse=True)
+            ranked = [c for c in filtered if pct_change(c) != 0]
+            ranked.sort(key=lambda c: abs(pct_change(c)), reverse=True)
         else:
             ranked = []
         return [c[0] for c in ranked[: self.state.universe_sizing]]
@@ -3019,8 +3021,8 @@ class TraderEngine:
         if p == "report":
             return rest.split()[0].lower() in ("on", "off", "interval")
         if p == "universe rank":
-            return rest.strip().lower() in ("gainers", "loosers", "volume",
-                                              "movers", "auto", "off")
+            return rest.strip().lower() in ("gainers", "losers", "loosers",
+                                             "volume", "movers", "auto", "off")
         if p in ("universe sizing", "universe volume", "universe volume usd"):
             return bool(re.search(r"-?\d+(?:\.\d+)?", rest))
         return False
@@ -3128,13 +3130,42 @@ class TraderEngine:
             except (ValueError, IndexError):
                 return "Usage: reentry cooldown sec 60"
         # ---- universe commands ----
+        # Auto and off are handled HERE, before the method branch: the old
+        # `startswith("universe rank")` branch swallowed them and answered
+        # "one of GAINERS, LOOSERS, ...", so the two commands advertised in
+        # /help were unreachable. `auto` also zeroed universe_sizing, which is
+        # exactly the setting that turns ranking off.
         if low.startswith("universe rank"):
             val = arg("universe rank").strip().upper()
-            if val in ("GAINERS", "LOSERS", "VOLUME", "MOVERS"):
-                s.universe_rank = val
-                return f"Universe rank = {s.universe_rank}."
-            return ("Universe rank is one of: GAINERS, LOOSERS, VOLUME, MOVERS "
-                    f"(current: {s.universe_rank}); AUTO turns on automatic ranking.")
+            if val == "AUTO":
+                if s.universe_rank == "LOOSERS":
+                    s.universe_rank = "LOSERS"
+                if s.universe_rank not in ("GAINERS", "LOSERS", "VOLUME", "MOVERS"):
+                    s.universe_rank = "VOLUME"
+                msg = f"Universe auto-ranking ON (rank = {s.universe_rank})."
+                if s.universe_sizing:
+                    msg += f" Scanning the top {s.universe_sizing} symbols."
+                else:
+                    msg += (" Universe sizing is 0, so nothing is scanned yet - "
+                            "set 'universe sizing N'.")
+                return msg
+            if val == "OFF":
+                s.universe_rank = ""
+                return ("Universe auto-ranking OFF. "
+                        f"Universe sizing stays {s.universe_sizing} for when you turn it back on.")
+            if val in ("GAINERS", "LOSERS", "LOOSERS", "VOLUME", "MOVERS"):
+                # LOOSERS is the misspelling early help text shipped with; keep
+                # accepting it so that command still works, but store the
+                # canonical method.
+                s.universe_rank = "LOSERS" if val == "LOOSERS" else val
+                msg = f"Universe rank = {s.universe_rank}."
+                if not s.universe_sizing:
+                    msg += (" Universe sizing is 0, so ranking is off - "
+                            "set 'universe sizing N'.")
+                return msg
+            return ("Universe rank is one of: GAINERS, LOSERS, VOLUME, MOVERS "
+                    f"(current: {s.universe_rank or 'off'}); AUTO turns on "
+                    "automatic ranking, OFF turns it off.")
         if low.startswith("universe sizing"):
             try:
                 s.universe_sizing = int(arg("universe sizing").split()[-1])
@@ -3142,28 +3173,23 @@ class TraderEngine:
                 return "Usage: universe sizing 50"
             if not 1 <= s.universe_sizing <= 200:
                 return f"Universe sizing must be 1..200 ({s.universe_sizing} rejected)."
-            return f"Universe sizing = {s.universe_sizing}."
-        if low.startswith("universe volume"):
-            try:
-                s.min_24h_volume_usdt = float(arg("universe volume").split()[-1])
-            except (ValueError, IndexError):
-                return "Usage: universe volume 1000000"
-            return (f"Universe min 24h volume = {s.min_24h_volume_usdt:g} USDT.")
+            msg = f"Universe sizing = {s.universe_sizing}."
+            if not s.universe_rank:
+                msg += (" Universe rank is off - set 'universe rank "
+                        "GAINERS|LOSERS|VOLUME|MOVERS' to start ranking.")
+            return msg
         if low.startswith("universe volume usd"):
             try:
                 s.min_24h_volume_usdt = float(arg("universe volume usd").split()[-1])
             except (ValueError, IndexError):
                 return "Usage: universe volume usd 1000000"
             return (f"Universe min 24h volume = {s.min_24h_volume_usdt:g} USDT.")
-        if low == "universe rank auto":
-            s.universe_rank = "AUTO"
-            s.universe_sizing = 0
-            return "Universe auto-ranking ON (top symbols by engine rank)."
-        if low == "universe rank off":
-            s.universe_rank = ""
-            s.universe_sizing = 0
-            return "Universe auto-ranking OFF."
-        # ---- end universe commands ----
+        if low.startswith("universe volume"):
+            try:
+                s.min_24h_volume_usdt = float(arg("universe volume").split()[-1])
+            except (ValueError, IndexError):
+                return "Usage: universe volume 1000000"
+            return (f"Universe min 24h volume = {s.min_24h_volume_usdt:g} USDT.")
         if low.startswith("reversal"):
             val = arg("reversal").strip("= ").lower()
             s.reversal = val in ("true", "1", "on", "yes")

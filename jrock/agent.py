@@ -122,7 +122,8 @@ TRADER ENGINE COMMANDS
   tpsl method POSITION|PARTIAL
   partial ladder 40@1,35@2,25@3     partial ladder off
   account tp usdt 100               account sl usdt 50
-  universe rank GAINERS|LOOSERS|VOLUME|MOVERS | universe sizing N | universe volume N
+  universe rank GAINERS|LOSERS|VOLUME|MOVERS | universe sizing N | universe volume N
+  universe rank auto | universe rank off
   margin add BTCUSDT 100            margin reduce BTCUSDT 50
 
 ENV SETTINGS (in .env, read at startup)
@@ -854,11 +855,11 @@ class JRockAgent:
         # Universe auto-ranking intents: the builder may have returned a
         # clarification (empty command, needs a value) or a concrete command.
         if intent.name in ("universe_rank", "universe_volume",
-                           "universe_sizing", "universe_rank_on"):
+                           "universe_sizing"):
             if intent.command:
                 return await self.handle(intent.command)
             return (f"I can set universe auto-ranking ({intent.describe}). "
-                    f"Try: 'universe rank GAINERS | LOOSERS | VOLUME | MOVERS', "
+                    f"Try: 'universe rank GAINERS | LOSERS | VOLUME | MOVERS', "
                     f"'universe sizing N', 'universe volume N', "
                     f"or 'universe rank auto'.")
         # Everything else is a real command string: reuse the existing router.

@@ -440,6 +440,23 @@ def _b_what_is(t: str) -> Intent:
 def _b_universe_rank(t: str) -> Intent:
     """A natural-language request about universe auto-ranking (rank/sizing/volume)."""
     low = t.lower()
+    # A rank METHOD wins over the volume-floor branch: in "universe rank
+    # volume" / "rank the universe by losers" the word is the method, not a
+    # threshold. The old order sent both to a threshold clarification.
+    if "universe rank" in low or "rank the universe" in low:
+        for name in ("gainers", "losers", "loosers", "volume", "movers"):
+            if name in low:
+                canonical = "LOSERS" if name == "loosers" else name.upper()
+                return Intent("universe_rank", f"universe rank {canonical}", 0.9,
+                              describe=f"rank the auto universe by {canonical}")
+        if re.search(r"\b(off|stop|disable)\b", low):
+            return Intent("universe_rank", "universe rank off", 0.9,
+                          describe="turn universe auto-ranking OFF")
+        if re.search(r"\b(auto|on|enable|start|automatic)\b", low):
+            return Intent("universe_rank", "universe rank auto", 0.9,
+                          describe="turn universe auto-ranking ON")
+        return Intent("universe_rank", "", 0.5, needs="GAINERS|LOSERS|VOLUME|MOVERS",
+                      describe="set the universe auto-rank method")
     if "volume" in low:
         n = _num_after(t, "volume", "to", "at")
         if n is None:
@@ -455,17 +472,15 @@ def _b_universe_rank(t: str) -> Intent:
                           describe="set universe sizing")
         return Intent("universe_sizing", f"universe sizing {int(n)}", 0.9,
                       describe=f"set universe sizing to {int(n)} symbols")
-    # universe rank GAINERS/LOSERS/VOLUME/MOVERS
-    for name in ("gainers", "loosers", "volume", "movers"):
-        if name in low:
-            return Intent("universe_rank", f"universe rank {name.upper()}", 0.9,
-                          describe=f"rank the auto universe by {name.upper()}")
-    return Intent("universe_rank", "", 0.5, needs="GAINERS|LOOSERS|VOLUME|MOVERS",
+    return Intent("universe_rank", "", 0.5, needs="GAINERS|LOSERS|VOLUME|MOVERS",
                   describe="set the universe auto-rank method")
 
 
 def _b_universe_rank_on(t: str) -> Intent:
-    return Intent("universe_rank_on", "universe rank auto", 0.9,
+    # Same intent NAME as _b_universe_rank: both rules match "universe rank
+    # auto" and the parser treats a same-name pair as one interpretation, not
+    # as an ambiguity to ask about.
+    return Intent("universe_rank", "universe rank auto", 0.9,
                   describe="turn universe auto-ranking ON")
 
 
@@ -708,10 +723,10 @@ RULES: list[tuple[str, re.Pattern, object]] = [
 
     # --- universe auto-ranking
     ("universe_rank_set", re.compile(
-        r"\b(universe rank|universe sizing|universe volume)\b", re.I),
+        r"\b(universe rank|universe sizing|universe volume|rank (?:the )?universe)\b", re.I),
      _b_universe_rank),
     ("universe_rank_on", re.compile(
-        r"\b(universe rank|universe auto)\b.*\b(auto|on|enable|start)\b", re.I),
+        r"\buniverse\b.*\b(auto|automatic)\b", re.I),
      _b_universe_rank_on),
 
     # --- risk, as a question or a concern (the setter needs a number)
@@ -1123,10 +1138,9 @@ def _options_for(intent: Intent) -> list[str]:
         return ["set margin mode to ISOLATION", "set margin mode to CROSS", "never mind"]
     if intent.name == "position_mode":
         return ["set position mode to HEDGE", "set position mode to ONE_WAY", "never mind"]
-    if intent.name in ("universe_rank", "universe_volume", "universe_sizing",
-                       "universe_rank_on"):
-        return ["universe rank GAINERS", "universe sizing 50",
-                "universe volume 1000000", "never mind"]
+    if intent.name in ("universe_rank", "universe_volume", "universe_sizing"):
+        return ["universe rank GAINERS", "universe rank LOSERS",
+                "universe sizing 50", "universe volume 1000000", "never mind"]
     return ["never mind"]
 
 
