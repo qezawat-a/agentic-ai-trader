@@ -11,6 +11,7 @@ import pytest
 
 from jrock.config import Settings
 from jrock.trader.engine import TraderEngine
+from jrock.trader.risk import Tier
 
 PAIR = {
     "symbol": "AKEUSDT", "minTradeVolume": "1",
@@ -222,3 +223,43 @@ def test_position_mode_is_cached_between_orders():
 
     asyncio.run(again())
     assert e.client.mode_reads == 1, "the mode must be cached, not re-fetched"
+
+
+# ------------------------------------------- scan-time leverage-cap watchdog
+LOW_CAP_TIERS = [
+    {"symbol": "AKEUSDT", "level": 1, "startValue": "0", "endValue": "10000",
+     "leverage": 25, "maintenanceMarginRate": "0.02"},
+]
+
+
+def _engine_with_leverage(leverage: int) -> TraderEngine:
+    s = Settings()
+    s.market_data_source = "rest"
+    s.sl_distance_pct = 2.0
+    e = TraderEngine(s)
+    e.client = FakeClient(100000.0, 0.005020, 0.005009)
+    e.state.leverage = leverage
+    e.tiers["AKEUSDT"] = [Tier.from_api(t) for t in LOW_CAP_TIERS]
+    return e
+
+
+def test_leverage_watchdog_warns_when_selected_leverage_exceeds_the_symbol_cap():
+    """Scanning at 50x while the exchange caps the symbol at 25x must warn the
+    operator - the entry path would refuse it, but the operator should hear it
+    during the scan, before an entry is ever attempted."""
+    e = _engine_with_leverage(50)
+    w = asyncio.run(e._leverage_watchdog("AKEUSDT"))
+    assert w is not None
+    assert "AKEUSDT" in w and "50x" in w and "25x" in w
+
+
+def test_leverage_watchdog_silent_when_the_selected_leverage_fits():
+    e = _engine_with_leverage(20)
+    assert asyncio.run(e._leverage_watchdog("AKEUSDT")) is None
+
+
+def test_leverage_watchdog_silent_without_a_usable_tier_table():
+    """A failed/empty tier fetch must not manufacture a warning."""
+    e = _engine_with_leverage(50)
+    e.tiers["AKEUSDT"] = []
+    assert asyncio.run(e._leverage_watchdog("AKEUSDT")) is None

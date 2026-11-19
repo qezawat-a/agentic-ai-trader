@@ -79,6 +79,12 @@ TRIGGER_TYPE = "LAST_PRICE"
 #: the mark price, which the exchange rejects with 30029/30031.
 MIN_STOP_TICKS = 3
 
+#: How long one symbol may re-emit a leverage-cap watchdog warning during the
+#: scan loop. The entry path already refuses a selected leverage above the
+#: symbol's tier cap (fail-closed); this makes the operator aware at scan time,
+#: before an entry is ever attempted.
+LEVERAGE_WATCHDOG_COOLDOWN_SEC = 3600
+
 
 @dataclass
 class EngineState:
@@ -245,6 +251,10 @@ class TraderEngine:
         #: symbols the exchange says cannot be traded (error 20015). Scanned
         #: once, then skipped: retrying them every cycle was pure noise.
         self._untradable: dict[str, str] = {}
+        #: symbol -> when the leverage-cap watchdog last fired (epoch). The
+        #: warning is advisory (the entry path still refuses the entry); this
+        #: dedupes the repeat emission across scan cycles.
+        self._leverage_watch_ts: dict[str, float] = {}
         #: auto-ranked universe symbols (SYMBOLS=AUTO) that the WS feed must
         #: price each cycle. Empty when universe ranking is off.
         self._auto_symbols: list[str] = []
@@ -841,6 +851,36 @@ class TraderEngine:
         return candles
 
     # ================================================================ scanning
+    async def _leverage_watchdog(self, symbol: str) -> str | None:
+        """Scan-time leverage-cap awareness: the selected leverage vs the symbol.
+
+        The operator may run the scanner / autotrade at a leverage that some
+        scanned symbols do not allow (e.g. a 25x-capped pair while the operator
+        set 50x). The entry path refuses such a signal fail-closed; this
+        watchdog surfaces the same fact during the scan so the operator hears
+        about it before an entry is ever attempted.
+
+        Read-only by design: it never lowers the leverage itself - lowering is
+        the operator's call (`leverage <N>`, applied on next entry) and the
+        exchange stays the source of truth through the tier table.
+        """
+        lev = int(self.state.leverage or 0)
+        if lev <= 0:
+            return None
+        tiers = self.tiers.get(symbol)
+        if tiers is None:
+            tiers = await self.load_tiers(symbol)
+        cap = max((int(t.leverage) for t in tiers), default=0)
+        if cap <= 0:
+            # No usable tier table (failed fetch etc.) - the entry path already
+            # reports the failure; stay silent here.
+            return None
+        if lev > cap:
+            return (f"leverage watchdog {symbol}: selected {lev}x but the "
+                    f"exchange caps this symbol at {cap}x - lower the leverage "
+                    f"before trading it")
+        return None
+
     async def scan_symbol(self, symbol: str) -> Aggregate:
         if symbol in self._untradable:
             return Aggregate(symbol=symbol)
@@ -984,6 +1024,16 @@ class TraderEngine:
                         # others their scan in the same cycle
                         try:
                             agg = await self.scan_symbol(sym)
+                            watch = await self._leverage_watchdog(sym)
+                            if watch and (
+                                    time.time() - self._leverage_watch_ts.get(sym, 0.0)
+                                    ) > LEVERAGE_WATCHDOG_COOLDOWN_SEC:
+                                # Advisory only: never touches ctx.leverage, never
+                                # auto-lowers - the operator decides, the entry
+                                # path still refuses anything above the cap.
+                                self._leverage_watch_ts[sym] = time.time()
+                                self.state.notes.append(watch)
+                                log.warning("scan %s: %s", sym, watch)
                             if self.state.autotrade and agg.actionable:
                                 await self.try_enter(agg)
                         except asyncio.CancelledError:
