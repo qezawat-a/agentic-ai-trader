@@ -37,6 +37,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 
+from .api_reference import ENDPOINTS
 from .errors import BitunixAPIError, describe
 
 log = logging.getLogger(__name__)
@@ -62,6 +63,90 @@ def _wire_bool(v: bool | None) -> str | None:
     if v is None:
         return None
     return "true" if v else "false"
+
+
+_DEPTH_LIMITS = frozenset({"1", "5", "15", "50", "max"})
+_KLINE_INTERVALS = frozenset({
+    "1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h",
+    "1d", "3d", "1w", "1M",
+})
+_KLINE_TYPES = frozenset({"LAST_PRICE", "MARK_PRICE"})
+_ORDER_SIDES = frozenset({"BUY", "SELL"})
+_TRADE_SIDES = frozenset({"OPEN", "CLOSE"})
+_ORDER_TYPES = frozenset({"LIMIT", "MARKET"})
+_ORDER_EFFECTS = frozenset({"IOC", "FOK", "GTC", "POST_ONLY"})
+_TPSL_STOP_TYPES = frozenset({"MARK_PRICE", "LAST_PRICE"})
+
+
+def _require_one(values: dict[str, Any], names: tuple[str, ...], context: str) -> None:
+    """Require at least one of the official alternative fields."""
+    if not any(values.get(name) not in (None, "") for name in names):
+        raise ValueError(f"{context} requires at least one of {'/'.join(names)}")
+
+
+def _normalise_enum(values: dict[str, Any], field: str, allowed: frozenset[str]) -> None:
+    """Validate and uppercase one documented enum field in-place."""
+    value = values.get(field)
+    if value is None or value == "":
+        return
+    normalised = str(value).strip().upper()
+    if normalised not in allowed:
+        raise ValueError(
+            f"{field} must be one of {', '.join(sorted(allowed))}, got {value!r}")
+    values[field] = normalised
+
+
+def _validate_tpsl_fields(values: dict[str, Any]) -> None:
+    """Validate the documented TP/SL trigger and child-order enums."""
+    _normalise_enum(values, "tpStopType", _TPSL_STOP_TYPES)
+    _normalise_enum(values, "slStopType", _TPSL_STOP_TYPES)
+    _normalise_enum(values, "tpOrderType", _ORDER_TYPES)
+    _normalise_enum(values, "slOrderType", _ORDER_TYPES)
+
+
+def _validate_order_fields(values: dict[str, Any], *, require_symbol: bool) -> None:
+    """Validate one place_order body (or one nested batch_order item).
+
+    The official batch table documents the same child fields as place_order.
+    ``tradeSide`` remains conditional because the docs explicitly say it is
+    required only in hedge mode.
+    """
+    allowed = {p.name for p in ENDPOINTS["place_order"].params}
+    unknown = sorted(set(values) - allowed)
+    if unknown:
+        raise ValueError(f"unknown order parameter(s): {', '.join(unknown)}")
+
+    required = {"qty", "side", "orderType"}
+    if require_symbol:
+        required.add("symbol")
+    missing = sorted(name for name in required if values.get(name) in (None, ""))
+    if missing:
+        raise ValueError(f"order is missing required parameter(s): {', '.join(missing)}")
+
+    for name in ("symbol", "qty", "price", "positionId", "clientId",
+                 "tpPrice", "tpOrderPrice", "slPrice", "slOrderPrice"):
+        value = values.get(name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"order parameter '{name}' must be a string")
+
+    _normalise_enum(values, "side", _ORDER_SIDES)
+    _normalise_enum(values, "tradeSide", _TRADE_SIDES)
+    _normalise_enum(values, "orderType", _ORDER_TYPES)
+    _normalise_enum(values, "effect", _ORDER_EFFECTS)
+    _validate_tpsl_fields(values)
+
+    if values.get("reduceOnly") is not None and not isinstance(values["reduceOnly"], bool):
+        raise ValueError("order parameter 'reduceOnly' must be a boolean")
+
+    order_type = str(values.get("orderType", "")).upper()
+    if order_type == "LIMIT" and values.get("price") in (None, ""):
+        raise ValueError("order parameter 'price' is required for LIMIT orders")
+    if values.get("tpOrderType") == "LIMIT" and values.get("tpOrderPrice") in (None, ""):
+        raise ValueError("order parameter 'tpOrderPrice' is required when tpOrderType is LIMIT")
+    if values.get("slOrderType") == "LIMIT" and values.get("slOrderPrice") in (None, ""):
+        raise ValueError("order parameter 'slOrderPrice' is required when slOrderType is LIMIT")
+    if values.get("tradeSide") == "CLOSE" and values.get("positionId") in (None, ""):
+        raise ValueError("order parameter 'positionId' is required when tradeSide is CLOSE")
 
 
 def order_row(data: Any) -> dict:
@@ -331,9 +416,14 @@ class BitunixClient:
         return await self.request("GET", "/api/v1/futures/market/tickers",
                                   params={"symbols": symbols}, signed=False)
 
-    async def get_depth(self, symbol: str, limit: int = 15) -> Any:
+    async def get_depth(self, symbol: str, limit: str | int = "15") -> Any:
+        limit_s = str(limit).strip().lower()
+        if limit_s not in _DEPTH_LIMITS:
+            raise ValueError(
+                "depth limit must be one of 1, 5, 15, 50, max, "
+                f"got {limit!r}")
         return await self.request("GET", "/api/v1/futures/market/depth",
-                                  params={"symbol": symbol, "limit": limit}, signed=False)
+                                  params={"symbol": symbol, "limit": limit_s}, signed=False)
 
     async def get_kline(self, symbol: str, interval: str, limit: int = 200,
                         end_time: int | None = None, ktype: str = "LAST_PRICE") -> Any:
@@ -354,9 +444,17 @@ class BitunixClient:
           price read from tickers instead.
         - limit defaults to 100, maximum 200 (REST_KLINE_MAX matches).
         """
+        if interval not in _KLINE_INTERVALS:
+            raise ValueError(
+                "kline interval must be one of "
+                f"{', '.join(sorted(_KLINE_INTERVALS))}, got {interval!r}")
+        ktype_s = str(ktype).strip().upper()
+        if ktype_s not in _KLINE_TYPES:
+            raise ValueError(
+                f"kline type must be one of {', '.join(sorted(_KLINE_TYPES))}, got {ktype!r}")
         return await self.request("GET", "/api/v1/futures/market/kline",
                                   params={"symbol": symbol, "interval": interval, "limit": limit,
-                                          "endTime": end_time, "type": ktype}, signed=False)
+                                          "endTime": end_time, "type": ktype_s}, signed=False)
 
     async def get_trading_pairs(self, symbols: str | None = None) -> Any:
         return await self.request("GET", "/api/v1/futures/market/trading_pairs",
@@ -428,8 +526,11 @@ class BitunixClient:
 
     async def change_margin_mode(self, symbol: str, margin_mode: str,
                                  margin_coin: str = "USDT") -> Any:
+        mode = str(margin_mode).strip().upper()
+        if mode not in ("ISOLATION", "CROSS"):
+            raise ValueError("margin_mode must be ISOLATION or CROSS")
         return await self.request("POST", "/api/v1/futures/account/change_margin_mode",
-                                  body={"symbol": symbol, "marginMode": margin_mode.upper(),
+                                  body={"symbol": symbol, "marginMode": mode,
                                         "marginCoin": margin_coin})
 
     async def change_position_mode(self, position_mode: str) -> Any:
@@ -439,8 +540,11 @@ class BitunixClient:
         signature also sent `marginCoin`, which the docs do not list - an
         undocumented extra field.
         """
+        mode = str(position_mode).strip().upper()
+        if mode not in ("ONE_WAY", "HEDGE"):
+            raise ValueError("position_mode must be ONE_WAY or HEDGE")
         return await self.request("POST", "/api/v1/futures/account/change_position_mode",
-                                  body={"positionMode": position_mode.upper()})
+                                  body={"positionMode": mode})
 
     async def get_leverage_and_margin_mode(self, symbol: str,
                                            margin_coin: str = "USDT") -> Any:
@@ -470,6 +574,9 @@ class BitunixClient:
         """
         params: dict[str, Any] = {}
         if symbols:
+            selected = [s for s in symbols.split(",") if s.strip()]
+            if len(selected) > 50:
+                raise ValueError("trading_settings accepts at most 50 symbols")
             params["symbols"] = symbols
         return await self.request("GET", "/api/v1/futures/account/trading_settings",
                                   params=params)
@@ -492,7 +599,10 @@ class BitunixClient:
         if position_id:
             body["positionId"] = str(position_id)
         if side:
-            body["side"] = str(side).upper()
+            side_s = str(side).strip().upper()
+            if side_s not in ("LONG", "SHORT"):
+                raise ValueError("side must be LONG or SHORT")
+            body["side"] = side_s
         return await self.request("POST", "/api/v1/futures/account/adjust_position_margin",
                                   body=body)
 
@@ -557,23 +667,21 @@ class BitunixClient:
 
         Official required: symbol, qty, side, orderType. tradeSide is required
         only in hedge mode. Optional: price, positionId, effect, clientId,
-        reduceOnly, and the tp*/sl* family. The body is passed through verbatim,
-        but the required set is checked first.
+        reduceOnly, and the tp*/sl* family. The body is checked against the
+        official field names, required set, types, enums, and LIMIT-only rules
+        before it can reach the exchange.
         """
-        missing = [k for k in self.PLACE_ORDER_REQUIRED if not kwargs.get(k)]
-        if missing:
-            raise ValueError(
-                f"place_order is missing required parameter(s): {', '.join(missing)} "
-                f"(official required: {', '.join(self.PLACE_ORDER_REQUIRED)})")
+        body = dict(kwargs)
+        _validate_order_fields(body, require_symbol=True)
         return order_row(await self.request("POST", "/api/v1/futures/trade/place_order",
-                                            body=kwargs))
+                                            body=body))
 
     async def batch_order(self, symbol: str, order_list: list[dict]) -> Any:
         """Batch place orders.
 
         Official: `symbol` AND `orderList` are BOTH required, and orderList has
-        a maximum length of 5. The old signature sent only orderList, so every
-        batch call was missing a required parameter.
+        a maximum length of 5. Every item has the same documented child fields
+        as place_order, including required qty, side and orderType values.
         """
         if not symbol:
             raise ValueError("batch_order requires symbol (official: required)")
@@ -582,8 +690,15 @@ class BitunixClient:
         if len(order_list) > 5:
             raise ValueError(
                 f"batch_order accepts at most 5 orders, got {len(order_list)}")
+        orders: list[dict[str, Any]] = []
+        for index, item in enumerate(order_list):
+            if not isinstance(item, dict):
+                raise ValueError(f"batch_order item {index} must be an object")
+            order = dict(item)
+            _validate_order_fields(order, require_symbol=False)
+            orders.append(order)
         return await self.request("POST", "/api/v1/futures/trade/batch_order",
-                                  body={"symbol": symbol, "orderList": order_list})
+                                  body={"symbol": symbol, "orderList": orders})
 
     async def cancel_orders(self, symbol: str, order_list: list[dict] | None = None,
                             order_id: str | None = None,
@@ -624,17 +739,25 @@ class BitunixClient:
         """Modify a pending order.
 
         Official required: qty, price. Optional: orderId or clientId (one of
-        them identifies the order), plus the tp*/sl* family.
+        them identifies the order), plus the tp*/sl* family. Unknown fields are
+        refused instead of being forwarded to the exchange.
         """
-        missing = [k for k in self.MODIFY_ORDER_REQUIRED if not kwargs.get(k)]
-        if missing:
+        errors = ENDPOINTS["modify_order"].validate(kwargs)
+        if errors:
             raise ValueError(
-                f"modify_order is missing required parameter(s): {', '.join(missing)} "
+                f"modify_order contract error: {'; '.join(errors)} "
                 f"(official required: {', '.join(self.MODIFY_ORDER_REQUIRED)})")
         if not kwargs.get("orderId") and not kwargs.get("clientId"):
             raise ValueError("modify_order needs orderId or clientId")
+        body = dict(kwargs)
+        for name in ("qty", "price", "orderId", "clientId", "tpPrice",
+                     "tpOrderPrice", "slPrice", "slOrderPrice"):
+            value = body.get(name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"order parameter '{name}' must be a string")
+        _validate_tpsl_fields(body)
         return order_row(await self.request("POST", "/api/v1/futures/trade/modify_order",
-                                            body=kwargs))
+                                            body=body))
 
     async def get_pending_orders(self, symbol: str | None = None, *, skip: int = 0,
                                  limit: int = 20, order_id: str | None = None,
@@ -693,6 +816,14 @@ class BitunixClient:
 
     async def get_order_detail(self, order_id: str | None = None,
                                client_id: str | None = None) -> Any:
+        """One order by id - official: at least one of orderId/clientId.
+
+        The official table marks both optional but the prose is explicit:
+        "At least one of orderId or clientId is required". Refuse a lookup
+        with neither instead of sending a doomed query.
+        """
+        _require_one({"orderId": order_id, "clientId": client_id},
+                     ("orderId", "clientId"), "get_order_detail")
         return await self.request("GET", "/api/v1/futures/trade/get_order_detail",
                                   params={"orderId": order_id, "clientId": client_id})
 
@@ -782,7 +913,13 @@ class BitunixClient:
                                          sl_price: str | None = None,
                                          tp_stop_type: str = "MARK_PRICE",
                                          sl_stop_type: str = "MARK_PRICE") -> Any:
-        """Position TP/SL - closes the ENTIRE position. One per position."""
+        """Position TP/SL - closes the ENTIRE position. One per position.
+
+        Official: at least one of tpPrice/slPrice is required - an exit
+        needs SOME trigger.
+        """
+        _require_one({"tpPrice": tp_price, "slPrice": sl_price},
+                     ("tpPrice", "slPrice"), "place_position_tp_sl_order")
         body: dict[str, Any] = {"symbol": symbol, "positionId": position_id,
                                 "tpStopType": tp_stop_type, "slStopType": sl_stop_type}
         if tp_price:
@@ -803,7 +940,13 @@ class BitunixClient:
                                  sl_order_price: str | None = None,
                                  tp_qty: str | None = None,
                                  sl_qty: str | None = None) -> Any:
-        """Modify a standalone TP/SL order. Official: `orderId` required."""
+        """Modify a standalone TP/SL order. Official: `orderId` required.
+
+        Official: at least one of tpPrice/slPrice is required - a stop with
+        no trigger cannot be written.
+        """
+        _require_one({"tpPrice": tp_price, "slPrice": sl_price},
+                     ("tpPrice", "slPrice"), "modify_tp_sl_order")
         body: dict[str, Any] = {"orderId": str(order_id)}
         if tp_price is not None and tp_price != "":
             body["tpPrice"] = str(tp_price)
@@ -832,6 +975,11 @@ class BitunixClient:
                                           sl_price: str | None = None,
                                           tp_stop_type: str | None = None,
                                           sl_stop_type: str | None = None) -> Any:
+        """Move/replace the position TP/SL. Official: at least one of
+        tpPrice/slPrice is required - an exit with no trigger is meaningless.
+        """
+        _require_one({"tpPrice": tp_price, "slPrice": sl_price},
+                     ("tpPrice", "slPrice"), "modify_position_tp_sl_order")
         body: dict[str, Any] = {"symbol": symbol, "positionId": position_id}
         if tp_price:
             body["tpPrice"] = str(tp_price)

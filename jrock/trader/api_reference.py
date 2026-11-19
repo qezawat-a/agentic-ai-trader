@@ -37,7 +37,8 @@ class Endpoint:
     doc: str = ""
 
     def validate(self, kwargs: dict) -> list[str]:
-        missing = [p.name for p in self.params if p.required and p.name not in kwargs]
+        missing = [p.name for p in self.params
+                   if p.required and kwargs.get(p.name) in (None, "")]
         unknown = [k for k in kwargs if k not in {p.name for p in self.params}]
         errs = []
         if missing:
@@ -64,7 +65,9 @@ _add(Endpoint("get_tickers", "GET", "/api/v1/futures/market/tickers", False,
               [_p("symbols", "string", False, "BTCUSDT,ETHUSDT")], "get_tickers.md"))
 _add(Endpoint("get_depth", "GET", "/api/v1/futures/market/depth", False,
               "10 req/sec/ip", "Order book depth",
-              [_p("symbol", "string", True), _p("limit", "int", False, "default 15")], "get_depth.md"))
+              [_p("symbol", "string", True),
+               _p("limit", "string", False, "1 | 5 | 15 | 50 | max")],
+              "get_depth.md"))
 _add(Endpoint("get_kline", "GET", "/api/v1/futures/market/kline", False,
               "10 req/sec/ip", "Klines (closed candles only; startTime is NOT supported)",
               [_p("symbol", "string", True), _p("interval", "string", True,
@@ -171,7 +174,10 @@ _add(Endpoint("place_order", "POST", "/api/v1/futures/trade/place_order", True,
               "place_order.md"))
 _add(Endpoint("batch_order", "POST", "/api/v1/futures/trade/batch_order", True,
               "2 req/sec/uid", "Batch place orders (orderList max 5)",
-              [_p("symbol", "string", True), _p("orderList", "array", True)],
+              [_p("symbol", "string", True),
+               _p("orderList", "array", True,
+                  "each item requires qty, side and orderType; tradeSide is "
+                  "required only in hedge mode")],
               "batch_order.md"))
 _add(Endpoint("cancel_orders", "POST", "/api/v1/futures/trade/cancel_orders", True,
               "10 req/sec/uid",
@@ -190,7 +196,7 @@ _add(Endpoint("modify_order", "POST", "/api/v1/futures/trade/modify_order", True
               "20 req/sec/uid", "Modify a pending order (orderId or clientId required)",
               [_p("orderId", "string", False), _p("clientId", "string", False),
                _p("qty", "string", True, "amount (base coin)"),
-               _p("price", "string", False, "required for LIMIT"),
+               _p("price", "string", True, "required by the docs (required for LIMIT)"),
                _p("tpPrice", "string", False), _p("tpStopType", "string", False),
                _p("tpOrderType", "string", False), _p("tpOrderPrice", "string", False),
                _p("slPrice", "string", False), _p("slStopType", "string", False),
@@ -220,7 +226,8 @@ _add(Endpoint("get_history_orders", "GET", "/api/v1/futures/trade/get_history_or
               "get_history_orders.md"))
 _add(Endpoint("get_order_detail", "GET", "/api/v1/futures/trade/get_order_detail", True,
               "10 req/sec/uid", "One order by id (orderId OR clientId required)",
-              [_p("orderId", "string", False), _p("clientId", "string", False)],
+              [_p("orderId", "string", False, "at least one of orderId/clientId is required"),
+               _p("clientId", "string", False, "at least one of orderId/clientId is required")],
               "get_order_detail.md"))
 _add(Endpoint("get_history_trades", "GET", "/api/v1/futures/trade/get_history_trades", True,
               "10 req/sec/uid", "Fill history",

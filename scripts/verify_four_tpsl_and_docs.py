@@ -135,7 +135,7 @@ async def main() -> int:
     print(f"    GET  {calls[-1]['path']}")
     print(f"    {json.dumps(calls[-1]['params'])}")
 
-    await c.batch_order("AKEUSDT", [{"qty": "1", "side": "BUY"}])
+    await c.batch_order("AKEUSDT", [{"qty": "1", "side": "BUY", "orderType": "MARKET"}])
     print("  BATCH ORDER (symbol AND orderList, max 5):")
     print(f"    POST {calls[-1]['path']}")
     print(f"    {json.dumps(calls[-1]['body'])}")

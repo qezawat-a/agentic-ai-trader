@@ -82,10 +82,10 @@ def test_cancel_tp_sl_signature_refuses_a_missing_symbol():
 def test_batch_order_sends_symbol_and_orderlist():
     """Was orderList only - symbol is a REQUIRED parameter."""
     c, calls = _client()
-    asyncio.run(c.batch_order("BTCUSDT", [{"qty": "1"}]))
+    asyncio.run(c.batch_order("BTCUSDT", [{"qty": "1", "side": "BUY", "orderType": "MARKET"}]))
     body = calls[0]["body"]
     assert body["symbol"] == "BTCUSDT"
-    assert body["orderList"] == [{"qty": "1"}]
+    assert body["orderList"] == [{"qty": "1", "side": "BUY", "orderType": "MARKET"}]
 
 
 def test_batch_order_refuses_more_than_five_orders():
@@ -99,6 +99,31 @@ def test_batch_order_refuses_an_empty_list():
     c, _ = _client()
     with pytest.raises(ValueError, match="non-empty"):
         asyncio.run(c.batch_order("BTCUSDT", []))
+
+
+def test_batch_order_refuses_a_child_missing_required_fields():
+    """Every orderList child needs qty, side and orderType (official)."""
+    c, _ = _client()
+    with pytest.raises(ValueError, match="missing required"):
+        asyncio.run(c.batch_order("BTCUSDT", [{"qty": "1"}]))
+    with pytest.raises(ValueError, match="missing required"):
+        asyncio.run(c.batch_order("BTCUSDT", [{"side": "BUY", "orderType": "MARKET"}]))
+
+
+def test_batch_order_refuses_a_limit_child_without_price():
+    """orderType=LIMIT requires the child price (official: required if LIMIT)."""
+    c, _ = _client()
+    with pytest.raises(ValueError, match="price"):
+        asyncio.run(c.batch_order("BTCUSDT",
+                                  [{"qty": "1", "side": "BUY", "orderType": "LIMIT"}]))
+
+
+def test_batch_order_refuses_unknown_child_parameters():
+    c, _ = _client()
+    with pytest.raises(ValueError, match="unknown order parameter"):
+        asyncio.run(c.batch_order("BTCUSDT",
+                                  [{"qty": "1", "side": "BUY", "orderType": "MARKET",
+                                    "bogus": 1}]))
 
 
 # ==================================================== adjust_position_margin
@@ -266,6 +291,71 @@ def test_api_reference_place_tp_sl_documents_tpqty():
     ep = ar.ENDPOINTS["place_tp_sl_order"]
     names = {p.name for p in ep.params}
     assert {"tpQty", "slQty", "tpStopType", "slStopType"} <= names
+
+
+# ==================================================== conditional requirements
+def test_get_order_detail_requires_one_of_orderid_or_clientid():
+    """Official: at least one of orderId/clientId is required."""
+    c, calls = _client()
+    with pytest.raises(ValueError, match="get_order_detail requires at least one of orderId/clientId"):
+        asyncio.run(c.get_order_detail())
+    asyncio.run(c.get_order_detail(order_id="T9"))
+    assert calls[0]["params"]["orderId"] == "T9"
+    asyncio.run(c.get_order_detail(client_id="c9"))
+    assert calls[1]["params"]["clientId"] == "c9"
+
+
+def test_get_order_detail_accepts_both_ids():
+    c, calls = _client()
+    asyncio.run(c.get_order_detail(order_id="T9", client_id="c9"))
+    assert calls[0]["params"]["orderId"] == "T9"
+    assert calls[0]["params"]["clientId"] == "c9"
+
+
+def test_place_position_tp_sl_requires_a_trigger():
+    """Official: at least one of tpPrice/slPrice is required."""
+    c, calls = _client()
+    with pytest.raises(ValueError, match="place_position_tp_sl_order requires at least one of tpPrice/slPrice"):
+        asyncio.run(c.place_position_tp_sl_order("AKEUSDT", "P1"))
+    asyncio.run(c.place_position_tp_sl_order("AKEUSDT", "P1", tp_price="0.006", sl_price="0.004"))
+    body = calls[0]["body"]
+    assert body["tpPrice"] == "0.006" and body["slPrice"] == "0.004"
+    assert body["positionId"] == "P1"
+
+
+def test_modify_position_tp_sl_requires_a_trigger():
+    c, _ = _client()
+    with pytest.raises(ValueError, match="modify_position_tp_sl_order requires at least one of tpPrice/slPrice"):
+        asyncio.run(c.modify_position_tp_sl_order("AKEUSDT", "P1", tp_price=None, sl_price=None))
+
+
+def test_modify_position_tp_sl_accepts_a_single_trigger():
+    c, calls = _client()
+    asyncio.run(c.modify_position_tp_sl_order("AKEUSDT", "P1", sl_price="0.004"))
+    assert calls[0]["body"]["slPrice"] == "0.004"
+
+
+def test_modify_tp_sl_requires_a_trigger():
+    c, _ = _client()
+    with pytest.raises(ValueError, match="modify_tp_sl_order requires at least one of tpPrice/slPrice"):
+        asyncio.run(c.modify_tp_sl_order("T1"))
+
+
+def test_place_order_requires_the_official_set_and_a_limit_price():
+    """Official: symbol, qty, side, orderType required; price required for LIMIT."""
+    c, calls = _client()
+    with pytest.raises(ValueError, match="missing required"):
+        asyncio.run(c.place_order(qty="1", side="BUY", orderType="MARKET"))
+    asyncio.run(c.place_order(symbol="BTCUSDT", qty="1", side="BUY", orderType="MARKET"))
+    assert calls[0]["body"]["orderType"] == "MARKET"
+    with pytest.raises(ValueError, match="price"):
+        asyncio.run(c.place_order(symbol="BTCUSDT", qty="1", side="BUY", orderType="LIMIT"))
+
+
+def test_place_order_refuses_unknown_parameters():
+    c, _ = _client()
+    with pytest.raises(ValueError, match="unknown order parameter"):
+        asyncio.run(c.place_order(symbol="BTCUSDT", qty="1", side="BUY", orderType="MARKET", bogus=1))
 
 
 # ==================================================== private WS channel
@@ -710,7 +800,7 @@ def test_api_reference_modify_order_requires_qty():
 
     names = {p.name: p for p in ar.ENDPOINTS["modify_order"].params}
     assert names["qty"].required, "qty is required by the docs"
-    assert not names["price"].required, "price is only required for LIMIT"
+    assert names["price"].required, "price is required by the docs (required for LIMIT)"
     assert not names["orderId"].required and not names["clientId"].required
 
 
