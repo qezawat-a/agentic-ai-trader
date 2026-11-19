@@ -184,6 +184,34 @@ def test_checker_fails_on_a_deliberately_broken_parameter(tmp_path):
     assert "symbol" in out.stdout
 
 
+def test_checker_fails_on_an_http_method_mismatch(tmp_path):
+    """The audit must compare the HTTP verb, not just the path."""
+    src = open(CLIENT, encoding="utf-8").read()
+    broken = src.replace(
+        'return await self.request("GET", "/api/v1/futures/market/kline",',
+        'return await self.request("POST", "/api/v1/futures/market/kline",')
+    assert broken != src, "the anchor text moved; update this test"
+
+    fake_root = tmp_path / "repo"
+    (fake_root / "jrock" / "trader").mkdir(parents=True)
+    (fake_root / "docs").mkdir()
+    (fake_root / "jrock" / "trader" / "client.py").write_text(broken)
+    (fake_root / "docs" / "bitunix_api_contract.json").write_text(
+        open(CONTRACT, encoding="utf-8").read())
+
+    script = open(CHECKER, encoding="utf-8").read()
+    script = script.replace(
+        'ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))',
+        f'ROOT = {str(fake_root)!r}')
+    path = tmp_path / "checker.py"
+    path.write_text(script)
+
+    out = subprocess.run([sys.executable, str(path), "--strict"],
+                         capture_output=True, text=True)
+    assert out.returncode == 1, "the checker did not fail on a wrong HTTP method"
+    assert "METHOD MISMATCH" in out.stdout
+
+
 def test_checker_fails_when_a_documented_optional_param_is_unreachable(tmp_path):
     """Optional params are coverage-checked too: renaming a documented
     optional field away from the client must fail the build."""

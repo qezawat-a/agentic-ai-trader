@@ -316,6 +316,10 @@ def audit() -> dict:
             status = "EXTRA-PARAM"
         elif unsent_opt:
             status = "UNSUPPORTED-PARAM"
+        # The client may call the right path with the wrong HTTP verb - that
+        # is a contract bug too, and the report must not call it OK.
+        if impl is not None and c["method"] != e["method"]:
+            status = "METHOD-MISMATCH"
 
         results.append(
             {
@@ -323,7 +327,7 @@ def audit() -> dict:
                 "title": e["title"],
                 "method": e["method"],
                 "status": status,
-                "client_method": c["method"],
+                "client_method": c["func"],
                 "client_lineno": c["lineno"],
                 "doc_required": sorted(doc_req_top),
                 "doc_optional": sorted(doc_opt_top),
@@ -338,7 +342,7 @@ def audit() -> dict:
     missing = [r for r in results if r["status"] == "MISSING"]
     oos = [r for r in results if r["status"] == "OUT-OF-SCOPE"]
     bad = [r for r in results if r["status"] in ("MISSING-REQUIRED", "EXTRA-PARAM",
-                                                 "UNSUPPORTED-PARAM")]
+                                                 "UNSUPPORTED-PARAM", "METHOD-MISMATCH")]
 
     return {
         "contract_endpoints": len([e for e in contract["endpoints"] if e["kind"] == "rest"]),
@@ -382,6 +386,9 @@ def main() -> int:
             if r.get("unsupported_optional"):
                 print(f"    DOCUMENTED PARAMS WITH NO ROUTE THROUGH CODE: "
                       f"{r['unsupported_optional']}")
+            if r.get("status") == "METHOD-MISMATCH":
+                print(f"    HTTP METHOD MISMATCH: client used {r.get('client_method')} "
+                      f"but the contract says {r.get('method')}")
             print()
 
     if args.strict and (rep["missing"] or rep["mismatched"]):

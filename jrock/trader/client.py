@@ -67,7 +67,7 @@ def _wire_bool(v: bool | None) -> str | None:
 
 _DEPTH_LIMITS = frozenset({"1", "5", "15", "50", "max"})
 _KLINE_INTERVALS = frozenset({
-    "1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h",
+    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h",
     "1d", "3d", "1w", "1M",
 })
 _KLINE_TYPES = frozenset({"LAST_PRICE", "MARK_PRICE"})
@@ -76,6 +76,9 @@ _TRADE_SIDES = frozenset({"OPEN", "CLOSE"})
 _ORDER_TYPES = frozenset({"LIMIT", "MARKET"})
 _ORDER_EFFECTS = frozenset({"IOC", "FOK", "GTC", "POST_ONLY"})
 _TPSL_STOP_TYPES = frozenset({"MARK_PRICE", "LAST_PRICE"})
+_PENDING_ORDER_STATUSES = frozenset({"NEW", "PART_FILLED"})
+_HISTORY_ORDER_STATUSES = frozenset(
+    {"FILLED", "CANCELED", "PART_FILLED_CANCELED", "EXPIRED"})
 
 
 def _require_one(values: dict[str, Any], names: tuple[str, ...], context: str) -> None:
@@ -756,6 +759,12 @@ class BitunixClient:
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"order parameter '{name}' must be a string")
         _validate_tpsl_fields(body)
+        if body.get("tpOrderType") == "LIMIT" and body.get("tpOrderPrice") in (None, ""):
+            raise ValueError(
+                "order parameter 'tpOrderPrice' is required when tpOrderType is LIMIT")
+        if body.get("slOrderType") == "LIMIT" and body.get("slOrderPrice") in (None, ""):
+            raise ValueError(
+                "order parameter 'slOrderPrice' is required when slOrderType is LIMIT")
         return order_row(await self.request("POST", "/api/v1/futures/trade/modify_order",
                                             body=body))
 
@@ -780,6 +789,12 @@ class BitunixClient:
         ``len(orders)`` count keys instead of orders. Normalising at the client
         boundary means every caller gets the same shape the tests stub.
         """
+        if status is not None:
+            st = str(status).strip().upper()
+            if st not in _PENDING_ORDER_STATUSES:
+                raise ValueError(
+                    f"status must be one of {', '.join(sorted(_PENDING_ORDER_STATUSES))}, got {status!r}")
+            status = st
         data = await self.request("GET", "/api/v1/futures/trade/get_pending_orders",
                                   params={"symbol": symbol, "skip": skip, "limit": limit,
                                           "orderId": order_id, "clientId": client_id,
@@ -805,12 +820,23 @@ class BitunixClient:
         only). `status` and `type` are upper-cased; `queryCanceled` goes on the
         wire as ``true``/``false``.
         """
+        if status is not None:
+            st = str(status).strip().upper()
+            if st not in _HISTORY_ORDER_STATUSES:
+                raise ValueError(
+                    f"status must be one of {', '.join(sorted(_HISTORY_ORDER_STATUSES))}, got {status!r}")
+            status = st
+        if order_type is not None:
+            ot = str(order_type).strip().upper()
+            if ot not in _ORDER_TYPES:
+                raise ValueError(
+                    f"type must be one of {', '.join(sorted(_ORDER_TYPES))}, got {order_type!r}")
+            order_type = ot
         return await self.request("GET", "/api/v1/futures/trade/get_history_orders",
                                   params={"symbol": symbol, "skip": skip, "limit": limit,
                                           "startTime": start_time, "endTime": end_time,
                                           "orderId": order_id, "clientId": client_id,
-                                          "status": status.upper() if status else None,
-                                          "type": order_type.upper() if order_type else None,
+                                          "status": status, "type": order_type,
                                           "subAccountId": sub_account_id,
                                           "queryCanceled": _wire_bool(query_canceled)})
 
@@ -902,6 +928,7 @@ class BitunixClient:
             raise ValueError("place_tp_sl_order needs at least one of tpPrice/slPrice")
         if "tpQty" not in body and "slQty" not in body:
             raise ValueError("place_tp_sl_order needs at least one of tpQty/slQty")
+        _validate_tpsl_fields(body)
         # The live server answers this endpoint with an ARRAY (the official
         # demo types it `List<OrderIdResp>`); the doc page shows an object.
         # `order_row` collapses both into one dict.
@@ -926,6 +953,7 @@ class BitunixClient:
             body["tpPrice"] = str(tp_price)
         if sl_price:
             body["slPrice"] = str(sl_price)
+        _validate_tpsl_fields(body)
         return order_row(await self.request("POST", "/api/v1/futures/tpsl/position/place_order",
                                             body=body))
 
@@ -943,10 +971,13 @@ class BitunixClient:
         """Modify a standalone TP/SL order. Official: `orderId` required.
 
         Official: at least one of tpPrice/slPrice is required - a stop with
-        no trigger cannot be written.
+        no trigger cannot be written - AND at least one of tpQty/slQty is
+        required, exactly like the place endpoint.
         """
         _require_one({"tpPrice": tp_price, "slPrice": sl_price},
                      ("tpPrice", "slPrice"), "modify_tp_sl_order")
+        _require_one({"tpQty": tp_qty, "slQty": sl_qty},
+                     ("tpQty", "slQty"), "modify_tp_sl_order")
         body: dict[str, Any] = {"orderId": str(order_id)}
         if tp_price is not None and tp_price != "":
             body["tpPrice"] = str(tp_price)
@@ -968,6 +999,7 @@ class BitunixClient:
             body["tpQty"] = str(tp_qty)
         if sl_qty is not None and sl_qty != "":
             body["slQty"] = str(sl_qty)
+        _validate_tpsl_fields(body)
         return order_row(await self.request("POST", "/api/v1/futures/tpsl/modify_order", body=body))
 
     async def modify_position_tp_sl_order(self, symbol: str, position_id: str,
@@ -992,6 +1024,7 @@ class BitunixClient:
             body["tpStopType"] = str(tp_stop_type).upper()
         if sl_stop_type:
             body["slStopType"] = str(sl_stop_type).upper()
+        _validate_tpsl_fields(body)
         return order_row(await self.request("POST", "/api/v1/futures/tpsl/position/modify_order",
                                             body=body))
 

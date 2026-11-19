@@ -358,6 +358,48 @@ def test_place_order_refuses_unknown_parameters():
         asyncio.run(c.place_order(symbol="BTCUSDT", qty="1", side="BUY", orderType="MARKET", bogus=1))
 
 
+def test_kline_accepts_the_documented_3m_interval():
+    """The official REST enum includes 3m - the engine default timeframe set
+    uses it, and the old client enum did not, which aborted the scan loop."""
+    c, calls = _client()
+    asyncio.run(c.get_kline("BTCUSDT", "3m", limit=10))
+    assert calls[0]["params"]["interval"] == "3m"
+
+
+def test_modify_tp_sl_requires_a_quantity_too():
+    """modify_tp_sl_order enforces BOTH official groups: a trigger AND a qty."""
+    c, _ = _client()
+    with pytest.raises(ValueError, match="modify_tp_sl_order requires at least one of tpQty/slQty"):
+        asyncio.run(c.modify_tp_sl_order("T1", tp_price="0.006"))
+    asyncio.run(c.modify_tp_sl_order("T1", tp_price="0.006", tp_qty="100"))
+    asyncio.run(c.modify_tp_sl_order("T1", sl_price="0.004", sl_qty="100"))
+
+
+def test_modify_order_requires_the_child_limit_prices():
+    c, _ = _client()
+    with pytest.raises(ValueError, match="tpOrderPrice' is required when tpOrderType is LIMIT"):
+        asyncio.run(c.modify_order(orderId="1", qty="1", price="0.005", tpOrderType="LIMIT"))
+    with pytest.raises(ValueError, match="slOrderPrice' is required when slOrderType is LIMIT"):
+        asyncio.run(c.modify_order(orderId="1", qty="1", price="0.005", slOrderType="LIMIT"))
+
+
+def test_place_tp_sl_rejects_an_unknown_stop_type():
+    c, _ = _client()
+    with pytest.raises(ValueError, match="tpStopType must be one of"):
+        asyncio.run(c.place_tp_sl_order("AKEUSDT", "P1", tp_price="0.006", tp_stop_type="BOGUS",
+                                      tp_qty="100"))
+
+
+def test_order_list_filters_reject_unknown_enums():
+    c, _ = _client()
+    with pytest.raises(ValueError, match="status must be one of"):
+        asyncio.run(c.get_pending_orders(symbol="BTCUSDT", status="WEIRD"))
+    with pytest.raises(ValueError, match="status must be one of"):
+        asyncio.run(c.get_history_orders(symbol="BTCUSDT", status="WEIRD"))
+    with pytest.raises(ValueError, match="type must be one of"):
+        asyncio.run(c.get_history_orders(symbol="BTCUSDT", order_type="WEIRD"))
+
+
 # ==================================================== private WS channel
 def test_private_feed_subscribes_all_four_private_channels():
     """PRIVATE_CHANNELS was defined but never subscribed - only printed."""

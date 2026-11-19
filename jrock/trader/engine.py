@@ -862,6 +862,11 @@ class TraderEngine:
                     return Aggregate(symbol=symbol)
                 self.state.errors.append(f"kline {symbol} {tf}: {e}")
                 continue
+            except ValueError as e:
+                # A local contract violation (e.g. an interval the client no
+                # longer accepts) must degrade this timeframe, not the scan.
+                self.state.errors.append(f"kline {symbol} {tf}: {type(e).__name__}: {e}")
+                continue
             if not candles:
                 continue
             sigs = []
