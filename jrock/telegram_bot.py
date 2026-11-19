@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import contextlib
 import html
+import json
 import logging
 import os
 import re
@@ -396,6 +397,63 @@ def render_help() -> str:
 HELP = render_help()
 
 
+def render_trade_alert(rec: dict) -> str:
+    """One chat message for a trade-log event.
+
+    `open` and `close` are the engine's own actions; `closed_on_exchange` is a
+    native TP/SL hit (or a manual close) noticed during reconciliation;
+    `close_failed` is the one failure the operator must see immediately.
+    """
+    ev = str(rec.get("event") or "")
+    sym = _e(rec.get("symbol") or "?")
+    pid = rec.get("position_id")
+
+    if ev == "open":
+        plan = rec.get("plan") or {}
+        lines = ["<b>POSITION OPENED</b>", f"{sym} {_e(rec.get('side'))}",
+                 f"qty {_e(rec.get('qty'))} @ {_e(rec.get('entry'))}"]
+        conf = rec.get("confidence")
+        if conf is not None:
+            extra = f"confidence {_e(conf)}%"
+            if rec.get("strength"):
+                extra += f" ({_e(rec.get('strength'))})"
+            if rec.get("agreeing") is not None:
+                extra += f", {_e(rec.get('agreeing'))} agreeing"
+            lines.append(extra)
+        if plan.get("sl") is not None and plan.get("tp") is not None:
+            lines.append(f"SL {_e(plan.get('sl'))}  TP {_e(plan.get('tp'))}")
+        if rec.get("order_id"):
+            lines.append(f"order {_e(rec.get('order_id'))}")
+        return "\n".join(lines)
+
+    if ev == "closed_on_exchange":
+        lines = ["<b>POSITION CLOSED ON EXCHANGE</b>",
+                 f"{sym} {_e(rec.get('side'))}".rstrip(),
+                 f"qty {_e(rec.get('qty'))} @ {_e(rec.get('entry'))}",
+                 "the exchange no longer reports it open (TP/SL or manual close)"]
+        if pid:
+            lines.append(f"position {_e(pid)}")
+        return "\n".join(lines)
+
+    if ev == "close_failed":
+        lines = ["<b>CLOSE FAILED</b>", sym]
+        if pid:
+            lines.append(f"position {_e(pid)}")
+        if rec.get("reason"):
+            lines.append(f"reason: {_e(rec.get('reason'))}")
+        if rec.get("error"):
+            lines.append(f"error: {_e(rec.get('error'))}")
+        return "\n".join(lines)
+
+    lines = ["<b>POSITION CLOSED</b>", sym]
+    if pid:
+        lines.append(f"position {_e(pid)}")
+    lines.append(f"reason: {_e(rec.get('reason') or 'unknown')}")
+    if rec.get("via"):
+        lines.append(f"via {_e(rec.get('via'))}")
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------ the bot app
 def _allowed_chats_from_env() -> set[int]:
     """TELEGRAM_ALLOWED_CHATS as chat ids. Empty = answer any chat."""
@@ -406,6 +464,16 @@ def _allowed_chats_from_env() -> set[int]:
 #: Floor for the report cadence, so a mistyped interval cannot turn the bot
 #: into a Telegram flood.
 REPORT_MIN_INTERVAL = 5
+
+#: How often the bot checks the trade log for new open/close events. The file
+#: is local and tiny, so polling it is cheaper than holding a second exchange
+#: connection just to notice a closed position.
+ALERT_POLL_SEC = 2.0
+
+#: Trade-log events the operator must hear about without asking. `open` and
+#: `close` are the engine's own actions; `closed_on_exchange` is a native
+#: TP/SL hit (or a manual close) that the engine noticed while reconciling.
+ALERT_EVENTS = {"open", "close", "closed_on_exchange", "close_failed"}
 
 
 class JRockTelegramApp:
@@ -426,6 +494,9 @@ class JRockTelegramApp:
         #: list is every allowed chat that has actually drawn a reply.
         self.chats: set[int | str] = set()
         self.allowed_chats = _allowed_chats_from_env()
+        #: Byte offset into data/trades.jsonl. None means "not polled yet":
+        #: the first poll starts at EOF, so a restart never replays old trades.
+        self._alert_offset: int | None = None
 
     def _chat_allowed(self, chat_id: int | str) -> bool:
         return not self.allowed_chats or chat_id in self.allowed_chats
@@ -577,6 +648,76 @@ class JRockTelegramApp:
                 log.exception("telegram report push failed")
             await asyncio.sleep(self._report_interval())
 
+    # ------------------------------------------------------ trade -> telegram
+    async def trade_alert_loop(self) -> None:
+        """Push an alert when a position opens or closes.
+
+        Reads the engine's own trade log, so the alert is the same event that
+        was recorded for the trade - no second source that can disagree. The
+        loop is independent of `report on`: a report is periodic, an alert is
+        an event.
+        """
+        while True:
+            try:
+                await self._push_trade_alerts_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("telegram trade alert push failed")
+            await asyncio.sleep(ALERT_POLL_SEC)
+
+    async def _push_trade_alerts_once(self) -> int:
+        """Send every new alert-worthy trade-log line. Returns how many.
+
+        Three deliberate rules:
+        * the first poll starts at EOF - a restart is not a replay;
+        * with no known chat the events are consumed silently, so the first
+          `/start` does not dump hours of history into the chat;
+        * only complete lines are consumed - a half-written JSON line waits
+          for the next poll.
+        """
+        eng = getattr(self.agent, "engine", None)
+        path = getattr(eng, "trades_path", None) if eng is not None else None
+        if path is None:
+            return 0
+        size = path.stat().st_size if path.exists() else 0
+        if self._alert_offset is None:
+            # First poll: start at EOF so a restart is not a replay. A missing
+            # file starts at 0 - the first event written later IS new.
+            self._alert_offset = size
+            return 0
+        if not path.exists():
+            return 0
+        if size < self._alert_offset:          # rotated or truncated
+            self._alert_offset = 0
+        if size == self._alert_offset:
+            return 0
+
+        with path.open("rb") as fh:
+            fh.seek(self._alert_offset)
+            data = fh.read(size - self._alert_offset)
+        end = data.rfind(b"\n")
+        if end < 0:                            # half-written line; wait
+            return 0
+        chunk = data[: end + 1]
+        self._alert_offset += len(chunk)
+
+        sent = 0
+        for raw in chunk.splitlines():
+            if not raw.strip():
+                continue
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("event") not in ALERT_EVENTS or not self.chats:
+                continue
+            body = render_trade_alert(rec)
+            for chat_id in sorted(self.chats, key=str):
+                await self.bot.send(chat_id, body, markdown=True)
+            sent += 1
+        return sent
+
     async def run(self, *, once: bool = False) -> None:
         me = await self.bot.get_me()
         log.info("connected as @%s", me.get("username"))
@@ -600,6 +741,8 @@ class JRockTelegramApp:
                   "that writes to the bot", flush=True)
         pusher = asyncio.create_task(self.report_push_loop(),
                                      name="telegram-report-push")
+        alerts = asyncio.create_task(self.trade_alert_loop(),
+                                     name="telegram-trade-alerts")
         offset: int | None = None
         try:
             while True:
@@ -630,9 +773,12 @@ class JRockTelegramApp:
                 if once:
                     return
         finally:
-            pusher.cancel()
+            for task in (alerts, pusher):
+                task.cancel()
             # Awaiting a cancelled task raises CancelledError (a BaseException,
             # deliberately not an Exception) - suppress exactly that.
+            with contextlib.suppress(asyncio.CancelledError):
+                await alerts
             with contextlib.suppress(asyncio.CancelledError):
                 await pusher
 

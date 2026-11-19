@@ -97,10 +97,11 @@ The first message from the operator's chat prints that chat id. Put it in
 any chat that finds the bot, or several chats as `id1,id2`). A chat not in the list
 gets no reply at all - not even an error.
 
-### Menu commands (10)
+### Menu commands
 
-The commands are published to Telegram's Menu button at startup, so they are visible
-without typing `help` first, and the most-used ride on a permanent reply keyboard:
+The full command list is published to Telegram's Menu button at startup, so it is
+visible without typing `help` first. The 10 engine commands are the ones used every
+minute:
 
 | Command | What it does |
 |---|---|
@@ -136,6 +137,23 @@ report on                 -> reports are PUSHED to the chat every report_interva
   flood Telegram.
 - Report generation failures are logged and absorbed; the next interval just tries
   again.
+
+### Trade alerts
+
+The bot watches the engine's own trade log (`data/trades.jsonl`) and pushes a
+message the moment a position opens or closes - no periodic report needed:
+
+| Alert | What it carries |
+|---|---|
+| **POSITION OPENED** | symbol, side, qty, entry, confidence/strength, SL/TP, order id |
+| **POSITION CLOSED** | symbol, position id, and **why** (`user`, `account_tp`, `account_sl`, `reversal`) |
+| **POSITION CLOSED ON EXCHANGE** | a native TP/SL hit (or a manual close) noticed during reconciliation, with side, qty and entry |
+| **CLOSE FAILED** | the exchange refused a close, with the error - the one failure that must not wait for a report |
+
+Alerts go to every chat that has messaged the bot in this run. The first poll starts
+at the end of the log, so a restart never replays old trades. Because the source is
+the shared `data/trades.jsonl`, the engine may run in a separate process from the
+bot as long as both use the same `data/` directory.
 
 ---
 
@@ -343,7 +361,7 @@ jrock/
       strategies/        16 strategies in 5 category modules
   docs/bitunix/          local copy of the official API docs
   soul/jrock.soul.md     the persona
-  tests/                 1290 tests
+  tests/                 1313 tests
 ```
 
 ---
@@ -774,10 +792,11 @@ python scripts/verify_restart.py   # the same through the real agent command pat
 python -m pytest -q tests
 ```
 
-1290 tests covering indicators, risk math, all 16 strategies (including empty and
+1313 tests covering indicators, risk math, all 16 strategies (including empty and
 short-data inputs), aggregation rules, universe auto-ranking (commands, env
 loading, percent-based GAINERS/LOSERS/MOVERS ranking and volume filtering),
-TP/SL planning and side validation
+Telegram trade alerts (open/close/closed-on-exchange, restart no-replay,
+half-written lines), TP/SL planning and side validation
 (30020-30033), the **running-engine** TP/SL path (breakeven + trailing, the
 second 30029), the order-size pre-flight (20003, tier leverage caps, margin
 bounds), API-reference/client drift, model probing, request signing, CLI
