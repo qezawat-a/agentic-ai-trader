@@ -122,8 +122,9 @@ def test_tier_for_leverage_returns_none_when_no_tier_allows_it():
 
 
 def test_tier_for_leverage_handles_no_tiers():
-    t = tier_for_leverage([], 10)
-    assert t is not None and t.leverage >= 10
+    """No tiers -> no tier covers the selection -> refuse signal (never a
+    synthetic 125x fallback that would quietly mis-price liquidation)."""
+    assert tier_for_leverage([], 10) is None
 
 
 # --- 3. the provisional plan is built at an affordable notional -------------

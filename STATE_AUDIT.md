@@ -35,7 +35,7 @@ A runtime change was lost on every restart.
 | `risk_pct` | `engine.py:55`, set at `engine.py:1016` | IN-MEMORY-ONLY | PERSISTED |
 | `breakeven_pct` | `engine.py:56`, set at `engine.py:960` | IN-MEMORY-ONLY | PERSISTED |
 | `trailing_trigger_roi_pct` | `engine.py:57`, set at `engine.py:966` | IN-MEMORY-ONLY | PERSISTED |
-| `liq_sl_distance_pct` | `engine.py:58`, set at `engine.py:972` | IN-MEMORY-ONLY | PERSISTED |
+| `sl_distance_pct` | `engine.py` EngineState field | IN-MEMORY-ONLY | PERSISTED |
 | `min_agreeing` | `engine.py:59`, set at `engine.py:978` | IN-MEMORY-ONLY | PERSISTED |
 | `timeframes` | `engine.py:60`, set at `engine.py:984` | IN-MEMORY-ONLY | PERSISTED |
 | `min_confidence` | `engine.py:61`, set at `engine.py:990` | IN-MEMORY-ONLY | PERSISTED |

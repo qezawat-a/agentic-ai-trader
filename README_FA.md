@@ -178,7 +178,7 @@ tpsl method POSITION|PARTIAL        partial ladder 40@1,35@2,25@3
 account tp usdt 100                 account sl usdt 50
 mid management position trigger     reversal=true   reversal_confidence=70
 scans interval sec 30               breakeven threshold pct 0.6
-trailing trigger stop ROI pct 25    liq sl distance pct 50
+trailing trigger stop ROI pct 25    sl distance pct 0 (none)
 min agreeing strategies 3           timeframes 1m,3m,5m,15m
 min confidence 70                   tf min confidence 60
 close position [SYMBOL]             margin mode ISOLATION|CROSS
@@ -271,7 +271,7 @@ universe rank off                           # خاموش (اندازهٔ تنظ�
 1. **قیمت لیکویید** از فرمول مارجین ایزوله با نرخ واقعی مارجین نگهداری برای همان پلهٔ نوشنال پوزیشن:
    - لانگ: `liq = entry * (1 - 1/L + mmr)`
    - شورت: `liq = entry * (1 + 1/L - mmr)`
-2. **حد ضرر** به اندازهٔ `liq sl distance pct` (پیش‌فرض ۵۰٪) از مسیر ورود تا لیکویید قرار می‌گیرد؛ یعنی تقریباً در ۵۰٪ ROI‌ای که لیکویید هزینه می‌کرد فعال می‌شود.
+2. **حد ضرر** دقیقاً در فاصلهٔ `sl distance pct` از قیمت ورود قرار می‌گیرد (پیش‌فرض ۰ = هیچ حد ضروری ندارد). موتور هیچ‌وقت فاصله یا کف ولتی را اختراع نمی‌کند.
 3. **حد سود** = فاصلهٔ حد ضرر × مضرب R، مقیاس‌شده با قدرت سیگنال:
    `weak 1.2R · normal 1.8R · strong 2.5R · extreme 3.2R` و کمی تنظیم‌شده با اطمینان.
 4. **اندازه** از ریسک: `qty = (equity × risk_pct) / |entry − stop|`، محدود به حداکثر نوشنال و گرد‌شده به **پایین** بر اساس `basePrecision`.

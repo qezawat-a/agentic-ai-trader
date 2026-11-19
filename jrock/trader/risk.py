@@ -78,21 +78,36 @@ class Tier:
 
     @classmethod
     def from_api(cls, d: dict) -> "Tier":
+        level = d.get("level")
+        end_value = d.get("endValue")
+        mmr = d.get("maintenanceMarginRate")
+        # The exchange always sends these; a missing value means a malformed
+        # response and the tier is unusable - refuse it rather than invent one.
+        if level is None or end_value is None or mmr is None or mmr == "":
+            raise ValueError("tier is missing level, endValue or "
+                             "maintenanceMarginRate")
         return cls(
-            level=int(d.get("level", 1)),
+            level=int(level),
             start_value=float(d.get("startValue", 0) or 0),
-            end_value=float(d.get("endValue", 0) or 0),
+            end_value=float(end_value),
             leverage=int(d.get("leverage", 1) or 1),
-            maintenance_margin_rate=float(d.get("maintenanceMarginRate", 0.004) or 0.004),
+            maintenance_margin_rate=float(mmr),
         )
 
 
 def round_step(value: float, precision: int) -> float:
-    """Round DOWN to the allowed precision (never over-size an order)."""
+    """Round DOWN to the allowed precision (never over-size an order).
+
+    Done with the decimal form of the input: `int(value * factor)` floors by
+    binary value, not by decimal value, so `round_step(0.29, 2)` came out as
+    0.28 - the computed order is one tick smaller than it should be.
+    """
     if precision < 0:
         precision = 0
-    factor = 10 ** precision
-    return int(value * factor) / factor
+    if value <= 0:
+        return 0.0
+    q = Decimal(1).scaleb(-int(precision))
+    return float(Decimal(repr(float(value))).quantize(q, rounding=ROUND_FLOOR))
 
 
 def round_price(price: float, precision: int) -> float:
@@ -253,20 +268,22 @@ def tier_leverage_violation(tiers: list["Tier"], notional: float,
 
 
 def tier_for_leverage(tiers: list["Tier"], leverage: int) -> "Tier | None":
-    """The largest tier whose leverage cap still permits `leverage`.
+    """The tier a SELECTED leverage maps to, per the official Bitunix rule.
 
-    Used to build the PROVISIONAL plan that sizes the order. The tier the final
-    notional lands in is checked separately (`tier_leverage_violation`); this
-    one only has to be a band where the configured leverage is valid, so the
-    liquidation formula does not degenerate while the size is computed.
-    Returns None when no tier allows the leverage at any size.
+    The risk-limit tier of the position is calculated by the leverage the
+    user selects - the HIGHEST tier whose maximum leverage still covers the
+    selection (Bitunix example: 50x with the documented BTCUSDT table ->
+    tier 3, whose cap is 2,500,000 USDT). The position value of the order
+    must stay within that tier's cap, otherwise the entry is refused - the
+    exchange would reject it anyway.
+
+    Returns None when no tier covers the leverage at any size - a refuse
+    signal, never a fallback.
     """
-    if not tiers:
-        return Tier(1, 0.0, float("inf"), 125, 0.004)
     best: "Tier | None" = None
     for t in tiers:
         if t.leverage >= leverage:
-            if best is None or t.end_value > best.end_value:
+            if best is None or t.level > best.level:
                 best = t
     return best
 
@@ -321,9 +338,13 @@ def unit_from_qty(qty: float, unit: str, price: float, leverage: int) -> float:
 
 
 def pick_tier(tiers: list[Tier], notional: float) -> Tier:
-    """Tier whose [startValue, endValue) contains the notional."""
+    """Tier whose [startValue, endValue) contains the notional.
+
+    Callers refuse when the table is empty - a synthetic fallback would
+    produce a wrong liquidation price for the whole entry pipeline.
+    """
     if not tiers:
-        return Tier(1, 0.0, float("inf"), 125, 0.004)
+        raise ValueError("pick_tier called with an empty tier table")
     ordered = sorted(tiers, key=lambda t: t.start_value)
     for t in ordered:
         if t.start_value <= notional < t.end_value:
@@ -343,55 +364,19 @@ def liquidation_price(entry: float, leverage: int, side: str,
     return max(p, 0.0)
 
 
-def max_leverage_for_stop(*, entry: float, mark: float, side: str,
-                          maintenance_margin_rate: float,
-                          rules: "PairRules", min_ticks: int = 3) -> int:
-    """Highest leverage at which a valid stop-loss can still fit.
+def sl_from_distance(entry: float, side: str, distance_pct: float) -> float:
+    """Stop loss `distance_pct`% from the entry price, or 0.0 = none.
 
-    A stop must sit strictly between the liquidation price and the mark-side
-    limit, keeping `min_ticks` clear of both. The limit is the WORSE of the
-    entry and the mark, exactly as `clamp_sl` uses it:
-
-        LONG : limit = min(entry, mark) - d,  need liq < limit
-        SHORT: limit = max(entry, mark) + d,  need liq > limit
-
-    At high leverage the liquidation price creeps toward the entry, and once it
-    crosses that limit there is no room left at all - the position would be
-    liquidated the moment it opened. Solving the liquidation formula for L:
-
-        LONG : L < 1 / (1 + mmr - limit/entry)
-        SHORT: L < 1 / (limit/entry - 1 + mmr)
-
-    Returns 0 when no leverage works, which happens only when the mark has
-    moved past the entry by more than the maintenance margin allows (at 1x the
-    liquidation price is just `mmr` away from the entry).
+    The stop is the user's own setting - the app never invents a distance, a
+    fraction of the liquidation distance, or a volatility floor. 0 disables
+    the stop (a plain market order with no SL attached).
     """
-    if entry <= 0 or mark <= 0:
-        return 0
-    d = min_stop_distance(rules, min_ticks)
-    mmr = max(0.0, maintenance_margin_rate)
+    frac = min(max(0.0, distance_pct), 50.0) / 100.0
+    if frac <= 0.0:
+        return 0.0
     if side.upper() in ("LONG", "BUY"):
-        limit = min(entry, mark) - d
-        denom = 1.0 + mmr - limit / entry
-    else:
-        limit = max(entry, mark) + d
-        denom = limit / entry - 1.0 + mmr
-    if denom <= 0:
-        return 0
-    return max(0, int(1.0 / denom))
-
-
-def sl_from_liq_distance(entry: float, liq: float, side: str,
-                         distance_pct: float = 50.0) -> float:
-    """Stop loss placed `distance_pct` of the way from entry toward liq price.
-
-    distance_pct = 50 means the SL sits halfway between entry and liquidation,
-    i.e. it triggers at ~50% of the ROI that would be lost at liquidation.
-    """
-    frac = max(1.0, min(99.0, distance_pct)) / 100.0
-    if side.upper() in ("LONG", "BUY"):
-        return entry - (entry - liq) * frac
-    return entry + (liq - entry) * frac
+        return entry * (1.0 - frac)
+    return entry * (1.0 + frac)
 
 
 def roi_pct(entry: float, price: float, side: str, leverage: int) -> float:

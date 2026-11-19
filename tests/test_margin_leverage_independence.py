@@ -108,6 +108,7 @@ def _run_engine(margin_pct, leverage, equity=EQUITY):
     s = Settings()
     s.market_data_source = "rest"
     s.margin_amount_pct = margin_pct
+    s.sl_distance_pct = 2.0
     e = TraderEngine(s)
     e.client = FakeClient(equity, MARK, PRICE)
     e.state.leverage = leverage
@@ -222,7 +223,8 @@ def test_position_size_by_margin_is_defensive():
 
 
 def test_zero_percentage_falls_back_to_risk_sizing():
-    """0 disables the knob, so the pre-existing risk path still applies."""
+    """0 disables the knob, so the pre-existing risk path still applies -
+    and it needs a stop distance to divide by, so set one."""
     r, e = _run_engine(0.0, 10)
     assert r["ok"] is True, r.get("reason")
     assert len(e.client.placed) == 1

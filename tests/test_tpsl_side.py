@@ -40,7 +40,7 @@ TIERS = [_Tier()]
 def _plan(side, *, entry=LAST, mark=MARK, leverage=10, ticks=3):
     return plan_tpsl(side=side, entry=entry, leverage=leverage, notional=20.0,
                      strength="MEDIUM", confidence=70.0, tiers=TIERS, rules=AKE,
-                     mark=mark, min_stop_ticks=ticks)
+                     mark=mark, sl_distance_pct=1.0, min_stop_ticks=ticks)
 
 
 # --- the direction rules -----------------------------------------------------
@@ -126,7 +126,7 @@ def test_coarse_tick_that_cannot_fit_raises_a_named_error():
     with pytest.raises(TpSlSideError) as e:
         plan_tpsl(side="LONG", entry=0.005126, leverage=50, notional=20.0,
                   strength="MEDIUM", confidence=70.0, tiers=TIERS, rules=coarse,
-                  mark=0.005126, min_stop_ticks=3)
+                  mark=0.005126, sl_distance_pct=5.0, min_stop_ticks=3)
     assert "no valid stop-loss exists" in str(e.value)
 
 
