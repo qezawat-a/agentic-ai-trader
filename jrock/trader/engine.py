@@ -584,7 +584,17 @@ class TraderEngine:
                     same = (format_price(st.sl, rules) == format_price(sl, rules)
                             if rules is not None and st.sl > 0
                             else math.isclose(st.sl, sl, rel_tol=1e-9))
-                    if st.sl > 0 and same:
+                    # Our own modify pushes a cancel+create in either order; the
+                    # cancel frame must not wipe `breakeven_done`/`trailing_active`
+                    # while our write is still propagating, or the next manage
+                    # pass re-arms breakeven and loosens the stop we just moved.
+                    # The same 90s benefit of the doubt the REST read-back gives
+                    # a missing row applies here.
+                    last_write = self._sl_writes.get(pid)
+                    in_grace = (last_write is not None
+                                and time.time() - last_write
+                                < self._SL_ABSENT_GRACE_SEC)
+                    if st.sl > 0 and same and not in_grace:
                         st.sl = 0.0
                         st.trailing_stop = 0.0
                         st.breakeven_done = False
@@ -611,7 +621,12 @@ class TraderEngine:
             st = self.positions.get(pid)
             event = str(row.get("event") or "").upper()
             qty = _as_float(row.get("qty"))
-            if event == "CLOSE" or qty <= 0:
+            # An OPEN/UPDATE frame that merely reports a (possibly zero) size
+            # must not be mistaken for a close - only an explicit CLOSE, or a
+            # frame with no live size on a non-update event, drops the position.
+            is_close = (event == "CLOSE" or
+                        (qty <= 0 and event not in ("OPEN", "UPDATE")))
+            if is_close:
                 if st is not None:
                     self._drop_position(pid, "closed on the exchange (ws)")
                 continue
@@ -1821,7 +1836,15 @@ class TraderEngine:
                                          trigger_type: str) -> None:
         """Record the filled position, and park the PARTIAL rungs on it."""
         sym = ctx.sym
-        positions = await self.open_positions()
+        for _ in range(8):
+            positions = await self.open_positions()
+            if any(p.get("symbol") == sym for p in positions):
+                break
+            await asyncio.sleep(0.1)
+        if not any(p.get("symbol") == sym for p in positions):
+            self.state.errors.append(
+                f"entry {sym}: position not visible after fill; rungs not placed")
+            return
         for p in positions:
             if p.get("symbol") != sym:
                 continue
