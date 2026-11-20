@@ -50,15 +50,20 @@ def _run(coro):
 
 
 # ------------------------------------------------------- junk gets executed
-def test_wrapped_ladder_call_is_refused_with_the_command_to_type(tmp_path):
-    """An imagined SETTER is never run - the operator gets the exact command."""
+def test_wrapped_ladder_call_is_run_immediately(tmp_path):
+    """A plain setting the model asked for is run on the spot.
+
+    A setting is not money: refusing it and telling the operator to type
+    it themselves is the old "I can't" behaviour. The operator said "turn
+    off the ladder"; the model asked for `-partial_ladder_off`; the ladder
+    goes off.
+    """
     a = _agent(tmp_path)
     _stub_chat(a, "<|tool_call_start|>[/-partial_ladder_off()]<|tool_call_end|>")
     out = _run(a.chat("turn off the ladder"))
     assert "<|tool_call" not in out
-    assert "I did not run" in out
-    assert "partial ladder off" in out
-    assert a.engine.state.partial_tp_ladder  # unchanged
+    assert "PARTIAL ladder OFF" in out
+    assert not a.engine.state.partial_tp_ladder
 
 
 def test_wrapped_tpsl_call_shows_the_exits(tmp_path):
@@ -85,7 +90,7 @@ def test_prose_stays_around_the_refused_call(tmp_path):
                   "Done.")
     out = _run(a.chat("turn the ladder off"))
     assert "turning it off now" in out
-    assert "I did not run" in out
+    assert "PARTIAL ladder OFF" in out
     assert "<|tool_call" not in out
 
 
@@ -116,22 +121,29 @@ def test_normal_markdown_survives(tmp_path):
     assert "See the docs [here](https://example.com)" in out
 
 
-def test_imagined_close_position_never_executes(tmp_path):
-    """The worst case: the model imagines a CLOSE. It must be refused, and
-    the position must still be there."""
+def test_imagined_close_position_waits_for_the_operators_yes(tmp_path):
+    """The worst case: the model imagines a CLOSE.
+
+    It must NOT execute on its own - the money move waits for the
+    operator's explicit yes - but it must not be refused either: the
+    request is queued and the operator gets the confirmation prompt.
+    """
     a = _agent(tmp_path)
     _stub_chat(a, "<|tool_call_start|>[/close position INITUSDT()]<|tool_call_end|>")
     out = _run(a.chat("what should I do with INIT"))
-    assert "I did not run" in out
-    assert "close position INITUSDT" in out
+    assert "I did not run" not in out
+    assert "close position initusdt" in out.lower()
+    assert "'yes' to confirm" in out
+    assert a._pending_action is not None  # held, not run
 
 
-def test_imagined_leverage_set_never_executes(tmp_path):
+def test_imagined_leverage_set_waits_for_the_operators_yes(tmp_path):
     a = _agent(tmp_path)
     _stub_chat(a, "[/leverage(100)]")
     out = _run(a.chat("bump it"))
-    assert a.engine.state.leverage != 100
-    assert "I did not run" in out
+    assert a.engine.state.leverage != 100  # not executed without the yes
+    assert "'yes' to confirm" in out
+    assert a._pending_action is not None
 
 
 # ---------------------------------------------------- smalltalk false hit

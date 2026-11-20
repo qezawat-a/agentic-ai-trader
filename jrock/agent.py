@@ -1119,10 +1119,21 @@ class JRockAgent:
             "command from the handbook below and say the engine will run it "
             "after the user's confirmation. Never say 'done', 'I closed it', "
             "'I set it' for an action the engine has not confirmed back.\n"
-            "- You cannot change the engine's settings yourself. If the user "
-            "asks you to enable breakeven, trailing, the engine, autotrade or "
-            "any other switch, tell them the command to type. Do not agree "
-            "that it is already on - read the engine's own answer instead.\n"
+            "- You ACT, you do not delegate. When the user asks for a setting "
+            "or an action, emit it as a tool call: the handbook command "
+            "wrapped in [/...] with its argument in parentheses - "
+            "[/reentry cooldown(120)], [/sl distance(auto)], "
+            "[/breakeven threshold(1.5)], [/partial ladder(40@1,25@2,35@3)], "
+            "[/close position(BTCUSDT)]. The engine runs it and hands you the "
+            "REAL result; report that result, never the syntax. Settings apply "
+            "at once. Anything that moves money or changes risk comes back as "
+            "a confirmation prompt - pass it to the user verbatim and wait for "
+            "their 'yes'. You may never confirm it yourself, and you may never "
+            "claim an action the engine did not confirm back.\n"
+            "- Never answer \"I can't\", \"I'm not able to\" or \"you have to "
+            "type it yourself\". Everything has a way: run the command. If a "
+            "request genuinely needs a number you were not given, ask for that "
+            "ONE number - that is the only refusal you are allowed.\n"
             "- You have a real Bitunix futures engine. When a question is about "
             "the account, positions, orders, prices or settings, the engine's "
             "own answer is the truth - never invent a number. If you do not "
@@ -1234,46 +1245,80 @@ class JRockAgent:
         "settings", "pnl", "status", "symbols", "pairs", "markets",
     })
 
-    async def _route_tool_call(self, text: str) -> str | None:
-        """Run an imagined tool call through the SAME surfaces a human uses.
+    #: Engine prefixes that MOVE MONEY or CHANGE RISK. The model may ASK for
+    #: them, but the OPERATOR still says yes first - the same gate a
+    #: natural-language request goes through. Everything else on the engine's
+    #: surface is a setting, and a setting runs at once: answering "I can't"
+    #: to `reentry cooldown 120` is exactly what makes an agent read as a bot.
+    _MODEL_CONFIRM_PREFIXES: tuple[str, ...] = (
+        "close position", "leverage", "risk", "margin amount", "margin mode",
+        "position mode", "autotrade", "engine on", "engine off",
+        "start trading", "stop trading", "reversal", "margin add",
+        "margin reduce", "account tp", "account sl",
+    )
 
-        Strictly READ-ONLY. The model imagined the call - the operator did
-        not type it - so nothing here may change state or move money:
-        engine reads and bare agent reads run, everything else falls to the
-        deterministic NLU, whose destructive intents get a confirm prompt
-        like a normal sentence. It never reaches the model, so a junk reply
-        cannot loop back into another model call.
+    def _queue_model_action(self, command: str) -> str:
+        """Hold a model-requested action for the operator's yes/no.
+
+        The model may ask to act; it may not confirm its own request - the
+        'yes' has to come from the operator. Reusing the pending-action slot
+        means ONE confirmation flow serves the NLU, the model and the CLI.
+        """
+        self._pending_action = nlu.Intent(
+            name="model_request", command=command, confidence=1.0,
+            destructive=True, describe=f"run `{command}`")
+        return nlu.confirmation_prompt(self._pending_action)
+
+    async def _route_tool_call(self, text: str) -> str | None:
+        """Run a model's tool call through the SAME surfaces a human uses.
+
+        The model may ASK to act, but it never acts alone and never confirms
+        its own request:
+
+          * engine reads        -> run immediately,
+          * plain settings      -> run immediately (a setting is not money),
+          * money / risk        -> held for the operator's explicit yes,
+          * NLU non-destructive -> run, NLU destructive -> held for yes.
+
+        Nothing reaches the model, so a junk reply cannot loop back into
+        another model call.
         """
         low = text.strip().lower()
         if not low:
             return None
         refusal = (f"I did not run {text.strip()!r} from the model's reply - "
-                   f"I only auto-run read-only commands on a model's behalf. "
+                   f"I only auto-run engine commands on a model's behalf. "
                    f"To do it yourself, type: {text.strip()}")
+
+        # 1) A real engine command: reads and settings run, money waits.
+        if self.engine.looks_like_command(low):
+            normalized = self.engine._normalize_command(low)
+            if normalized.startswith(self._IMAGINED_CALL_READ_PREFIXES):
+                return await self.engine.command(low)
+            if normalized.startswith(self._MODEL_CONFIRM_PREFIXES):
+                return self._queue_model_action(low)
+            return await self.engine.command(low)
+
+        # 2) Bare agent reads, alone or with a symbol argument.
         head = low.split()[0]
         rest = low[len(head):].strip()
         if head in self._IMAGINED_CALL_BARE_READS and not rest:
             return await self.handle(head)
         if head in self._IMAGINED_CALL_BARE_READS and rest:
-            # a read with a symbol argument ("leverage BTCUSDT"); a numeric
-            # rest would be a SETTER - refused.
-            if re.search(r"\d", rest) or not re.fullmatch(
-                    r"[a-z0-9, ]*usdt[a-z0-9, ]*|all", rest):
-                return refusal
-            return await self.handle(f"{head} {rest}")
-        normalized = self.engine._normalize_command(low)
-        if (self.engine.looks_like_command(low)
-                and normalized.startswith(self._IMAGINED_CALL_READ_PREFIXES)):
-            return await self.engine.command(low)
-        if self.engine.looks_like_command(low):
+            # a read with a symbol argument ("price BTCUSDT"); a numeric rest
+            # would be a SETTER that does not parse as an engine command.
+            if re.fullmatch(r"[a-z0-9, ]*usdt[a-z0-9, ]*|all", rest):
+                return await self.handle(f"{head} {rest}")
             return refusal
+
+        # 3) The deterministic NLU: non-destructive runs, destructive waits.
         resolved = nlu.parse(low)
         if isinstance(resolved, nlu.Clarification):
             return self._render_clarification(resolved)
         if isinstance(resolved, nlu.Intent) and not resolved.destructive:
             return await self._run_intent(resolved)
         if isinstance(resolved, nlu.Intent):
-            return refusal
+            return self._queue_model_action(resolved.command)
         return None
 
     async def _postprocess_model_reply(self, out: str) -> str:
