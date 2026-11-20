@@ -86,6 +86,13 @@ def _row(pid: str, sl: str) -> dict:
             "slStopType": "LAST_PRICE", "slQty": "4000"}
 
 
+def _readback(e: TraderEngine):
+    async def go():
+        ex = await e._exchange_tpsl_state()
+        e._read_back_tpsl(ex)
+    return asyncio.run(go())
+
+
 # ------------------------------------------------------------- the report
 def test_report_quotes_the_stop_the_exchange_holds(tmp_path):
     """The operator compares the report with the app - they must agree."""
@@ -109,7 +116,7 @@ def test_report_readback_failure_keeps_the_report_alive(tmp_path):
 
 def test_readback_without_the_method_answers_empty(tmp_path):
     e, _ = _engine(0.00530, tmp_path=tmp_path, readback=False)
-    assert _run(e._exchange_sl_map()) == {}
+    assert _run(e._exchange_tpsl_state()).empty()
 
 
 # ------------------------------------------------- acting on the real stop
@@ -179,25 +186,31 @@ def test_conflicting_stop_rows_are_not_guessed(tmp_path):
     e, _ = _engine(0.00530, seed=_seed(sl=0.00490),
                    sl_rows=[_row("P1", "0.005040"), _row("P1", "0.005010")],
                    tmp_path=tmp_path)
-    _run(e._read_back_sl())
+    _readback(e)
     assert e.positions["P1"].sl == pytest.approx(0.00490)
 
 
 def test_rows_for_another_position_are_ignored(tmp_path):
-    e, _ = _engine(0.00530, seed=_seed(sl=0.00490),
+    e, _ = _engine(0.00530, seed=_seed(sl=0.0),
                    sl_rows=[_row("P9", "0.005040")], tmp_path=tmp_path)
-    _run(e._read_back_sl())
-    assert e.positions["P1"].sl == pytest.approx(0.00490)
+    _readback(e)
+    assert e.positions["P1"].sl == 0.0, (
+        "another position's stop was adopted into P1")
 
 
 def test_tp_only_rungs_carry_no_stop_and_are_skipped(tmp_path):
     """The PARTIAL rungs are TP-only: a row without slPrice is not a stop."""
-    e, _ = _engine(0.00530, seed=_seed(sl=0.00490),
-                   sl_rows=[{"positionId": "P1", "symbol": "AKEUSDT",
-                             "tpPrice": "0.005500", "slPrice": "0"}],
-                   tmp_path=tmp_path)
-    _run(e._read_back_sl())
-    assert e.positions["P1"].sl == pytest.approx(0.00490)
+    e, _ = _engine(0.00530, seed=_seed(sl=0.0), tmp_path=tmp_path)
+    e.state.tpsl_method = "PARTIAL"
+    e.client.sl_rows = [{"positionId": "P1", "symbol": "AKEUSDT",
+                         "tpPrice": "0.005500", "tpQty": "1000",
+                         "slPrice": "0"}]
+    _readback(e)
+    st = e.positions["P1"]
+    assert st.sl == 0.0, "a TP-only rung was mistaken for a stop"
+    assert st.tp == 0.0, "a TP-only rung was mistaken for the position TP"
+    ex = _run(e._exchange_tpsl_state())
+    assert [r["price"] for r in ex.rungs["P1"]] == [pytest.approx(0.0055)]
 
 
 def test_trading_pair_rules_still_load_for_the_manage_pass(tmp_path):

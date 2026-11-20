@@ -406,15 +406,19 @@ def test_close_all_positions_falls_back_to_per_position_close():
     flashed: list[str] = []
 
     class C:
+        open_pids = {"P1", "P2"}
+
         async def close_all_position(self):
             raise BitunixAPIError(10001, "boom")
 
         async def get_pending_positions(self, sym=None):
-            return [{"positionId": "P1", "symbol": "AKEUSDT"},
-                    {"positionId": "P2", "symbol": "ETHUSDT"}]
+            return [{"positionId": pid,
+                     "symbol": ("AKEUSDT" if pid == "P1" else "ETHUSDT")}
+                    for pid in sorted(self.open_pids)]
 
         async def flash_close_position(self, pid):
             flashed.append(pid)
+            self.open_pids.discard(pid)   # the exchange really closes it
             return {"ok": True}
 
     e.client = C()  # type: ignore[assignment]

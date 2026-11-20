@@ -192,6 +192,59 @@ class _EntryContext:
     notes: list[str] = field(default_factory=list)
 
 
+@dataclass
+class _TpslReadback:
+    """What the exchange is ACTUALLY holding for our positions.
+
+    One REST read (`get_pending_tp_sl_order`) plus the private WS `tpsl`
+    channel both land here, so every surface that prints or acts on an exit
+    works from the exchange's numbers instead of the engine's memory.
+
+    A position-level TP/SL order carries BOTH prices; a PARTIAL ladder rung
+    is a TP-only order (`tpPrice` + `tpQty`, no `slPrice`). That is the
+    discriminator: rungs are listed as rungs, never mistaken for the
+    position's TP.
+    """
+
+    #: True only when the exchange actually ANSWERED. An empty readback with
+    #: ok=True means "the exchange holds no exits for these positions"; an
+    #: empty readback with ok=False means "we do not know" - the two must
+    #: never be confused, or a failed call would look like a removed stop.
+    ok: bool = False
+    #: False when the exchange's page may have been truncated (limit reached
+    #: without a `total` that proves otherwise). Absence is only trusted on a
+    #: complete read: a stop missing from page 1 is not a missing stop.
+    complete: bool = True
+    sl: dict[str, float] = field(default_factory=dict)
+    tp: dict[str, float] = field(default_factory=dict)
+    rungs: dict[str, list[dict]] = field(default_factory=dict)
+    #: Positions for which the exchange DID list an exit, even when its rows
+    #: disagree. "Conflicting" is not "absent": the engine refuses to guess a
+    #: value but must not conclude the stop is gone.
+    sl_seen: set[str] = field(default_factory=set)
+    tp_seen: set[str] = field(default_factory=set)
+
+    def empty(self) -> bool:
+        return not (self.sl or self.tp or self.rungs)
+
+
+def _as_float(value: Any) -> float:
+    """An exchange field -> float; junk/blank/None -> 0.0 (never raises)."""
+    try:
+        return float(str(value).strip()) if value not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _frame_rows(data: Any) -> list[dict]:
+    """A private push payload -> row dicts (the docs say object, not list)."""
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    return []
+
+
 class TraderEngine:
     def __init__(self, settings: Settings, data_dir: Path | None = None,
                  store: Store | None = None):
@@ -425,9 +478,13 @@ class TraderEngine:
     async def start_feed(self) -> None:
         """Open the public WS feed when MARKET_DATA_SOURCE=ws.
 
-        With `rest` this returns immediately and NO socket is ever opened -
-        that is asserted by a test.
+        With `rest` this returns immediately and NO public socket is ever
+        opened - that is asserted by a test. The PRIVATE account stream is
+        independent of the price source: it is opened whenever credentials
+        exist, because "what the exchange holds right now" (a stop edited in
+        the app, a position closed by a TP) is not a market-data question.
         """
+        await self.start_private_feed()
         if self.s.market_data_source != "ws":
             return
         if self.feed is not None:
@@ -456,23 +513,129 @@ class TraderEngine:
             self.feed_error = f"{type(e).__name__}: {e}"
             log.warning("ws feed failed to start: %s - falling back to REST", e)
             self.feed = None
-        # The private feed carries balance/position/order/tpsl. It needs
-        # credentials, so it is skipped (with a reason) when they are absent -
-        # the public feed keeps working either way.
-        if self.s.bitunix_api_key and self.s.bitunix_api_secret:
-            try:
-                self.private_feed = PrivateFeed(cfg)
-                await self.private_feed.start()
-                for _ in range(30):
-                    if self.private_feed.ws.logged_in:
-                        break
-                    await asyncio.sleep(0.1)
-            except Exception as e:  # noqa: BLE001
-                self.private_feed_error = f"{type(e).__name__}: {e}"
-                log.warning("private ws feed failed: %s", e)
-                self.private_feed = None
-        else:
-            self.private_feed_error = "no BITUNIX_API_KEY/SECRET - private channels not subscribed"
+
+    async def start_private_feed(self) -> None:
+        """Open the private account stream: balance / position / order / tpsl.
+
+        This used to live inside the `MARKET_DATA_SOURCE=ws` branch, so an
+        operator on REST had NO live view of their own account: a stop edited
+        in the app was noticed at best on the next 30s report. The private
+        feed needs credentials, not a price-source choice - it is the only
+        way "read it from the exchange, immediately" can be true.
+        """
+        if self.private_feed is not None:
+            return
+        if not (self.s.bitunix_api_key and self.s.bitunix_api_secret):
+            self.private_feed_error = (
+                "no BITUNIX_API_KEY/SECRET - private channels not subscribed")
+            return
+        cfg = WSConfig.from_settings(self.s)
+        try:
+            pf = PrivateFeed(cfg)
+            self._wire_private_feed(pf)
+            await pf.start()
+            self.private_feed = pf
+            for _ in range(30):
+                if pf.ws.logged_in:
+                    break
+                await asyncio.sleep(0.1)
+        except Exception as e:  # noqa: BLE001
+            self.private_feed_error = f"{type(e).__name__}: {e}"
+            log.warning("private ws feed failed: %s", e)
+            self.private_feed = None
+
+    def _wire_private_feed(self, pf: PrivateFeed) -> None:
+        """Let the private pushes DRIVE engine state the moment they arrive.
+
+        Before this, the feed subscribed the channels and counted the frames
+        for `/ws` - nothing read them. The engine's own numbers stayed the
+        only truth until the next REST poll, which is exactly what made a
+        manual stop edit invisible for up to a report interval.
+        """
+        pf.ws.on("tpsl", self._on_ws_tpsl)
+        pf.ws.on("position", self._on_ws_position)
+
+    def _on_ws_tpsl(self, ev) -> None:
+        """A TP/SL order was created, updated or closed on the exchange."""
+        for row in _frame_rows(ev.data):
+            pid = str(row.get("positionId") or "")
+            st = self.positions.get(pid)
+            if st is None:
+                continue
+            event = str(row.get("event") or "").upper()
+            status = str(row.get("status") or "").upper()
+            sl = _as_float(row.get("slPrice"))
+            tp = _as_float(row.get("tpPrice"))
+            live = event in ("CREATE", "UPDATE") and status in ("NEW", "")
+            if not live:
+                # "CLOSE alone is not a final state" (docs): read event WITH
+                # status. A cancelled stop is NOT adopted - the exchange no
+                # longer holds it - and a filled one is the close path's job.
+                if sl > 0 and status in ("CANCELED", "SYSTEM_CANCELED"):
+                    self._log_tpsl({
+                        "event": "sl_removed_on_exchange", "ts": time.time(),
+                        "symbol": st.symbol, "position_id": pid,
+                        "sl": sl, "status": status, "source": "ws"})
+                    # The cancelled order carried THIS price: it is the stop
+                    # the engine believed was live, so stop believing it. A
+                    # modify can push cancel+create in either order; the
+                    # create frame (new price) arrives separately and adopts.
+                    rules = self.rules.get(st.symbol)
+                    same = (format_price(st.sl, rules) == format_price(sl, rules)
+                            if rules is not None and st.sl > 0
+                            else math.isclose(st.sl, sl, rel_tol=1e-9))
+                    if st.sl > 0 and same:
+                        st.sl = 0.0
+                        st.trailing_stop = 0.0
+                        st.breakeven_done = False
+                        st.trailing_active = False
+                continue
+            rules = self.rules.get(st.symbol)
+            if sl > 0:
+                self._adopt_exchange_sl(st, sl, rules=rules, source="ws",
+                                        force=True)
+            # A TP-only frame under PARTIAL is a ladder rung, not the
+            # position's take-profit - only a position-level order (both
+            # prices) may set st.tp.
+            partial = (self.state.tpsl_method or "POSITION").upper() == "PARTIAL"
+            if tp > 0 and (sl > 0 or not partial):
+                self._adopt_exchange_tp(st, tp, rules=rules, source="ws",
+                                        force=True)
+
+    def _on_ws_position(self, ev) -> None:
+        """A position was opened, updated or closed on the exchange."""
+        for row in _frame_rows(ev.data):
+            pid = str(row.get("positionId") or "")
+            if not pid:
+                continue
+            st = self.positions.get(pid)
+            event = str(row.get("event") or "").upper()
+            qty = _as_float(row.get("qty"))
+            if event == "CLOSE" or qty <= 0:
+                if st is not None:
+                    self._drop_position(pid, "closed on the exchange (ws)")
+                continue
+            if st is None:
+                # a position opened outside this engine: it is picked up by
+                # the next manage pass, which reads the full REST row.
+                continue
+            changed: dict[str, float] = {}
+            if not math.isclose(qty, st.qty, rel_tol=1e-9):
+                changed["qty"] = qty
+            lev = int(_as_float(row.get("leverage")))
+            if lev > 0 and lev != st.leverage:
+                changed["leverage"] = float(lev)
+            if not changed:
+                continue
+            before = {"qty": st.qty, "leverage": st.leverage}
+            if "qty" in changed:
+                st.qty = changed["qty"]
+            if "leverage" in changed:
+                st.leverage = int(changed["leverage"])
+            self._log_tpsl({"event": "position_reconciled", "ts": time.time(),
+                            "symbol": st.symbol, "position_id": pid,
+                            "engine": before, "exchange": changed,
+                            "source": "ws"})
 
     async def stop_feed(self) -> None:
         if self.private_feed is not None:
@@ -490,8 +653,6 @@ class TraderEngine:
 
     def private_feed_report(self) -> str:
         """Honest one-liner for the private channels."""
-        if self.s.market_data_source != "ws":
-            return "private ws: not opened (MARKET_DATA_SOURCE=rest)"
         if self.private_feed is None:
             why = f" - {self.private_feed_error}" if self.private_feed_error else ""
             return f"private ws: NOT connected{why}"
@@ -662,13 +823,6 @@ class TraderEngine:
             self._position_mode = ""
         self._position_mode_ts = now
         return self._position_mode
-
-    def _remember_position_mode(self, mode: str) -> None:
-        """Record a mode we just set, so the next order does not re-read it."""
-        mode = (mode or "").strip().upper()
-        if mode in ("HEDGE", "ONE_WAY"):
-            self._position_mode = mode
-            self._position_mode_ts = time.time()
 
     async def _trade_side_fields(self, hedge_side: str,
                                  position_id: str | None = None) -> dict:
@@ -1097,16 +1251,30 @@ class TraderEngine:
         for pid in list(self.positions):
             if pid in live_ids:
                 continue
-            st = self.positions.pop(pid)
+            self._drop_position(pid, "not open on the exchange anymore")
             closed.append(pid)
-            self._note_closed(st.symbol, "closed on the exchange")
-            self._log_trade({"event": "closed_on_exchange", "ts": time.time(),
-                              "symbol": st.symbol, "position_id": pid,
-                              "side": st.side, "entry": st.entry, "qty": st.qty,
-                              "reason": "not open on the exchange anymore"})
         if closed:
             self.persist_positions()
         return closed
+
+    def _drop_position(self, pid: str, why: str) -> None:
+        """Forget a position that is gone, and start its re-entry cooldown.
+
+        ONE path for both the REST reconcile and the private WS push: a
+        position that vanished must always (a) leave `self.positions`,
+        (b) arm the anti-churn cooldown, (c) leave a trade-log line - the
+        same close must never be handled two different ways depending on
+        which surface noticed it first.
+        """
+        st = self.positions.pop(pid, None)
+        if st is None:
+            return
+        self._note_closed(st.symbol, "closed on the exchange")
+        self._log_trade({"event": "closed_on_exchange", "ts": time.time(),
+                          "symbol": st.symbol, "position_id": pid,
+                          "side": st.side, "entry": st.entry, "qty": st.qty,
+                          "reason": why})
+        self.persist_positions()
 
     def _note_closed(self, symbol: str, why: str) -> None:
         """Remember that a symbol was just closed (anti-churn cooldown)."""
@@ -1769,32 +1937,100 @@ class TraderEngine:
     async def close_position(self, symbol: str | None = None,
                              position_id: str | None = None,
                              reason: str = "user") -> dict:
-        """Close a position, and RECORD WHY.
+        """Close a position, and RECORD WHY - then READ THE EXCHANGE BACK.
 
         The close log used to carry only the symbol and the result, so a log
         could not tell a reversal close from an account-threshold close from
         the operator's own command. "Why did it open and close several
         positions in a minute?" was unanswerable from the evidence - the
         reason is the one thing that separates them.
+
+        A 200 from the close endpoint is an ACCEPTED REQUEST, not proof the
+        position is gone. The engine used to pop its own state on that 200:
+        a close that did not actually flatten left a live position that the
+        engine no longer tracked (no report line, no management, and a
+        re-entry cooldown armed for a position that never closed). The
+        exchange is read back before anything is forgotten.
         """
         try:
             if position_id:
                 res = await self.client.flash_close_position(position_id)
             else:
                 res = await self.client.close_all_position(symbol)
-            self._note_closed(symbol or "", reason)
-            self._log_trade({"event": "close", "ts": time.time(),
-                             "symbol": symbol, "position_id": position_id,
-                             "reason": reason, "result": res})
-            if position_id:
-                st = self.positions.pop(str(position_id), None)
-            self.persist_positions()
-            return {"ok": True, "reason": reason, "result": res}
         except BitunixAPIError as e:
             self._log_trade({"event": "close_failed", "ts": time.time(),
                              "symbol": symbol, "position_id": position_id,
                              "reason": reason, "error": str(e)})
             return {"ok": False, "reason": str(e), "hint": e.hint}
+
+        pids = {str(position_id)} if position_id else None
+        confirmed = await self._confirm_flat(
+            pids, symbol=(symbol if not position_id else None))
+        if confirmed is False:
+            # The exchange still reports it open. Keep the state and say so:
+            # forgetting it here is how a position becomes unmanaged.
+            self._log_trade({"event": "close_unconfirmed", "ts": time.time(),
+                             "symbol": symbol, "position_id": position_id,
+                             "reason": reason, "result": res})
+            return {"ok": False, "reason": (
+                        "the exchange still reports this position open after "
+                        "the close request"), "confirmed": False,
+                    "result": res}
+
+        # Drop exactly what was confirmed gone: one id, one symbol, or the
+        # whole account - and arm the anti-churn cooldown for each symbol.
+        if position_id:
+            affected = [self.positions.pop(str(position_id), None)]
+        elif symbol:
+            affected = [self.positions.pop(pid)
+                        for pid, st in list(self.positions.items())
+                        if st.symbol.upper() == symbol.upper()]
+        else:
+            affected = list(self.positions.values())
+            self.positions.clear()
+        for st in affected:
+            if st is not None:
+                self._note_closed(st.symbol, reason)
+        if symbol:
+            self._note_closed(symbol, reason)
+        self._log_trade({"event": "close", "ts": time.time(),
+                         "symbol": symbol, "position_id": position_id,
+                         "reason": reason, "result": res,
+                         "confirmed": "yes" if confirmed else "unreadable"})
+        self.persist_positions()
+        return {"ok": True, "reason": reason, "result": res,
+                "confirmed": confirmed}
+
+    async def _confirm_flat(self, pids: set[str] | None = None,
+                            symbol: str | None = None,
+                            attempts: int = 4,
+                            delay: float = 0.25) -> bool | None:
+        """Read the exchange after a close: True flat, False still open,
+        None could not read.
+
+        `pids` narrows the check to specific positions; `symbol` narrows it
+        to one pair (the bulk close with a symbol closes that pair only);
+        both None means the whole account must be flat. A failed read is NOT
+        treated as flat - but it is also not treated as proof the close
+        failed, so callers keep the API response as the fallback and say the
+        confirmation was unreadable.
+        """
+        for i in range(max(1, attempts)):
+            try:
+                rows = await self.client.get_pending_positions()
+            except Exception as e:  # noqa: BLE001 - a read must never mask a close
+                log.debug("close confirmation unreadable: %s", e)
+                return None
+            if symbol:
+                rows = [r for r in (rows or [])
+                        if str(r.get("symbol", "")).upper() == symbol.upper()]
+            live = {str(r.get("positionId") or "") for r in (rows or [])}
+            still = live if pids is None else (pids & live)
+            if not still:
+                return True
+            if i + 1 < attempts:
+                await asyncio.sleep(delay)
+        return False
 
     # ================================================================ management
     def _plan_rungs(self, rungs: list[LadderRung], qty: float,
@@ -1951,18 +2187,41 @@ class TraderEngine:
         """
         try:
             await self.client.close_all_position()
+            confirmed = await self._confirm_flat()
+            if confirmed is False:
+                # At least one position survived the bulk close. Forget only
+                # the ones the exchange confirms are gone; keep managing the
+                # rest and say the close did not flatten the account.
+                live = await self.live_positions()
+                if live is not None:
+                    live_ids = {str(p.get("positionId") or "") for p in live}
+                    for pid in list(self.positions):
+                        if pid not in live_ids:
+                            self._drop_position(pid, reason)
+                    for st in self.positions.values():
+                        self._log_trade({
+                            "event": "close_unconfirmed", "ts": time.time(),
+                            "symbol": st.symbol, "position_id": st.position_id,
+                            "reason": reason, "via": "close_all_position"})
+                return {"ok": False, "via": "close_all_position",
+                        "reason": reason, "confirmed": False}
             for st in list(self.positions.values()):
                 self._note_closed(st.symbol, reason)
                 self._log_trade({"event": "close", "ts": time.time(),
                                  "symbol": st.symbol, "position_id": st.position_id,
-                                 "reason": reason, "via": "close_all_position"})
+                                 "reason": reason, "via": "close_all_position",
+                                 "confirmed": ("yes" if confirmed
+                                               else "unreadable")})
             self.positions.clear()
             self.persist_positions()
-            return {"ok": True, "via": "close_all_position", "reason": reason}
+            return {"ok": True, "via": "close_all_position", "reason": reason,
+                    "confirmed": confirmed}
         except BitunixAPIError as e:
             log.warning("close_all_position failed (%s) - falling back to "
                         "per-position close", e)
         closed, failed = 0, 0
+        closed_pids: set[str] = set()
+        closed_syms: dict[str, str] = {}
         for p in await self.open_positions():
             pid = str(p.get("positionId") or "")
             if not pid:
@@ -1970,16 +2229,42 @@ class TraderEngine:
             try:
                 await self.client.flash_close_position(pid)
                 closed += 1
-                self._note_closed(str(p.get("symbol") or ""), reason)
-                self._log_trade({"event": "close", "ts": time.time(),
-                                 "symbol": p.get("symbol"), "position_id": pid,
-                                 "reason": reason, "via": "flash_close_position"})
+                closed_pids.add(pid)
+                closed_syms[pid] = str(p.get("symbol") or "")
             except BitunixAPIError:
                 failed += 1
-        self.positions.clear()
+        confirmed = await self._confirm_flat(closed_pids) if closed_pids else None
+        if confirmed is False:
+            # Keep the state for anything still open: a close that did not
+            # happen must not disappear from the engine's bookkeeping.
+            live = await self.live_positions()
+            if live is not None:
+                live_ids = {str(x.get("positionId") or "") for x in live}
+                for pid in list(self.positions):
+                    if pid not in live_ids:
+                        self._drop_position(pid, reason)
+                for pid in closed_pids & live_ids:
+                    self._log_trade({
+                        "event": "close_unconfirmed", "ts": time.time(),
+                        "symbol": closed_syms.get(pid, ""),
+                        "position_id": pid, "reason": reason,
+                        "via": "flash_close_position"})
+            return {"ok": False, "via": "flash_close_position",
+                    "reason": reason, "closed": closed, "failed": failed,
+                    "confirmed": False}
+        for pid in closed_pids:
+            self._note_closed(closed_syms.get(pid, ""), reason)
+            self._log_trade({"event": "close", "ts": time.time(),
+                             "symbol": closed_syms.get(pid, ""),
+                             "position_id": pid, "reason": reason,
+                             "via": "flash_close_position",
+                             "confirmed": ("yes" if confirmed
+                                           else "unreadable")})
+            self.positions.pop(pid, None)
         self.persist_positions()
         return {"ok": failed == 0, "via": "flash_close_position",
-                "reason": reason, "closed": closed, "failed": failed}
+                "reason": reason, "closed": closed, "failed": failed,
+                "confirmed": confirmed}
 
     def tpsl_method_report(self) -> str:
         """One honest line about the four documented TP/SL methods.
@@ -2046,14 +2331,13 @@ class TraderEngine:
 
     async def manage_positions(self) -> list[dict]:
         actions: list[dict] = []
-        positions = await self.open_positions()
-        live_ids = {str(p.get("positionId")) for p in positions}
-
-        for pid in list(self.positions):
-            if pid not in live_ids:
-                # the position vanished (stop filled, manual close, ...) and
-                # its management state is obsolete
-                self.positions.pop(pid, None)
+        live = await self.live_positions()
+        positions = live or []
+        # A position that vanished (stop filled, manual close, ...) is dropped
+        # WITH its cooldown and a log line - a failed read (live is None) must
+        # not throw away every live position's management state.
+        if live is not None:
+            self.reconcile_positions(live)
 
         # --- ACCOUNT TP/SL: the whole futures account is the control unit.
         closed_all = await self._manage_account_tpsl(positions)
@@ -2061,13 +2345,13 @@ class TraderEngine:
             actions.append(closed_all)
             return actions
 
-        # The exchange's OWN stops, read once for the whole pass: the manage
-        # loop must not act on a stop the operator moved by hand (see
-        # `_adopt_exchange_sl`).
-        sl_map = await self._exchange_sl_map() if positions else {}
+        # The exchange's OWN exits, read once for the whole pass: the manage
+        # loop must not act on a stop/target the operator moved by hand (see
+        # `_adopt_exchange_sl` / `_adopt_exchange_tp`).
+        ex = await self._exchange_tpsl_state() if positions else _TpslReadback()
 
         for p in positions:
-            actions.extend(await self._manage_one_position(p, sl_map))
+            actions.extend(await self._manage_one_position(p, ex))
 
         # Management state (breakeven_done / trailing_stop / peak_roi) must hit
         # the disk even if the process is killed a moment later.
@@ -2126,10 +2410,15 @@ class TraderEngine:
             return None
         log.warning("ACCOUNT TP/SL: %s", decision.reason)
         closed = await self.close_all_positions(reason=f"account_{decision.trigger}")
-        self._log_tpsl({"event": f"account_{decision.trigger}",
+        ok = bool(closed.get("ok")) if isinstance(closed, dict) else True
+        # The threshold FIRED either way, but a close the exchange did not
+        # confirm is not the same event as a flat account - the log must not
+        # claim the position is gone when it is still there.
+        self._log_tpsl({"event": (f"account_{decision.trigger}" if ok
+                                  else f"account_{decision.trigger}_failed"),
                         "ts": time.time(), "total_pnl": round(total_pnl, 2),
                         "threshold": decision.threshold,
-                        "reason": decision.reason})
+                        "reason": decision.reason, "result": closed})
         self.persist_positions()
         return {"action": f"account_{decision.trigger}",
                 "total_pnl": round(total_pnl, 2),
@@ -2158,47 +2447,114 @@ class TraderEngine:
                         "engine_qty": st.qty, "exchange_qty": live_qty})
         st.qty = live_qty
 
+    def _reconcile_position_fields(self, st: PositionState, p: dict,
+                                   sym: str, pid: str) -> None:
+        """Adopt entry / liquidation price / leverage from the position row.
+
+        These were copied ONCE when the position was first seen and never
+        refreshed. Adding margin or qty on the exchange moves the average
+        entry and the liquidation price; the leverage can be changed from the
+        app too. A report quoting the old numbers is a report the operator
+        cannot audit - and a stop clamped against a stale liquidation price
+        can be rejected (30029/30031) for no visible reason.
+        """
+        changed: dict[str, float] = {}
+        entry = _as_float(p.get("avgOpenPrice"))
+        liq = _as_float(p.get("liqPrice"))
+        lev = int(_as_float(p.get("leverage")))
+        if entry > 0 and not math.isclose(entry, st.entry, rel_tol=1e-9):
+            changed["entry"] = entry
+        if liq > 0 and not math.isclose(liq, st.liq, rel_tol=1e-9):
+            changed["liq"] = liq
+        if lev > 0 and lev != st.leverage:
+            changed["leverage"] = float(lev)
+        if not changed:
+            return
+        before = {"entry": st.entry, "liq": st.liq, "leverage": st.leverage}
+        if "entry" in changed:
+            st.entry = changed["entry"]
+        if "liq" in changed:
+            st.liq = changed["liq"]
+        if "leverage" in changed:
+            st.leverage = int(changed["leverage"])
+        self._log_tpsl({"event": "position_reconciled", "ts": time.time(),
+                        "symbol": sym, "position_id": pid,
+                        "engine": before, "exchange": changed})
+
     #: A stop this engine wrote a moment ago is echoed by the next read-back.
     #: Inside this window the exchange's value is OUR write, not an operator
     #: edit, and adopting it would just be reading our own handwriting.
     _SL_WRITE_GRACE_SEC = 5.0
+    #: How long "the exchange does not list this stop" is treated as OUR write
+    #: still propagating rather than the stop being gone. A differing VALUE is
+    #: strong evidence and only needs the 5s echo window; a MISSING row is
+    #: weak evidence (the exchange may not have indexed it yet), so it gets a
+    #: longer benefit of the doubt before the engine declares a position
+    #: unprotected.
+    _SL_ABSENT_GRACE_SEC = 90.0
 
-    async def _exchange_sl_map(self) -> dict[str, float]:
-        """positionId -> the stop-loss the exchange is actually holding.
+    async def _exchange_tpsl_state(self) -> _TpslReadback:
+        """What the exchange is holding for every position, in ONE call.
 
-        ONE call covers every open position: `get_pending_orders` answers with
-        all pending TP/SL rows and each row carries its own `slPrice`. The
-        PARTIAL rungs are TP-only (no `slPrice`), so they drop out, and a
-        position whose rows disagree with each other is dropped rather than
-        guessed at - there is no single "the stop" to adopt in that case.
-
-        A read that fails degrades to "no read-back": the engine then behaves
-        exactly as before (its own bookkeeping), never crashing a loop over a
-        reporting nicety.
+        `get_pending_orders` returns all pending TP/SL rows; each row carries
+        its own `slPrice`/`tpPrice`. A position whose rows disagree about a
+        price is dropped rather than guessed at - there is no single value to
+        adopt in that case. A read that fails degrades to "no read-back": the
+        engine then behaves as before, never crashing a loop over it.
         """
+        out = _TpslReadback()
         try:
             data = await self.client.get_pending_tp_sl_order(limit=100)
         except BitunixAPIError as e:
-            self.state.errors.append(f"sl read-back: {e}")
-            return {}
+            self.state.errors.append(f"tpsl read-back: {e}")
+            return out
         except Exception as e:  # noqa: BLE001 - a client without the method
-            log.debug("sl read-back unavailable: %s", e)
-            return {}
-        out: dict[str, float] = {}
-        conflicted: set[str] = set()
-        for row in order_rows(data):
-            pid = str(row.get("positionId") or "")
+            log.debug("tpsl read-back unavailable: %s", e)
+            return out
+        partial = (self.state.tpsl_method or "POSITION").upper() == "PARTIAL"
+        rows = order_rows(data)
+        total: int | None = None
+        if isinstance(data, dict):
             try:
-                px = float(str(row.get("slPrice") or 0))
+                total = int(data.get("total"))
             except (TypeError, ValueError):
+                total = None
+        out.complete = ((total <= len(rows)) if total is not None
+                        else len(rows) < 100)
+        sl_seen: dict[str, set[float]] = {}
+        tp_seen: dict[str, set[float]] = {}
+        for row in rows:
+            pid = str(row.get("positionId") or "")
+            if not pid:
                 continue
-            if not pid or px <= 0:
+            sl = _as_float(row.get("slPrice"))
+            tp = _as_float(row.get("tpPrice"))
+            if sl > 0:
+                sl_seen.setdefault(pid, set()).add(sl)
+            if tp <= 0:
                 continue
-            if pid in out and out[pid] != px:
-                conflicted.add(pid)
-            out[pid] = px
-        for pid in conflicted:
-            out.pop(pid, None)
+            if sl > 0 or not partial:
+                # both prices on one order (or a POSITION-method TP): the
+                # position-level take-profit.
+                tp_seen.setdefault(pid, set()).add(tp)
+            else:
+                # TP only under PARTIAL = a parked rung, with its own qty.
+                out.rungs.setdefault(pid, []).append({
+                    "order_id": str(row.get("id") or ""),
+                    "price": tp,
+                    "qty": _as_float(row.get("tpQty")),
+                })
+        for pid, vals in sl_seen.items():
+            out.sl_seen.add(pid)
+            if len(vals) == 1:
+                out.sl[pid] = next(iter(vals))
+        for pid, vals in tp_seen.items():
+            out.tp_seen.add(pid)
+            if len(vals) == 1:
+                out.tp[pid] = next(iter(vals))
+        for rows in out.rungs.values():
+            rows.sort(key=lambda r: r["price"])
+        out.ok = True
         return out
 
     @staticmethod
@@ -2215,7 +2571,8 @@ class TraderEngine:
         return candidate <= reference
 
     def _adopt_exchange_sl(self, st: PositionState, ex_sl: float, *,
-                           rules: PairRules | None, source: str) -> bool:
+                           rules: PairRules | None, source: str,
+                           force: bool = False) -> bool:
         """Make the engine's stop the stop the exchange will fire on.
 
         `st.sl` was only ever WRITTEN by this engine - at entry, by the
@@ -2232,8 +2589,11 @@ class TraderEngine:
         widened again on the next trail write, and a manually LOOSENED one
         would be tightened back seconds later. The exchange is the source of
         truth for the stop; the engine resumes protecting from there.
+
+        `force` is for the private WS: a push is ordered AFTER the write it
+        describes, so its value is never a stale echo of our own request.
         """
-        if st.position_id in self._sl_writes and (
+        if not force and st.position_id in self._sl_writes and (
                 time.time() - self._sl_writes[st.position_id]
                 < self._SL_WRITE_GRACE_SEC):
             return False
@@ -2253,24 +2613,94 @@ class TraderEngine:
                         "source": source})
         return True
 
-    async def _read_back_sl(self, pids: set[str] | None = None) -> None:
-        """Adopt the exchange's stop for every live position we track.
+    def _adopt_exchange_tp(self, st: PositionState, ex_tp: float, *,
+                           rules: PairRules | None, source: str,
+                           force: bool = False) -> bool:
+        """The take-profit is the exchange's number too.
 
-        Used by the report, which PRINTS `st.sl` and must print the number
-        the exchange holds. The manage loop reads the same map itself,
-        because it needs it before it decides whether to move a stop.
+        Same defect as the stop: `st.tp` was written at entry and never read
+        back. A TP the operator moved by hand was invisible, and the next
+        breakeven/trailing modify sent `tp_price=st.tp` (or None when the
+        engine believed there was no TP) - overwriting the edit.
         """
-        sl_map = await self._exchange_sl_map()
-        if not sl_map:
+        if not force and st.position_id in self._sl_writes and (
+                time.time() - self._sl_writes[st.position_id]
+                < self._SL_WRITE_GRACE_SEC):
+            return False
+        if st.tp > 0:
+            if rules is not None:
+                same = format_price(st.tp, rules) == format_price(ex_tp, rules)
+            else:
+                same = math.isclose(st.tp, ex_tp, rel_tol=1e-9, abs_tol=0.0)
+            if same:
+                return False
+        engine_tp = st.tp
+        st.tp = ex_tp
+        self._log_tpsl({"event": "tp_reconciled", "ts": time.time(),
+                        "symbol": st.symbol, "position_id": st.position_id,
+                        "engine_tp": engine_tp, "exchange_tp": ex_tp,
+                        "source": source})
+        return True
+
+    def _read_back_tpsl(self, ex: _TpslReadback,
+                        pids: set[str] | None = None,
+                        source: str = "report") -> None:
+        """Adopt every exit price the exchange holds - and its absence.
+
+        `st.sl` / `st.tp` were write-only engine memory. Adopting a value the
+        exchange holds is only half the read-back: when the exchange holds NO
+        stop, the engine must stop claiming it does. Otherwise a stop the
+        operator cancelled leaves `breakeven_done=True` and a stop in the
+        report that is not on the exchange - the position is naked while every
+        engine surface says it is protected.
+        """
+        if not ex.ok:
             return
-        for st in self.positions.values():
+        now = time.time()
+        for st in list(self.positions.values()):
             if pids is not None and st.position_id not in pids:
                 continue
-            ex_sl = sl_map.get(st.position_id)
-            if ex_sl:
-                self._adopt_exchange_sl(
-                    st, ex_sl, rules=self.rules.get(st.symbol),
-                    source="report")
+            rules = self.rules.get(st.symbol)
+            sl = ex.sl.get(st.position_id)
+            if sl:
+                self._adopt_exchange_sl(st, sl, rules=rules, source=source)
+            elif st.sl > 0 and st.position_id not in ex.sl_seen:
+                self._note_exit_gone(st, "sl", source, now, complete=ex.complete)
+            tp = ex.tp.get(st.position_id)
+            if tp:
+                self._adopt_exchange_tp(st, tp, rules=rules, source=source)
+            elif st.tp > 0 and st.position_id not in ex.tp_seen:
+                self._note_exit_gone(st, "tp", source, now, complete=ex.complete)
+
+    def _note_exit_gone(self, st: PositionState, which: str, source: str,
+                        now: float, *, complete: bool) -> None:
+        """The exchange no longer holds this exit - make the engine say so."""
+        if not complete:
+            return                      # a truncated page proves nothing
+        last = self._sl_writes.get(st.position_id)
+        if last is not None and now - last < self._SL_ABSENT_GRACE_SEC:
+            return                      # our own write may not be listed yet
+        if which == "sl":
+            if st.sl <= 0:
+                return
+            engine_sl = st.sl
+            st.sl = 0.0
+            st.trailing_stop = 0.0
+            st.breakeven_done = False
+            st.trailing_active = False
+            self._log_tpsl({"event": "sl_missing_on_exchange",
+                            "ts": time.time(), "symbol": st.symbol,
+                            "position_id": st.position_id,
+                            "engine_sl": engine_sl, "source": source})
+        else:
+            if st.tp <= 0:
+                return
+            engine_tp = st.tp
+            st.tp = 0.0
+            self._log_tpsl({"event": "tp_missing_on_exchange",
+                            "ts": time.time(), "symbol": st.symbol,
+                            "position_id": st.position_id,
+                            "engine_tp": engine_tp, "source": source})
 
     async def _apply_breakeven(self, st: PositionState, sym: str, pid: str,
                                side: str, entry: float, mark: float, *,
@@ -2371,7 +2801,7 @@ class TraderEngine:
                 "new_sl": sl, "roi": round(roi, 2)}
 
     async def _manage_one_position(self, p: dict,
-                                   sl_map: dict[str, float] | None = None,
+                                   ex: _TpslReadback | None = None,
                                    ) -> list[dict]:
         """Breakeven, trailing and the reversal close for ONE position."""
         actions: list[dict] = []
@@ -2419,14 +2849,12 @@ class TraderEngine:
                 return actions
 
             self._reconcile_qty(st, p, sym, pid, rules)
+            self._reconcile_position_fields(st, p, sym, pid)
 
-            # The exchange's stop, before anything decides to move it: a stop
-            # the operator edited by hand must be the engine's truth too, or
-            # the very next breakeven/trailing write reverts the edit.
-            ex_sl = (sl_map or {}).get(pid)
-            if ex_sl:
-                self._adopt_exchange_sl(st, ex_sl, rules=rules,
-                                        source="manage")
+            # The exchange's exits, before anything decides to move them: a
+            # stop/target the operator edited by hand must be the engine's
+            # truth too, or the very next breakeven/trailing write reverts it.
+            self._read_back_tpsl(ex or _TpslReadback(), {pid}, source="manage")
 
             # 1) breakeven - always armed: move SL to entry once ROI passes
             # the threshold, with no ladder gating (the ladder machinery is
@@ -2646,11 +3074,18 @@ class TraderEngine:
         positions = live or []
         self.reconcile_positions(live)
         live_ids = {str(p.get("positionId") or "") for p in positions}
-        # The report quotes `st.sl`; the operator compares it with the app.
-        # Read the exchange's own stop back first so the two agree even when
-        # the stop was moved by hand (and even when the manage loop is off).
+        # The report quotes st.sl/st.tp/st.liq/leverage; read the exchange's
+        # own values back first so the numbers agree with the app even when
+        # they were changed by hand (and even when the manage loop is off).
+        ex = _TpslReadback()
         if positions:
-            await self._read_back_sl(live_ids)
+            for p in positions:
+                pid = str(p.get("positionId") or "")
+                st = self.positions.get(pid)
+                if st is not None:
+                    self._reconcile_position_fields(st, p, st.symbol, pid)
+            ex = await self._exchange_tpsl_state()
+            self._read_back_tpsl(ex, live_ids, source="report")
         if positions:
             lines.append("-- open positions --")
             for p in positions:
@@ -2678,12 +3113,13 @@ class TraderEngine:
                     f"px={price} roi={roi:.2f}% liq={p.get('liqPrice')}")
         else:
             lines.append("no open positions")
-        lines.extend(await self._report_tpsl(live_ids))
+        lines.extend(await self._report_tpsl(live_ids, ex))
         if self.state.errors:
             lines.append(f"errors: {len(self.state.errors)} (last: {self.state.errors[-1]})")
         return "\n".join(lines)
 
-    async def _report_tpsl(self, live_ids: set[str] | None = None) -> list[str]:
+    async def _report_tpsl(self, live_ids: set[str] | None = None,
+                           tpsl: _TpslReadback | None = None) -> list[str]:
         """The TP/SL state of the account, in the report.
 
         The report used to stop at the signal and the position line, so an
@@ -2746,26 +3182,52 @@ class TraderEngine:
                 trail = "OFF(mid management off)"
             lines.append(
                 f"  {st.symbol} {st.side} qty={st.qty:g} entry={st.entry:g} "
-                f"sl={st.sl:g} tp={tp} liq={st.liq:g} "
+                f"sl={st.sl:g}"
+                + (" (NO STOP ON THE EXCHANGE)" if st.sl <= 0 else "")
+                + f" tp={tp} liq={st.liq:g} "
                 f"be={be} trail={trail}"
                 + (f" peak_roi={st.peak_roi:.2f}%" if st.peak_roi else ""))
 
-        # the rungs that are actually parked on the exchange, from the log -
-        # but only for a position that is STILL open
-        for rec in reversed(self.tpsl_history(20)):
-            if rec.get("event") != "partial_rungs_placed":
-                continue
-            placed = rec.get("placed") or []
-            if not placed:
-                continue
-            pid = str(rec.get("position_id") or "")
-            if live_ids is not None and pid not in live_ids:
-                continue          # the position is gone - the rungs are history
-            rungs = ", ".join(
-                f"{p.get('share')}%@{p.get('r')}R={p.get('price')}"
-                for p in placed)
-            lines.append(f"  parked rungs ({rec.get('symbol')}): {rungs}")
-            break
+        # the rungs that are ACTUALLY parked on the exchange. The log only
+        # records what the engine PLACED: a rung the operator cancelled or
+        # that already filled would still be reported as working. When the
+        # exchange's pending orders were read, they are the source of truth.
+        if tpsl is not None and m == "PARTIAL":
+            if not tpsl.ok:
+                lines.append("  parked rungs: could not read the exchange "
+                             "(the pending TP/SL read failed)")
+            else:
+                for st in self.positions.values():
+                    if live_ids is not None and st.position_id not in live_ids:
+                        continue
+                    rows = tpsl.rungs.get(st.position_id) or []
+                    if rows:
+                        shown = ", ".join(
+                            f"{r['price']:g}x{r['qty']:g}" for r in rows)
+                        lines.append(
+                            f"  parked rungs on the exchange ({st.symbol}): {shown}")
+                    elif not tpsl.complete:
+                        lines.append(
+                            f"  parked rungs ({st.symbol}): the exchange page "
+                            f"was full - the list may be incomplete")
+                    else:
+                        lines.append(
+                            f"  parked rungs ({st.symbol}): none on the exchange")
+        else:
+            for rec in reversed(self.tpsl_history(20)):
+                if rec.get("event") != "partial_rungs_placed":
+                    continue
+                placed = rec.get("placed") or []
+                if not placed:
+                    continue
+                pid = str(rec.get("position_id") or "")
+                if live_ids is not None and pid not in live_ids:
+                    continue          # the position is gone - the rungs are history
+                rungs = ", ".join(
+                    f"{p.get('share')}%@{p.get('r')}R={p.get('price')}"
+                    for p in placed)
+                lines.append(f"  parked rungs ({rec.get('symbol')}): {rungs}")
+                break
         lines.extend(self._report_closes())
         if self.state.notes:
             lines.append(f"notes: {len(self.state.notes)} "
@@ -3464,8 +3926,15 @@ class TraderEngine:
                     self._position_mode = ""
                     self._position_mode_ts = 0.0
                     return f"Position mode set locally to {val}, exchange said: {e}"
-                self._remember_position_mode(val)
-                return f"Position mode = {val}."
+                # A successful write is not the mode: read it back, so the
+                # cache and the operator both see what the exchange stored.
+                self._position_mode = ""
+                self._position_mode_ts = 0.0
+                mode = await self.account_position_mode()
+                if mode and mode != val:
+                    return (f"Position mode requested {val}; the exchange "
+                            f"reports {mode}.")
+                return f"Position mode = {mode or val}."
             return "Usage: Position mode HEDGE|ONE_WAY"
             return "Usage: Symbols BTCUSDT,ETHUSDT"
         if low.startswith("max open positions"):

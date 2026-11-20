@@ -624,6 +624,12 @@ onto WS by default would mean trusting an unverified auth path with real
 positions. Set `MARKET_DATA_SOURCE=ws` yourself once you have confirmed
 `/ws test` and a private login on your own keys.
 
+The **private account feed is independent of that choice**: with credentials
+present it opens even under `MARKET_DATA_SOURCE=rest`, because "what the
+exchange holds right now" (a stop edited in the app, a position closed by a
+TP) is not a market-data question. Its `tpsl` and `position` pushes update
+the engine's state immediately; the REST read-back remains the fallback.
+
 ### Price cache - how `ws` actually replaces REST
 
 `MARKET_DATA_SOURCE=ws` is not a label. Every price read in the engine goes

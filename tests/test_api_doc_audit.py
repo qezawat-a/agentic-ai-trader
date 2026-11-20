@@ -439,8 +439,10 @@ def test_private_feed_tpsl_buffer_is_bounded():
     assert len(pf.tpsl_events) == 200, "the buffer must not grow forever"
 
 
-def test_private_feed_is_not_opened_in_rest_mode():
-    """rest mode must still open ZERO sockets."""
+def test_rest_mode_opens_no_public_socket_and_private_is_independent():
+    """rest mode must open no PUBLIC socket. The private account stream is
+    not a market-data question: with no credentials it is skipped with a
+    reason, and with credentials it is opened even in rest mode."""
     from jrock.trader.engine import TraderEngine
 
     s = Settings()
@@ -449,7 +451,7 @@ def test_private_feed_is_not_opened_in_rest_mode():
     asyncio.run(e.start_feed())
     assert e.feed is None
     assert e.private_feed is None
-    assert "not opened" in e.private_feed_report()
+    assert "BITUNIX_API_KEY" in e.private_feed_report()
 
 
 def test_private_feed_report_says_why_when_credentials_are_missing():
