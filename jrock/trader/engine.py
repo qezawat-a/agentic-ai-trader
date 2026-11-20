@@ -2532,7 +2532,7 @@ class TraderEngine:
             self.state.errors.append(f"tpsl read-back: {e}")
             return out
         except Exception as e:  # noqa: BLE001 - a client without the method
-            log.debug("tpsl read-back unavailable: %s", e)
+            self.state.errors.append(f"tpsl read-back: {type(e).__name__}: {e}")
             return out
         partial = (self.state.tpsl_method or "POSITION").upper() == "PARTIAL"
         rows = order_rows(data)
