@@ -26,7 +26,7 @@ from ..store import Store, open_store
 from .account_tpsl import (AccountTpSlConfig, account_tpsl_decision,
                            total_unrealized_pnl)
 from .aggregator import Aggregate, aggregate
-from .client import BitunixClient, BitunixConfig, order_row
+from .client import BitunixClient, BitunixConfig, order_row, order_rows
 from .errors import BitunixAPIError
 from .indicators import atr, to_candles
 from .kline_cache import REST_KLINE_MAX, KlineCache
@@ -257,6 +257,10 @@ class TraderEngine:
         #: warning is advisory (the entry path still refuses the entry); this
         #: dedupes the repeat emission across scan cycles.
         self._leverage_watch_ts: dict[str, float] = {}
+        #: positionId -> when this engine last WROTE a stop for it (epoch).
+        #: The read-back must not treat its own fresh write as an operator
+        #: edit - see `_adopt_exchange_sl`.
+        self._sl_writes: dict[str, float] = {}
         #: auto-ranked universe symbols (SYMBOLS=AUTO) that the WS feed must
         #: price each cycle. Empty when universe ranking is off.
         self._auto_symbols: list[str] = []
@@ -1665,6 +1669,10 @@ class TraderEngine:
                 liq=float(p.get("liqPrice") or plan.liq),
                 opened_ts=time.time(),
             )
+            # The entry order carried this stop, so the exchange already has
+            # it: stamp the write so the read-back does not mistake the echo
+            # of OUR stop for an operator edit.
+            self._sl_writes[pid] = time.time()
             # With the PARTIAL method the rungs are parked at entry as
             # native exchange-enforced TP orders (tpQty each), so the
             # exits survive even if this engine dies.
@@ -2053,8 +2061,13 @@ class TraderEngine:
             actions.append(closed_all)
             return actions
 
+        # The exchange's OWN stops, read once for the whole pass: the manage
+        # loop must not act on a stop the operator moved by hand (see
+        # `_adopt_exchange_sl`).
+        sl_map = await self._exchange_sl_map() if positions else {}
+
         for p in positions:
-            actions.extend(await self._manage_one_position(p))
+            actions.extend(await self._manage_one_position(p, sl_map))
 
         # Management state (breakeven_done / trailing_stop / peak_roi) must hit
         # the disk even if the process is killed a moment later.
@@ -2145,6 +2158,120 @@ class TraderEngine:
                         "engine_qty": st.qty, "exchange_qty": live_qty})
         st.qty = live_qty
 
+    #: A stop this engine wrote a moment ago is echoed by the next read-back.
+    #: Inside this window the exchange's value is OUR write, not an operator
+    #: edit, and adopting it would just be reading our own handwriting.
+    _SL_WRITE_GRACE_SEC = 5.0
+
+    async def _exchange_sl_map(self) -> dict[str, float]:
+        """positionId -> the stop-loss the exchange is actually holding.
+
+        ONE call covers every open position: `get_pending_orders` answers with
+        all pending TP/SL rows and each row carries its own `slPrice`. The
+        PARTIAL rungs are TP-only (no `slPrice`), so they drop out, and a
+        position whose rows disagree with each other is dropped rather than
+        guessed at - there is no single "the stop" to adopt in that case.
+
+        A read that fails degrades to "no read-back": the engine then behaves
+        exactly as before (its own bookkeeping), never crashing a loop over a
+        reporting nicety.
+        """
+        try:
+            data = await self.client.get_pending_tp_sl_order(limit=100)
+        except BitunixAPIError as e:
+            self.state.errors.append(f"sl read-back: {e}")
+            return {}
+        except Exception as e:  # noqa: BLE001 - a client without the method
+            log.debug("sl read-back unavailable: %s", e)
+            return {}
+        out: dict[str, float] = {}
+        conflicted: set[str] = set()
+        for row in order_rows(data):
+            pid = str(row.get("positionId") or "")
+            try:
+                px = float(str(row.get("slPrice") or 0))
+            except (TypeError, ValueError):
+                continue
+            if not pid or px <= 0:
+                continue
+            if pid in out and out[pid] != px:
+                conflicted.add(pid)
+            out[pid] = px
+        for pid in conflicted:
+            out.pop(pid, None)
+        return out
+
+    @staticmethod
+    def _at_least_as_protective(side: str, candidate: float,
+                                reference: float) -> bool:
+        """Is `candidate` at least as close to the price as `reference`?
+
+        For a LONG the stop that triggers FIRST is the higher one; for a
+        SHORT it is the lower one. Direction-aware, because "tighter" is not
+        a property of a number - it is a property of a number and a side.
+        """
+        if side.upper() in ("LONG", "BUY"):
+            return candidate >= reference
+        return candidate <= reference
+
+    def _adopt_exchange_sl(self, st: PositionState, ex_sl: float, *,
+                           rules: PairRules | None, source: str) -> bool:
+        """Make the engine's stop the stop the exchange will fire on.
+
+        `st.sl` was only ever WRITTEN by this engine - at entry, by the
+        breakeven and by the trailing ratchet - and never read back. A stop
+        the operator moved by hand in the Bitunix app was therefore invisible:
+        the report quoted a number that was not on the exchange (live:
+        app 0.006430 against a report that said 0.00639), and the next
+        breakeven/trailing pass silently put the engine's own value back,
+        undoing the edit.
+
+        Adopting also REBASES the trailing ratchet. `next_trailing_stop` only
+        ever compares against `st.trailing_stop`, so without this the ratchet
+        would keep the engine's old level: a manually TIGHTENED stop would be
+        widened again on the next trail write, and a manually LOOSENED one
+        would be tightened back seconds later. The exchange is the source of
+        truth for the stop; the engine resumes protecting from there.
+        """
+        if st.position_id in self._sl_writes and (
+                time.time() - self._sl_writes[st.position_id]
+                < self._SL_WRITE_GRACE_SEC):
+            return False
+        if st.sl > 0:
+            if rules is not None:
+                same = format_price(st.sl, rules) == format_price(ex_sl, rules)
+            else:
+                same = math.isclose(st.sl, ex_sl, rel_tol=1e-9, abs_tol=0.0)
+            if same:
+                return False
+        engine_sl = st.sl
+        st.sl = ex_sl
+        st.trailing_stop = ex_sl
+        self._log_tpsl({"event": "sl_reconciled", "ts": time.time(),
+                        "symbol": st.symbol, "position_id": st.position_id,
+                        "engine_sl": engine_sl, "exchange_sl": ex_sl,
+                        "source": source})
+        return True
+
+    async def _read_back_sl(self, pids: set[str] | None = None) -> None:
+        """Adopt the exchange's stop for every live position we track.
+
+        Used by the report, which PRINTS `st.sl` and must print the number
+        the exchange holds. The manage loop reads the same map itself,
+        because it needs it before it decides whether to move a stop.
+        """
+        sl_map = await self._exchange_sl_map()
+        if not sl_map:
+            return
+        for st in self.positions.values():
+            if pids is not None and st.position_id not in pids:
+                continue
+            ex_sl = sl_map.get(st.position_id)
+            if ex_sl:
+                self._adopt_exchange_sl(
+                    st, ex_sl, rules=self.rules.get(st.symbol),
+                    source="report")
+
     async def _apply_breakeven(self, st: PositionState, sym: str, pid: str,
                                side: str, entry: float, mark: float, *,
                                rules: PairRules, roi: float,
@@ -2155,6 +2282,16 @@ class TraderEngine:
         sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
                       rules=rules, min_ticks=self.state.min_stop_ticks,
                       liq=st.liq or None)
+        # The operator may have ALREADY put the stop at or past the
+        # breakeven by hand - the read-back adopted it into `st.sl`. Sending
+        # `entry` now would LOOSEN the stop they just tightened, and the
+        # report would show the engine undoing an edit it had just seen.
+        if st.sl > 0 and self._at_least_as_protective(side, st.sl, sl):
+            st.breakeven_done = True
+            self._log_tpsl({"event": "breakeven_already", "ts": time.time(),
+                            "symbol": sym, "position_id": pid, "sl": st.sl,
+                            "target": sl, "roi": round(roi, 2)})
+            return None
         if not self._tpsl_side_ok(sym, side, entry, mark, sl=sl, tp=st.tp, rules=rules):
             return None
         try:
@@ -2167,6 +2304,7 @@ class TraderEngine:
             return None
         st.breakeven_done = True
         st.sl = sl
+        self._sl_writes[pid] = time.time()
         self._log_tpsl({"event": "breakeven", "ts": time.time(), "symbol": sym,
                         "position_id": pid, "sl": sl, "roi": round(roi, 2)})
         return {"action": "breakeven", "symbol": sym,
@@ -2226,12 +2364,15 @@ class TraderEngine:
         st.trailing_stop = sl
         st.trailing_active = True
         st.sl = sl
+        self._sl_writes[pid] = time.time()
         self._log_tpsl({"event": "trail", "ts": time.time(), "symbol": sym,
                         "position_id": pid, "sl": sl, "roi": round(roi, 2)})
         return {"action": "trail", "symbol": sym,
                 "new_sl": sl, "roi": round(roi, 2)}
 
-    async def _manage_one_position(self, p: dict) -> list[dict]:
+    async def _manage_one_position(self, p: dict,
+                                   sl_map: dict[str, float] | None = None,
+                                   ) -> list[dict]:
         """Breakeven, trailing and the reversal close for ONE position."""
         actions: list[dict] = []
         if True:
@@ -2278,6 +2419,14 @@ class TraderEngine:
                 return actions
 
             self._reconcile_qty(st, p, sym, pid, rules)
+
+            # The exchange's stop, before anything decides to move it: a stop
+            # the operator edited by hand must be the engine's truth too, or
+            # the very next breakeven/trailing write reverts the edit.
+            ex_sl = (sl_map or {}).get(pid)
+            if ex_sl:
+                self._adopt_exchange_sl(st, ex_sl, rules=rules,
+                                        source="manage")
 
             # 1) breakeven - always armed: move SL to entry once ROI passes
             # the threshold, with no ladder gating (the ladder machinery is
@@ -2497,6 +2646,11 @@ class TraderEngine:
         positions = live or []
         self.reconcile_positions(live)
         live_ids = {str(p.get("positionId") or "") for p in positions}
+        # The report quotes `st.sl`; the operator compares it with the app.
+        # Read the exchange's own stop back first so the two agree even when
+        # the stop was moved by hand (and even when the manage loop is off).
+        if positions:
+            await self._read_back_sl(live_ids)
         if positions:
             lines.append("-- open positions --")
             for p in positions:
