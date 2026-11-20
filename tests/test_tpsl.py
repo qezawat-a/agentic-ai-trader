@@ -43,6 +43,53 @@ def test_stronger_signal_gives_bigger_tp():
     assert strong.tp > weak.tp
 
 
+def test_auto_sl_distance_comes_from_signal_strength():
+    """`sl distance auto`: the agent picks the stop, not the operator.
+
+    Stronger signals get a tighter stop - the entry is more reliable - and the
+    TP is still scaled off that stop, so one setting drives both sides.
+    """
+    weak = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
+                     strength="weak", confidence=65, tiers=TIERS, rules=RULES,
+                     sl_distance_auto=True)
+    strong = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
+                       strength="strong", confidence=90, tiers=TIERS,
+                       rules=RULES, sl_distance_auto=True)
+    assert weak.sl == pytest.approx(97.0, rel=1e-6)      # 3% stop
+    assert strong.sl == pytest.approx(98.5, rel=1e-6)    # 1.5% stop
+    assert strong.sl > weak.sl                           # tighter when stronger
+    # a stop exists, so the TP the R-multiple derives from it exists too
+    assert weak.tp > 100 and strong.tp > 100
+
+
+def test_auto_wins_over_a_stale_manual_distance():
+    """A leftover sl_distance_pct must not keep deciding after `sl distance auto`.
+
+    Otherwise the operator types the command, sees an acknowledgement, and the
+    old number silently still owns the stop.
+    """
+    p = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
+                  strength="strong", confidence=90, tiers=TIERS, rules=RULES,
+                  sl_distance_pct=35.0, sl_distance_auto=True)
+    assert p.sl == pytest.approx(98.5, rel=1e-6)         # 1.5%, not 35%
+
+
+def test_auto_with_no_signal_still_places_no_stop():
+    """`none` has no strength to derive from, so nothing is invented."""
+    p = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
+                  strength="none", confidence=0, tiers=TIERS, rules=RULES,
+                  sl_distance_auto=True)
+    assert p.sl == 0.0
+    assert p.tp == 0.0
+
+
+def test_manual_distance_is_unchanged_when_auto_is_off():
+    p = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
+                  strength="normal", confidence=75, tiers=TIERS, rules=RULES,
+                  sl_distance_pct=5.0, sl_distance_auto=False)
+    assert p.sl == pytest.approx(95.0, rel=1e-6)
+
+
 def test_higher_tier_raises_mmr():
     p1 = plan_tpsl(side="LONG", entry=100, leverage=10, notional=1000,
                    strength="normal", confidence=75, tiers=TIERS, rules=RULES)

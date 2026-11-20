@@ -94,6 +94,7 @@ REAL_COMMANDS = [
     "breakeven threshold 0.5",
     "trailing trigger 1.0",
     "sl distance 2",
+    "sl distance auto",
     "min agreeing 3",
     "min confidence 80",
     "tf min confidence 60",
@@ -414,3 +415,25 @@ def test_the_aliases_do_not_swallow_a_question(tmp_path):
     for q in ("is the leverage too high?", "what does margin per trade mean?",
               "should I set reversal confidence to 90?"):
         assert not a.engine.looks_like_command(q), q
+
+
+def test_sl_distance_auto_is_a_command_not_a_model_fallback(tmp_path):
+    """`sl distance auto` must reach the engine.
+
+    It is the only `sl distance` argument that is not a number, so the
+    numeric-argument guard rejected it, nlu did not know it either, and the
+    line fell through to the model - which, when the model was down, answered
+    an HTTP 504 instead of changing the setting the operator asked for.
+    """
+    a = _agent(tmp_path)
+    assert a.engine.looks_like_command("sl distance auto") is True
+
+    out = _run(a.handle("sl distance auto"))
+    assert a.engine.state.sl_distance_auto is True, out
+    assert "auto" in out.lower(), out
+    assert "unknown" not in out.lower(), out
+
+    # and the numeric form still turns auto back off
+    out = _run(a.handle("sl distance 2"))
+    assert a.engine.state.sl_distance_auto is False, out
+    assert a.engine.state.sl_distance_pct == 2.0, out

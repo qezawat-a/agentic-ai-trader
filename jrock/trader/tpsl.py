@@ -145,10 +145,13 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
     ref = mark if (mark is not None and mark > 0) else entry
 
     # Auto mode: derive the stop distance from signal strength so the
-    # operator does not have to pick a percentage. 0 still means "no stop".
-    effective_sl_pct = sl_distance_pct
-    if sl_distance_auto and sl_distance_pct <= 0:
+    # operator does not have to pick a percentage. It WINS over a stale
+    # manual number - otherwise a leftover sl_distance_pct silently keeps
+    # deciding after "sl distance auto" was typed.
+    if sl_distance_auto:
         effective_sl_pct = AUTO_SL_DISTANCE_PCT.get(strength, 0.0)
+    else:
+        effective_sl_pct = sl_distance_pct
 
     if effective_sl_pct > 0:
         sl = sl_from_distance(entry, side, effective_sl_pct)

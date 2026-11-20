@@ -2922,6 +2922,13 @@ class TraderEngine:
         # A numeric command takes a number, optionally preceded by a unit word
         # ("leverage to 20", "risk pct 1.5", "min confidence 70").
         if p in self._NUMERIC_ARG_COMMANDS:
+            # "sl distance auto" is the one non-numeric argument: it hands the
+            # distance back to the agent. Without this the line fails the
+            # grammar check above, falls through to nlu and then to the model,
+            # and with the model down the operator gets an HTTP 504 instead of
+            # the setting they asked for.
+            if p == "sl distance" and rest.strip("=:. ").lower() == "auto":
+                return True
             return bool(re.search(r"-?\d+(?:\.\d+)?", rest))
         # Symbol lists: "symbols BTCUSDT,ETHUSDT" / "symbol BTCUSDT".
         if p in ("symbols", "symbol"):
