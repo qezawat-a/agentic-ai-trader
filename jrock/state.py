@@ -139,6 +139,8 @@ def _setting_fields(agent: JRockAgent) -> list[dict]:
         ("breakeven_pct", "breakeven threshold (%)", s.breakeven_pct),
         ("trailing_trigger_roi_pct", "trailing trigger ROI (%)", s.trailing_trigger_roi_pct),
         ("sl_distance_pct", "sl distance (%)", s.sl_distance_pct),
+        ("sl_distance_auto", "sl distance auto", s.sl_distance_auto),
+        ("reentry_cooldown_sec", "re-entry cooldown (s)", s.reentry_cooldown_sec),
         ("min_agreeing", "min agreeing strategies", s.min_agreeing),
         ("min_confidence", "min confidence", s.min_confidence),
         ("tf_min_confidence", "tf min confidence", s.tf_min_confidence),

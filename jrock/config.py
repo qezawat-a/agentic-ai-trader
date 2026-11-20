@@ -136,6 +136,10 @@ class Settings:
     #: Stop-loss distance from the entry, % of price (0 = none).
     #: The stop is the user's setting; the app never invents one.
     sl_distance_pct: float = 0.0
+    #: When True the agent derives the stop distance from signal strength
+    #: instead of using sl_distance_pct (weak 3%, normal 2%, strong 1.5%,
+    #: extreme 1%). 0 = none still disables stops entirely.
+    sl_distance_auto: bool = False
     min_agreeing: int = 3
     timeframes: list[str] = field(default_factory=lambda: ["1m", "3m", "5m", "15m"])
     min_confidence: float = 70.0
@@ -281,6 +285,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         breakeven_pct=_f("TRADE_BREAKEVEN_PCT", 0.6),
         trailing_trigger_roi_pct=_f("TRADE_TRAILING_TRIGGER_ROI_PCT", 25.0),
         sl_distance_pct=_f("TRADE_SL_DISTANCE_PCT", 0.0),
+        sl_distance_auto=_b("TRADE_SL_DISTANCE_AUTO", False),
         min_agreeing=_i("TRADE_MIN_AGREING", 3),
         timeframes=tfs or ["1m", "3m", "5m", "15m"],
         min_confidence=_f("TRADE_MIN_CONFIDENCE", 70.0),

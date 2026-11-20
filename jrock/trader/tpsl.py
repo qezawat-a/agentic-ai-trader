@@ -2,13 +2,18 @@
 
 The user sets the stop-loss distance, breakeven and trailing trigger:
     sl_distance_pct          - stop `distance_pct` % from entry (0 = none)
+    sl_distance_auto         - when True the agent derives the stop distance
+                              from signal strength (weak 3%, normal 2%,
+                              strong 1.5%, extreme 1%) instead of using
+                              sl_distance_pct. 0 still disables stops.
     breakeven_pct            - move SL to entry once ROI >= this %
     trailing_trigger_roi_pct - start trailing once ROI >= this %
 
 Everything else is derived:
-    * SL is placed exactly `sl_distance_pct` from the entry - the app never
-      invents a distance, a fraction of the liquidation distance, or a
-      volatility floor. 0 disables both the stop and the TP.
+    * SL is placed exactly `sl_distance_pct` from the entry (or auto-derived
+      from strength when sl_distance_auto is True) - the app never invents a
+      distance beyond the configured/auto value. 0 disables both the stop
+      and the TP.
     * TP is a multiple of the SL distance, scaled by confidence/strength:
         weak 1.2R, normal 1.8R, strong 2.5R, extreme 3.2R
       (only when a stop is set; there is no distance to scale otherwise).
@@ -106,9 +111,19 @@ def _roi_pct(p: float, entry: float, side: str, leverage: int) -> float:
     return raw * leverage * 100.0
 
 
+AUTO_SL_DISTANCE_PCT = {
+    "none": 0.0,
+    "weak": 3.0,
+    "normal": 2.0,
+    "strong": 1.5,
+    "extreme": 1.0,
+}
+
+
 def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
               strength: str, confidence: float, tiers: list[Tier],
               rules: PairRules, sl_distance_pct: float = 0.0,
+              sl_distance_auto: bool = False,
               breakeven_pct: float = 0.6,
               trailing_trigger_roi_pct: float = 25.0,
               mark: float | None = None,
@@ -129,8 +144,14 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
     d = min_stop_distance(rules, min_stop_ticks)
     ref = mark if (mark is not None and mark > 0) else entry
 
-    if sl_distance_pct > 0:
-        sl = sl_from_distance(entry, side, sl_distance_pct)
+    # Auto mode: derive the stop distance from signal strength so the
+    # operator does not have to pick a percentage. 0 still means "no stop".
+    effective_sl_pct = sl_distance_pct
+    if sl_distance_auto and sl_distance_pct <= 0:
+        effective_sl_pct = AUTO_SL_DISTANCE_PCT.get(strength, 0.0)
+
+    if effective_sl_pct > 0:
+        sl = sl_from_distance(entry, side, effective_sl_pct)
         sl = round_price(sl, rules.quote_precision)
     else:
         sl = 0.0
@@ -156,7 +177,7 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
         sl_roi = 0.0
         tp_roi = 0.0
         rr = 0.0
-        notes = ["no stop configured (set sl distance pct <pct> - the app never invents one)"]
+        notes = ["no stop configured (set 'sl distance <pct>' or 'sl distance auto')"]
     else:
         tp = _plan_tp(side=side, entry=entry, ref=ref, sl_dist=sl_dist,
                       strength=strength, confidence=confidence, is_long=is_long,

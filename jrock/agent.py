@@ -113,7 +113,7 @@ TRADER ENGINE COMMANDS
   settings trade                    scan on | scan off
   mid management position trigger   reversal=true  reversal_confidence=70
   scans interval sec 30             breakeven threshold pct 0.6
-  trailing trigger stop ROI pct 25  sl distance pct 0
+  trailing trigger stop ROI pct 25  sl distance pct 0|auto
   min agreeing strategies 3         timeframes 1m,3m,5m,15m
   min confidence 70                 tf min confidence 60
   close position [SYMBOL]           margin mode ISOLATION|CROSS
@@ -2193,7 +2193,7 @@ class JRockAgent:
             risk_line,
             f"breakeven: {s.breakeven_pct}%  "
             f"trailing trigger: {s.trailing_trigger_roi_pct}% ROI  "
-            f"sl distance: {s.sl_distance_pct}% from entry (0 = none)",
+            f"sl distance: {'auto' if s.sl_distance_auto else f'{s.sl_distance_pct}%'} from entry (0 = none, auto = agent-decided)",
             f"min agreeing strategies: {s.min_agreeing}  "
             f"timeframes: {','.join(s.timeframes)}",
             f"min confidence: {s.min_confidence}  "

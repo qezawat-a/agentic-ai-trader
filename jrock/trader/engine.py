@@ -120,6 +120,7 @@ class EngineState:
     #: Stop-loss distance from the entry, as a % of price (0 = none).
     #: The app never invents one; the user's setting is the only source.
     sl_distance_pct: float = 0.0
+    sl_distance_auto: bool = False
     min_agreeing: int = 3
     timeframes: list[str] = field(default_factory=lambda: ["1m", "3m", "5m", "15m"])
     min_confidence: float = 70.0
@@ -219,6 +220,7 @@ class TraderEngine:
             breakeven_pct=settings.breakeven_pct,
             trailing_trigger_roi_pct=settings.trailing_trigger_roi_pct,
             sl_distance_pct=settings.sl_distance_pct,
+            sl_distance_auto=settings.sl_distance_auto,
             min_agreeing=settings.min_agreeing,
             timeframes=list(settings.timeframes),
             min_confidence=settings.min_confidence,
@@ -315,7 +317,7 @@ class TraderEngine:
         "reversal", "reversal_confidence", "mid_management",
         "symbols", "leverage", "margin_mode", "position_mode",
         "max_open_positions", "risk_pct", "margin_amount_pct", "breakeven_pct",
-        "trailing_trigger_roi_pct", "sl_distance_pct", "reentry_cooldown_sec",
+        "trailing_trigger_roi_pct", "sl_distance_pct", "sl_distance_auto", "reentry_cooldown_sec",
         "min_agreeing", "timeframes", "min_confidence", "tf_min_confidence",
         "scans",
         "tpsl_method", "partial_tp_ladder",
@@ -1302,6 +1304,7 @@ class TraderEngine:
                 notional=prov_notional,
                 strength=ctx.agg.strength, confidence=ctx.agg.confidence, tiers=ctx.tiers, rules=ctx.rules,
                 sl_distance_pct=self.state.sl_distance_pct,
+                sl_distance_auto=self.state.sl_distance_auto,
                 breakeven_pct=self.state.breakeven_pct,
                 trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
                 mark=ctx.mark, min_stop_ticks=self.state.min_stop_ticks,
@@ -1332,7 +1335,7 @@ class TraderEngine:
         if self.state.margin_amount_pct <= 0.0 and (not ctx.plan or ctx.plan.sl <= 0.0):
             return {"ok": False,
                     "reason": "no stop-loss is set and MARGIN_AMOUNT_PCT is 0 - "
-                              "nothing to size against. Set sl distance pct or a margin budget."}
+                              "nothing to size against. Set sl distance pct, 'sl distance auto', or a margin budget."}
         if self.state.margin_amount_pct > 0:
             ctx.qty = position_size_by_margin(
                 ctx.equity, self.state.margin_amount_pct, ctx.price, ctx.leverage, ctx.rules,
@@ -1455,6 +1458,7 @@ class TraderEngine:
                 notional=ctx.qty * ctx.price, strength=ctx.agg.strength, confidence=ctx.agg.confidence,
                 tiers=ctx.tiers, rules=ctx.rules,
                 sl_distance_pct=self.state.sl_distance_pct,
+                sl_distance_auto=self.state.sl_distance_auto,
                 breakeven_pct=self.state.breakeven_pct,
                 trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
                 mark=ctx.mark, min_stop_ticks=self.state.min_stop_ticks,
@@ -1689,14 +1693,15 @@ class TraderEngine:
         if not agg.actionable:
             return None, {"ok": False, "reason": "not actionable"}
 
+        live = await self.live_positions()
+        positions = live or []
+        self.reconcile_positions(live)
+
         # anti-churn: a symbol closed a moment ago is not re-entered
         cool = self._reentry_block(sym)
         if cool:
             return None, {"ok": False, "reason": cool}
 
-        live = await self.live_positions()
-        positions = live or []
-        self.reconcile_positions(live)
         if len(positions) >= self.state.max_open_positions:
             return None, {"ok": False, "reason": f"max open positions ({self.state.max_open_positions}) reached"}
         if any(p.get("symbol") == sym for p in positions):
@@ -2340,7 +2345,7 @@ class TraderEngine:
             "=== the exits, right now ===",
             f"armed: breakeven at +{s.breakeven_pct:g}% ROI, "
             f"trailing from +{s.trailing_trigger_roi_pct:g}% ROI, "
-            f"sl distance {s.sl_distance_pct:g}%",
+            f"sl distance {'auto' if s.sl_distance_auto else f'{s.sl_distance_pct:g}%'}",
             self._manage_state_line(),
         ]
         if not self.positions:
@@ -2417,7 +2422,7 @@ class TraderEngine:
             f"SETTINGS: leverage {s.leverage}x | margin mode {s.margin_mode} | "
             f"{sizing} | breakeven at +{s.breakeven_pct:g}% ROI | "
             f"trailing from +{s.trailing_trigger_roi_pct:g}% ROI | "
-            f"sl distance {s.sl_distance_pct:g}% | "
+            f"sl distance {'auto' if s.sl_distance_auto else f'{s.sl_distance_pct:g}%'} | "
             f"max {s.max_open_positions} position(s) | "
             f"re-entry cooldown {s.reentry_cooldown_sec}s | "
             f"TP/SL {s.tpsl_method}"
@@ -3155,14 +3160,20 @@ class TraderEngine:
         if low.startswith("trailing"):
             return self._explain_trailing()
         if low.startswith("sl distance"):
+            parts = arg("sl distance").split()
+            if parts and parts[-1].lower() == "auto":
+                s.sl_distance_auto = True
+                return ("SL distance = AUTO (derived from signal strength: "
+                        "weak 3%, normal 2%, strong 1.5%, extreme 1%).")
             try:
-                v = float(arg("sl distance").split()[-1])
+                v = float(parts[-1])
                 if v < 0 or v > 50:
-                    return "Usage: SL distance pct 2 (0 = none, 2-50 = %)"
+                    return "Usage: SL distance pct 2 (0 = none, 2-50 = %) or 'sl distance auto'"
                 s.sl_distance_pct = v
+                s.sl_distance_auto = False
                 return f"SL distance = {s.sl_distance_pct:g}% from entry (0 = no stop)."
             except (ValueError, IndexError):
-                return "Usage: SL distance pct 2 (0 = none)"
+                return "Usage: SL distance pct 2 (0 = none) or 'sl distance auto'"
         if low.startswith("min agreeing"):
             try:
                 s.min_agreeing = int(arg("min agreeing").split()[-1])

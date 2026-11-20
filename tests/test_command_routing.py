@@ -333,7 +333,7 @@ SETTINGS_VISIBLE = {
     "breakeven_pct": "breakeven:",
     "trailing_trigger_roi_pct": "trailing trigger:",
     "sl_distance_pct": "sl distance:",
-    "min_agreeing": "min agreeing strategies:",
+    "sl_distance_auto": "auto = agent-decided",    "min_agreeing": "min agreeing strategies:",
     "timeframes": "timeframes:",
     "min_confidence": "min confidence:",
     "tf_min_confidence": "tf min confidence:",
