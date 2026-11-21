@@ -3217,8 +3217,17 @@ class TraderEngine:
         # exchange's pending orders were read, they are the source of truth.
         if tpsl is not None and m == "PARTIAL":
             if not tpsl.ok:
-                lines.append("  parked rungs: could not read the exchange "
-                             "(the pending TP/SL read failed)")
+                if live_ids:
+                    lines.append("  parked rungs: could not read the exchange "
+                                 "(the pending TP/SL read failed)")
+                else:
+                    # Nothing to read: report() only calls the exchange's
+                    # pending-orders read when positions exist, so the default
+                    # ok=False here means "no open positions", not a failed
+                    # read. Saying "could not read" would be the misleading
+                    # half of a claim.
+                    lines.append("  parked rungs: none (no open positions on "
+                                 "the exchange)")
             else:
                 for st in self.positions.values():
                     if live_ids is not None and st.position_id not in live_ids:
