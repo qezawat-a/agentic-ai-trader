@@ -3453,6 +3453,8 @@ class TraderEngine:
         # the PARTIAL method's knobs (POSITION has none; TRAILING/ACCOUNT are
         # always armed with their own Readouts)
         "tpsl method", "partial ladder",
+        # move the stop-loss of a live position: "sl set ONUSDT 0.1180"
+        "sl set",
         "account tp usdt", "account sl usdt",
         "universe rank", "universe sizing", "universe volume", "universe volume usd",
         "universe rank auto", "universe rank off",
@@ -3623,6 +3625,12 @@ class TraderEngine:
                                              "volume", "movers", "auto", "off")
         if p in ("universe sizing", "universe volume", "universe volume usd"):
             return bool(re.search(r"-?\d+(?:\.\d+)?", rest))
+        if p == "sl set":
+            # "sl set ONUSDT 0.1180" - a symbol AND a price.
+            toks = rest.split()
+            return (len(toks) == 2
+                    and bool(re.search(r"[A-Za-z]{2,10}USDT", toks[0], re.I))
+                    and bool(re.search(r"-?\d+(?:\.\d+)?", toks[1])))
         return False
 
     async def command(self, line: str) -> str:
@@ -4047,6 +4055,8 @@ class TraderEngine:
                 return f"Account SL = -{s.account_sl_usdt:g} USDT (0 disables)."
             except (ValueError, IndexError):
                 return "Usage: account sl usdt 50"
+        if low.startswith("sl set"):
+            return await self.set_position_sl(raw)
         # ---------------------------------------------- the PARTIAL rung ladder
         if low.startswith("partial ladder"):
             rest = raw[len("partial ladder"):].strip()
@@ -4071,6 +4081,76 @@ class TraderEngine:
             except (ValueError, IndexError):
                 return "Usage: risk 1.0"
         return None
+
+    async def set_position_sl(self, line: str) -> str:
+        """Move the stop-loss of one open position: `sl set SYMBOL PRICE`.
+
+        The user-facing way to put a new level on the exchange's stop of a
+        live position - breakeven, a ratchet, or the parked rungs' stop - the
+        one exit no command had before. It goes through
+        `modify_position_tp_sl_order` and READS BACK the exchange: the answer
+        quotes the price the exchange actually holds, never a local guess.
+        """
+        rest = line[len("sl set"):].strip()
+        parts = rest.split()
+        if len(parts) != 2:
+            return "Usage: sl set SYMBOL PRICE   (e.g. sl set ONUSDT 0.1180)"
+        sym = parts[0].upper()
+        try:
+            price = float(parts[1])
+        except ValueError:
+            return (f"Usage: sl set SYMBOL PRICE - the price must be a number, "
+                    f"got {parts[1]!r}")
+        if price <= 0:
+            return "sl set: the price must be positive"
+        live = await self.live_positions()
+        row = next((p for p in live or []
+                    if str(p.get("symbol", "")).upper() == sym), None)
+        if row is None:
+            return f"no open position on {sym}"
+        pid = str(row.get("positionId"))
+        side = str(row.get("side", "LONG"))
+        entry = _as_float(row.get("avgOpenPrice"))
+        if entry <= 0:
+            return f"{sym}: no entry price on the exchange row"
+        rules = self.rules.get(sym)
+        if rules is None:
+            await self.load_rules([sym])
+            rules = self.rules.get(sym)
+        if rules is None:
+            return f"{sym}: no trading rules - cannot place the stop"
+        mark = await self.get_price(sym) or entry
+        st = self.positions.get(pid)
+        # Leave the TP alone: the position method still has its take-profit;
+        # the engine's own manage path sends the same None convention.
+        tp_price = format_price(st.tp, rules) if (st is not None and st.tp > 0) else None
+        sl_price = format_price(price, rules)
+        viol = validate_tpsl_side(symbol=sym, side=side, entry=entry,
+                                  mark=mark, sl=float(sl_price), tp=None,
+                                  rules=rules,
+                                  min_ticks=self.state.min_stop_ticks)
+        if viol:
+            return ("Refused: " + "; ".join(viol) +
+                    " - nothing was changed.")
+        try:
+            await self.client.modify_position_tp_sl_order(
+                sym, pid, tp_price=tp_price, sl_price=sl_price,
+                sl_stop_type=TRIGGER_TYPE)
+        except BitunixAPIError as e:
+            self.state.errors.append(f"sl set {sym}: {e}")
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            self.state.errors.append(f"sl set {sym}: {type(e).__name__}: {e}")
+            return f"sl set failed: {type(e).__name__}: {e}"
+        # READ BACK: quote the price the exchange holds, not ours.
+        ex = await self._exchange_tpsl_state()
+        held = ex.sl.get(pid) if ex.ok else None
+        if held is not None and st is not None:
+            self._adopt_exchange_sl(st, held, rules=rules, source="sl set",
+                                     force=True)
+        return (f"SL on {sym} set to {held if held is not None else sl_price} "
+                f"(pid {pid}, read back from the exchange).")
+
     async def _margin_adjust_command(self, raw: str) -> str:
         """`margin add SYMBOL AMOUNT` / `margin reduce SYMBOL AMOUNT`.
 
