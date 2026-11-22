@@ -2551,7 +2551,7 @@ class JRockAgent:
                     if node.func.id in ("eval", "exec"):
                         issues.append(f"{rel}:{node.lineno}: {node.func.id}() call")
             for pat, msg in [
-                (r"except\s+Exception:\s*\n\s*pass", "swallowed exception (except: pass)"),
+                (r"except\s+Exception:\s*\n\s*pass", "swallowed exception (except Exception: pass)"),
                 (r"TODO|FIXME|XXX", "TODO/FIXME marker"),
                 (r"print\(", "print() in library code"),
                 (r"time\.sleep\(", "blocking time.sleep in async code"),
