@@ -91,6 +91,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("verify", "run the tests and the import check"),
     ("simplify", "simplify a source file"),
     ("selfheal", "the self-repair loop (pytest -> review -> fix)"),
+    ("limits", "the agent's step budget and rate limit"),
     ("diagnose", "full diagnostic bundle"),
     ("reset", "clear the conversation memory"),
 ]

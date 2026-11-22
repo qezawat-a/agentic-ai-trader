@@ -153,10 +153,13 @@ class Settings:
     #                       (code review, bug_fix, self-heal, autopsy) vs. chat
     #   AGENT_AUTONOMOUS_SEC - seconds between autonomous iterations
     #   AGENT_RATE_LIMIT_WINDOW - rate-limit window (in seconds) for agent calls
+    #   AGENT_RATE_LIMIT_MAX - how many provider calls may start inside that
+    #                       window (0 = no provider calls at all)
     agent_max_steps: int = 128
     agent_thinking: str = "max"
     agent_autonomous_sec: int = 15
     agent_rate_limit_window: int = 128
+    agent_rate_limit_max: int = 128
     # rest | ws. Defaults to rest: the public WS layer is live-verified, but the
     # private (position/order/balance) login handshake has never been verified
     # against the real server, so we do not silently switch the engine onto it.
@@ -300,6 +303,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         agent_thinking=(os.getenv("AGENT_THINKING") or "max").strip().lower(),
         agent_autonomous_sec=_i("AGENT_AUTONOMOUS_SEC", 15),
         agent_rate_limit_window=_i("AGENT_RATE_LIMIT_WINDOW", 128),
+        agent_rate_limit_max=_i("AGENT_RATE_LIMIT_MAX", 128),
         market_data_source=_market_data_source(),
         order_unit=_order_unit(),
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),

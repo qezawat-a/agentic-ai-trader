@@ -77,6 +77,68 @@ command router. It publishes `/status /positions /orders /pnl /engine /tpsl
 `jrock/` and `tests/`, never force-pushes, and pushes only on `main`.
 Runtime: `/selfheal once|loop|stop|status`.
 
+### Permission-gated repairs
+
+Every self-edit goes through the permission manager, so a repair is never
+silent:
+
+| `AUTO_ACCEPT_EDIT` | What a repair does |
+|---|---|
+| `false` (default) | the fix is **queued**, the file is NOT touched, and the cycle logs `permission-required`. Review it with `pending`, apply it with `/approve`, then run `/selfheal once` to verify and commit it. |
+| `true` | the fix is applied and audited (`self_edit_auto`). |
+
+`/approve` really writes the file: the queued edit carries the old and new
+content, is checked against the current file (a conflict is refused, not
+forced), is confined to the repository root, and is audited.
+
+---
+
+## Agent limits - what stops a runaway loop
+
+Two independent guards, both configurable at runtime and persisted
+(`store > .env > default`):
+
+| Setting | Default | What it limits |
+|---|---|---|
+| `AGENT_MAX_STEPS` | 128 | steps ONE operation may take. A step is one model call, one executed tool command, or one file edit. `0` = unlimited. |
+| `AGENT_RATE_LIMIT_WINDOW` | 128 | width of the rolling rate-limit window, in seconds. |
+| `AGENT_RATE_LIMIT_MAX` | 128 | provider calls allowed to start inside that window. `0` = no provider calls at all. |
+
+The step budget is reset at the start of every user turn, so a long
+conversation cannot starve the current request while a single runaway
+request still stops. When it runs out, the agent says so - it does not
+silently truncate the work.
+
+The rate limiter counts the calls it blocks, and the model-discovery batch
+(`AutoSetModelByKey` probes up to 12 models) is reserved as a whole, because
+a discovery is that many provider calls, not one. A refused call never
+reaches the network and the operator is told how long to wait.
+
+```
+/limits                          show the limits and the live state
+agent max steps 64               steps one operation may take (0 = unlimited)
+agent rate limit window 60       width of the provider-call window, seconds
+agent rate limit max 32          provider calls allowed inside that window
+```
+
+---
+
+## Live check
+
+```bash
+.venv/bin/python scripts/live_check.py
+```
+
+Reads the REAL Bitunix API and reports what it actually verified: the
+public ticker feed, the trading-pair rules, the position tier table, the
+klines, the universe ranking, the engine scan (strategies + ATR) and the
+auto TP/SL plan. With API keys present it also checks the account,
+positions and orders.
+
+It never places, modifies or cancels an order, and never changes a
+setting. Anything it could not check is printed as `SKIP` with the reason -
+it never claims to have verified something it did not.
+
 ---
 
 ## Telegram chat

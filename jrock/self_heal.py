@@ -120,11 +120,28 @@ class SelfHealer:
         self.max_files = max_files
         self.permission_manager = permission_manager or getattr(agent, "perms", None)
         self._stop = threading.Event()
+        #: Step budget for ONE cycle. The agent owns the number (its
+        #: AGENT_MAX_STEPS setting); a cycle that runs out of steps stops and
+        #: says so in the log instead of burning the provider budget.
+        #: 0 means unlimited - so it must not be collapsed to the default.
+        raw_steps = getattr(agent, "agent_max_steps", 128)
+        self.max_steps = 128 if raw_steps is None else int(raw_steps)
+        self._steps = 0
+        self._budget_stopped = False
+
+    def _take_step(self, what: str) -> bool:
+        """Consume one step of this cycle's budget."""
+        self._steps += 1
+        if self.max_steps > 0 and self._steps > self.max_steps:
+            log.warning("selfheal: step budget exhausted at %s", what)
+            return False
+        return True
 
     # ------------------------------------------------------------ public API
     def run_once(self) -> Cycle:
         """One full cycle: test -> review -> fix -> (re)test -> push."""
         cyc = Cycle()
+        self._steps = 0
         green, tail = self._run_tests()
         cyc.tests = _pytest_tail(tail)
 
@@ -161,6 +178,13 @@ class SelfHealer:
                 self._append_log(cyc)
                 return cyc
 
+        if not self._take_step("llm review"):
+            cyc.phase = "step-budget-exhausted"
+            cyc.note = (f"stopped before the LLM review: step budget "
+                        f"{self._steps}/{self.max_steps} reached")
+            self._append_log(cyc)
+            return cyc
+
         analysis, fixes = self._review(cyc.tests)
         cyc.analysis = analysis
         if not fixes:
@@ -171,6 +195,10 @@ class SelfHealer:
 
         changed = self._apply_fixes(fixes)
         cyc.files = changed
+        if self._budget_stopped:
+            cyc.phase = "step-budget-exhausted"
+            cyc.note = (f"step budget {self.max_steps} reached during the "
+                        f"repair; the cycle stopped here")
         pending = [fx.file for fx in fixes if fx.pending]
         if pending:
             cyc.phase = "permission-required"
@@ -180,7 +208,8 @@ class SelfHealer:
             self._append_log(cyc)
             return cyc
         if not changed:
-            cyc.note = "no fix applied (anchors missing or files not allowed)"
+            if not self._budget_stopped:
+                cyc.note = "no fix applied (anchors missing or files not allowed)"
             self._append_log(cyc)
             return cyc
         cyc.fixes_applied = [f"{x.file}" for x in fixes if x.applied]
@@ -364,6 +393,11 @@ class SelfHealer:
 
         changed: list[str] = []
         for rel, file_fixes in by_file.items():
+            if not self._take_step(f"edit {rel}"):
+                # The budget ran out. Say so, and do NOT touch this file or
+                # any later one.
+                self._budget_stopped = True
+                break
             p = ROOT / rel
             try:
                 src = p.read_text(encoding="utf-8")

@@ -134,6 +134,38 @@ def test_approving_a_queued_edit_actually_applies_it(tmp_path):
     assert perms.pending == []
 
 
+def test_selfheal_step_budget_stops_the_cycle(tmp_path, monkeypatch):
+    """A cycle that runs out of steps stops and says so - it does not keep
+    calling the provider.
+
+    With max_steps=1 the LLM review (step 1) is allowed, but no edit may
+    follow it: the cycle stops before touching a file.
+    """
+    h = _healer(tmp_path, monkeypatch)
+    h.max_steps = 1
+    (tmp_path / "jrock").mkdir()
+    (tmp_path / "jrock" / "x.py").write_text("a = 1\n", encoding="utf-8")
+    monkeypatch.setattr(h, "_run_tests", lambda: (False, "1 failed"))
+    monkeypatch.setattr(h, "_review",
+                        lambda tail: ("root cause",
+                                      [Fix("jrock/x.py", "a = 1", "a = 2")]))
+    monkeypatch.setattr(sh, "_flaky_hint", lambda tail: False)
+
+    cyc = h.run_once()
+
+    assert cyc.phase == "step-budget-exhausted" or cyc.files == []
+    assert (tmp_path / "jrock" / "x.py").read_text(encoding="utf-8") == "a = 1\n", \
+        "the budget must stop the cycle BEFORE the file is touched"
+    assert "step budget" in cyc.note
+
+
+def test_selfheal_step_budget_zero_is_unlimited(tmp_path, monkeypatch):
+    h = _healer(tmp_path, monkeypatch)
+    h.max_steps = 0
+    for _ in range(50):
+        assert h._take_step("x") is True
+
+
 # ------------------------------------------------------------------- the log
 def test_a_green_cycle_is_logged_and_changes_nothing(tmp_path, monkeypatch):
     h = _healer(tmp_path, monkeypatch)

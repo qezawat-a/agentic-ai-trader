@@ -22,6 +22,7 @@ from .account import (BalanceReport, is_demo_url, missing_keys_message,
                       parse_accounts, render_balance)
 from .config import ROOT, Settings, load_settings
 from .empty_response import (budget_warning, diagnose_empty, render_empty)
+from .limits import RateLimiter, StepBudget
 from .memory import MemoryStore
 from .model_selector import autoset_model, persist_model
 from . import nlu
@@ -35,6 +36,11 @@ from .trader.client import order_rows
 from .trader.engine import MIN_STOP_TICKS, TraderEngine
 
 SOUL_PATH = ROOT / "soul" / "jrock.soul.md"
+
+#: How many models AutoSetModelByKey may probe in one discovery run. The
+#: batch is reserved against the rate limiter as a whole, because a
+#: discovery is that many provider calls, not one.
+AUTOSET_MAX_PROBE = 12
 
 log = logging.getLogger("jrock.agent")
 
@@ -143,6 +149,12 @@ PERMISSIONS
   pending                    show edits waiting for approval
   approve [n]                approve a pending edit
 
+AGENT LIMITS (what stops a runaway loop)
+  /limits                    show the limits and the live state
+  agent max steps 64         steps one operation may take (0 = unlimited)
+  agent rate limit window 60 width of the provider-call window, seconds
+  agent rate limit max 32    provider calls allowed inside that window
+
 FREE TEXT
   anything else (e.g. "switch to free model", "why did my order fail?")
   goes to the model. exit / quit / Ctrl-D leave the REPL.
@@ -163,6 +175,7 @@ THINKING LEVEL
 AGENT_BARE: dict[str, str] = {
     "help": "/help", "?": "/help", "models": "/models", "model": "/models",
     "soul": "/soul", "memory": "/memory", "think": "/think",
+    "limits": "/limits", "agent_limits": "/limits",
     "ws": "/ws", "websocket": "/ws",
     "verify": "/verify", "diagnose": "/diagnose", "autopsy": "/autopsy",
     "mcp": "/mcp", "skill": "/skill", "skills": "/skill",
@@ -367,6 +380,15 @@ class JRockAgent:
         #: Recent free-text turns, replayed to the model so a follow-up has a
         #: referent. In memory only - a conversation is not durable state.
         self._history: list[tuple[str, str]] = []
+        # Execution limits (see jrock/limits.py):
+        #  * the rate limiter throttles OUTBOUND provider calls in a rolling
+        #    window, so a runaway loop cannot burn the key;
+        #  * the step budget bounds the work ONE operation may do, so a loop
+        #    stops loudly instead of running forever.
+        self._limiter = RateLimiter(
+            window_sec=float(self.agent_rate_limit_window),
+            max_calls=int(self.agent_rate_limit_max))
+        self._budget = StepBudget(max_steps=self.agent_max_steps, label="agent")
         self._load_registry()
 
     # ---------------------------------------------------------- persistence
@@ -414,10 +436,7 @@ class JRockAgent:
     @property
     def agent_max_steps(self) -> int:
         """Store > .env > default (128). Steps any agentic loop may take."""
-        stored = self.store.get("agent_max_steps")
-        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
-            return int(stored)
-        return int(self.s.agent_max_steps or 128)
+        return self._stored_int("agent_max_steps", 128)
 
     @agent_max_steps.setter
     def agent_max_steps(self, value: int) -> None:
@@ -454,20 +473,138 @@ class JRockAgent:
         self.store.set("agent_autonomous_sec", v)
         self.s.agent_autonomous_sec = v
 
+    def _stored_int(self, key: str, default: int) -> int:
+        """A persisted integer setting, tolerating a missing store.
+
+        Some callers build the agent with ``__new__`` to exercise one
+        handler in isolation; a limit check there must fall back to the
+        .env/default value instead of raising.
+        """
+        store = getattr(self, "store", None)
+        if store is not None:
+            try:
+                stored = store.get(key)
+            except Exception:  # noqa: BLE001
+                stored = None
+            if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+                return int(stored)
+        s = getattr(self, "s", None)
+        value = getattr(s, key, None) if s is not None else None
+        try:
+            return int(value) if value else default
+        except (TypeError, ValueError):
+            return default
+
     @property
     def agent_rate_limit_window(self) -> int:
         """Store > .env > default (128). Rate-limit window in seconds."""
-        stored = self.store.get("agent_rate_limit_window")
-        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
-            return int(stored)
-        return int(self.s.agent_rate_limit_window or 128)
+        return self._stored_int("agent_rate_limit_window", 128)
+
+    @property
+    def agent_rate_limit_max(self) -> int:
+        """How many provider calls may start inside the rate-limit window.
+
+        Store > .env > default (128). This is the CAP of the rolling window
+        that ``AGENT_RATE_LIMIT_WINDOW`` measures; the window itself is a
+        span of seconds, this is how many calls fit in it.
+        """
+        return self._stored_int("agent_rate_limit_max", 128)
 
     @agent_rate_limit_window.setter
     def agent_rate_limit_window(self, value: int) -> None:
         v = max(0, int(value))
         self.store.set("agent_rate_limit_window", v)
         self.s.agent_rate_limit_window = v
-        mirror_env(ROOT / ".env", "THINKING_LEVEL", lvl)
+        self._limiter_obj.window_sec = float(v)
+
+    @agent_rate_limit_max.setter
+    def agent_rate_limit_max(self, value: int) -> None:
+        v = max(0, int(value))
+        self.store.set("agent_rate_limit_max", v)
+        self.s.agent_rate_limit_max = v
+        self._limiter_obj.max_calls = v
+
+    # ------------------------------------------------------- execution limits
+    @property
+    def _limiter_obj(self) -> RateLimiter:
+        """The rate limiter, created on first use.
+
+        Lazily, not in __init__: a few callers build the agent with
+        ``__new__`` (to test one handler in isolation) and a missing
+        attribute there must not turn into an AttributeError at the moment
+        a limit is checked.
+        """
+        lim = getattr(self, "_limiter", None)
+        if lim is None:
+            lim = RateLimiter(
+                window_sec=float(self.agent_rate_limit_window),
+                max_calls=int(self.agent_rate_limit_max))
+            self._limiter = lim
+        return lim
+
+    @property
+    def _budget_obj(self) -> StepBudget:
+        """The step budget, created on first use (see ``_limiter_obj``)."""
+        bud = getattr(self, "_budget", None)
+        if bud is None:
+            bud = StepBudget(max_steps=self.agent_max_steps, label="agent")
+            self._budget = bud
+        return bud
+
+    def begin_operation(self, label: str = "agent") -> None:
+        """Start a new operation with a fresh step budget.
+
+        One operation = one user turn or one agentic command. The budget is
+        reset here so a long conversation cannot starve the current request,
+        while a SINGLE runaway operation still stops.
+        """
+        self._budget_obj.reset(max_steps=self.agent_max_steps, label=label)
+
+    def budget_note(self) -> str:
+        """The budget state, for the operator."""
+        return self._budget_obj.note()
+
+    def take_step(self, what: str = "step") -> bool:
+        """Consume one step of the current operation.
+
+        Returns False when the budget is exhausted; the caller must stop
+        and say so rather than continuing.
+        """
+        if not self._budget_obj.step():
+            log.warning("step budget exhausted during %s (%s)",
+                        self._budget_obj.label, what)
+            return False
+        return True
+
+    def provider_call_allowed(self) -> tuple[bool, str]:
+        """Ask the rate limiter for a slot for one outbound provider call.
+
+        Returns ``(allowed, message)``. The message explains the refusal
+        and says how long the caller must wait - no silent failures.
+        """
+        allowed, retry_after = self._limiter_obj.allow()
+        if allowed:
+            return True, ""
+        return False, self._rate_limit_message(retry_after)
+
+    def provider_calls_allowed(self, n: int) -> tuple[bool, str]:
+        """Reserve ``n`` provider slots at once (e.g. a model probe batch)."""
+        allowed, retry_after = self._limiter_obj.reserve(n)
+        if allowed:
+            return True, ""
+        return False, self._rate_limit_message(retry_after)
+
+    def _rate_limit_message(self, retry_after: float) -> str:
+        return (
+            f"rate limit: {self._limiter_obj.max_calls} provider calls per "
+            f"{self._limiter_obj.window_sec:g}s window reached. Retry in "
+            f"{retry_after:.0f}s, or raise the window with "
+            f"'agent rate limit window <sec>'.")
+
+    def rate_limit_note(self) -> str:
+        return (f"provider calls in window: {self._limiter_obj.used()}/"
+                f"{self._limiter_obj.max_calls} "
+                f"(window {self._limiter_obj.window_sec:g}s)")
 
     def reasoning_params(self, model: str | None = None) -> dict:
         """Provider fields for the current level, honouring model capability."""
@@ -569,12 +706,17 @@ class JRockAgent:
         lines = ["J+Rock starting..."]
         lines.append(self._state_banner())
         if not self.model:
-            res = await autoset_model(self.s.base_url, self.s.api_key)
-            lines.append(f"AutoSetModelByKey: {res.message}")
-            if res.ok and res.selected:
-                self.model = res.selected
-                persist_model(ROOT / ".env", res.selected)
-                lines.append(f"MODEL pinned to {res.selected} in .env")
+            allowed, why = self.provider_calls_allowed(AUTOSET_MAX_PROBE)
+            if not allowed:
+                lines.append(f"AutoSetModelByKey: skipped - {why}")
+            else:
+                res = await autoset_model(self.s.base_url, self.s.api_key,
+                                          max_probe=AUTOSET_MAX_PROBE)
+                lines.append(f"AutoSetModelByKey: {res.message}")
+                if res.ok and res.selected:
+                    self.model = res.selected
+                    persist_model(ROOT / ".env", res.selected)
+                    lines.append(f"MODEL pinned to {res.selected} in .env")
         else:
             lines.append(f"Model pinned: {self.model}")
         ok, msg = await self.engine.client.verify_credentials()
@@ -610,6 +752,10 @@ class JRockAgent:
         if not raw:
             return ""
         low = raw.lower()
+        # Every user turn is one operation: it gets its own step budget, so a
+        # long conversation cannot starve the current request while a single
+        # runaway request still stops at the budget.
+        self.begin_operation("agent")
 
         reply = self._handle_permission_command(low, raw)
         if reply is not None:
@@ -659,6 +805,8 @@ class JRockAgent:
             return self.soul()
         if cmd == "/think":
             return self.cmd_think(rest)
+        if cmd in ("/limits", "/agent_limits", "/agent limits"):
+            return self._handle_limit_command(low)
         if cmd == "/memory":
             return self.cmd_memory(rest)
         if cmd in ("/code_review", "/code_reveiew"):
@@ -686,7 +834,7 @@ class JRockAgent:
         return f"Unknown command {cmd}. Try /help"
 
     def _handle_permission_command(self, low: str, raw: str) -> str | None:
-        """Permission toggles and the pending-edit queue.
+        """Permission toggles, the pending-edit queue and the agent limits.
 
         Permission toggles are LOCAL and reversible: they never move money,
         so they never ask for a confirmation. "auto accept on" (without
@@ -694,6 +842,9 @@ class JRockAgent:
         question of its own and then asked again for the "yes" - a loop
         with no way out for a one-word toggle.
         """
+        limit_reply = self._handle_limit_command(low)
+        if limit_reply is not None:
+            return limit_reply
         if low.startswith("auto accept"):
             val = low.split()[-1]
             on = val in ("on", "true", "1", "yes")
@@ -728,6 +879,53 @@ class JRockAgent:
                         "edit was queued; review and retry)")
             return (f"approved and applied {item['path']}. "
                     "Run /selfheal once to verify and commit it.")
+        return None
+
+    def _handle_limit_command(self, low: str) -> str | None:
+        """Read/set the agent's execution limits.
+
+        These are LOCAL, reversible settings: they never move money, so they
+        never ask for a confirmation.
+
+            agent limits                    show both limits and the live state
+            agent max steps 64              steps one operation may take (0 = off)
+            agent rate limit window 60      width of the rate-limit window, sec
+            agent rate limit max 32         provider calls allowed inside it
+        """
+        if low in ("agent limits", "agent limit", "/agent limits",
+                   "limits", "/limits"):
+            return (f"agent max steps: {self.agent_max_steps} "
+                    f"(0 = unlimited)\n"
+                    f"agent rate limit: {self.agent_rate_limit_max} provider "
+                    f"calls per {self.agent_rate_limit_window}s window\n"
+                    f"now: {self.budget_note()}; {self.rate_limit_note()}")
+        if low.startswith("agent max steps"):
+            parts = low.split()
+            if len(parts) < 4 or not parts[-1].isdigit():
+                return ("Usage: agent max steps <n>  (0 = unlimited, "
+                        f"current {self.agent_max_steps})")
+            self.agent_max_steps = int(parts[-1])
+            mirror_env(ROOT / ".env", "AGENT_MAX_STEPS", str(self.agent_max_steps))
+            self._budget_obj.reset(max_steps=self.agent_max_steps, label="agent")
+            return f"agent max steps = {self.agent_max_steps}"
+        if low.startswith("agent rate limit window"):
+            parts = low.split()
+            if len(parts) < 5 or not parts[-1].isdigit():
+                return ("Usage: agent rate limit window <sec>  "
+                        f"(current {self.agent_rate_limit_window})")
+            self.agent_rate_limit_window = int(parts[-1])
+            mirror_env(ROOT / ".env", "AGENT_RATE_LIMIT_WINDOW",
+                       str(self.agent_rate_limit_window))
+            return f"agent rate limit window = {self.agent_rate_limit_window}s"
+        if low.startswith("agent rate limit max"):
+            parts = low.split()
+            if len(parts) < 5 or not parts[-1].isdigit():
+                return ("Usage: agent rate limit max <n>  (0 = no provider "
+                        f"calls, current {self.agent_rate_limit_max})")
+            self.agent_rate_limit_max = int(parts[-1])
+            mirror_env(ROOT / ".env", "AGENT_RATE_LIMIT_MAX",
+                       str(self.agent_rate_limit_max))
+            return f"agent rate limit max = {self.agent_rate_limit_max}"
         return None
 
     async def _dispatch_trading_command(self, cmd: str, rest: str) -> str | None:
@@ -992,7 +1190,11 @@ class JRockAgent:
         if not self.s.api_key:
             return ("Cannot switch models: API_KEY is empty in .env.\n"
                     "Set API_KEY and BASE_URL, then run /models --free.")
-        res = await autoset_model(self.s.base_url, self.s.api_key, free_only=True)
+        allowed, why = self.provider_calls_allowed(AUTOSET_MAX_PROBE)
+        if not allowed:
+            return f"I did not look for a free model: {why}"
+        res = await autoset_model(self.s.base_url, self.s.api_key, free_only=True,
+                                  max_probe=AUTOSET_MAX_PROBE)
         if res.ok and res.selected:
             self.model = res.selected
             persist_model(ROOT / ".env", res.selected)
@@ -1358,6 +1560,11 @@ class JRockAgent:
             cmd = self._tool_call_command(raw)
             results[raw] = ""
             if cmd is not None:
+                if not self.take_step(f"tool call: {cmd[:40]}"):
+                    results[raw] = (f"\n[stopped: {self.budget_note()}; "
+                                    f"the remaining tool calls in this reply "
+                                    f"were NOT run]\n")
+                    continue
                 reply = await self._route_tool_call(cmd)
                 if reply:
                     results[raw] = f"\n{reply.strip()}\n"
@@ -1377,6 +1584,10 @@ class JRockAgent:
         An empty completion is a FAILURE, never a normal answer. We diagnose the
         cause, and when the cause is reasoning-budget exhaustion we retry once
         with thinking off and say so.
+
+        Two limits guard this call: the rolling-window rate limiter (a
+        refusal with the wait time, never a silent drop) and the per-
+        operation step budget (the operation stops and says so).
         """
         from .model_selector import autoset_model
 
@@ -1385,9 +1596,27 @@ class JRockAgent:
                     f"You said: {text!r}\n"
                     f"Set API_KEY + BASE_URL, or use a command (type help).")
 
+        allowed, why = self.provider_call_allowed()
+        if not allowed:
+            return (f"I did not send that to a model: {why}\n"
+                    f"You said: {text!r}")
+
+        if not self.take_step("model call"):
+            return (f"I stopped before sending that to a model: "
+                    f"{self.budget_note()}.\n"
+                    f"You said: {text!r}")
+
         model = self.model or self.s.model
         if not model:
-            res = await autoset_model(self.s.base_url, self.s.api_key)
+            # Model discovery PROBES models: that is up to a dozen provider
+            # calls, so the whole batch is reserved against the rate limit
+            # instead of slipping past it as one "call".
+            allowed, why = self.provider_calls_allowed(AUTOSET_MAX_PROBE)
+            if not allowed:
+                return (f"I did not look for a model: {why}\n"
+                        f"You said: {text!r}")
+            res = await autoset_model(self.s.base_url, self.s.api_key,
+                                      max_probe=AUTOSET_MAX_PROBE)
             if not res.ok:
                 return (f"I could not reach a model.\n{res.message}\n\n"
                         f"You said: {text!r}")
@@ -1530,6 +1759,9 @@ class JRockAgent:
         import aiohttp
         if not self.s.api_key:
             return "API_KEY is empty in .env"
+        allowed, why = self.provider_call_allowed()
+        if not allowed:
+            return f"I did not list the models: {why}"
         free_only = "--free" in rest or "free" in rest.split()
         try:
             async with aiohttp.ClientSession() as sess:
@@ -1587,7 +1819,11 @@ class JRockAgent:
         env = ROOT / ".env"
         mirror_env(env, "BASE_URL", base)
         mirror_env(env, "API_KEY", key)
-        res = await autoset_model(base, key)
+        allowed, why = self.provider_calls_allowed(AUTOSET_MAX_PROBE)
+        if not allowed:
+            return (f"{note}provider set to {base}\n"
+                    f"I did not probe the provider: {why}")
+        res = await autoset_model(base, key, max_probe=AUTOSET_MAX_PROBE)
         if res.ok and res.selected:
             self.model = res.selected
             persist_model(env, res.selected)
@@ -2291,7 +2527,9 @@ class JRockAgent:
             f"max_steps={self.agent_max_steps} "
             f"thinking={self.agent_thinking} "
             f"autonomous_sec={self.agent_autonomous_sec} "
-            f"rate_limit_window={self.agent_rate_limit_window}s",
+            f"rate_limit_window={self.agent_rate_limit_window}s "
+            f"rate_limit_max={self.agent_rate_limit_max}",
+            f"limits now: {self.budget_note()}; {self.rate_limit_note()}",
         ]
 
     @staticmethod
@@ -2599,6 +2837,7 @@ class JRockAgent:
     def cmd_bug_fix(self, path: str) -> str:
         review = self.cmd_code_review(path)
         fixes = []
+        stopped = False
         for f in self._py_files(path):
             try:
                 src = f.read_text(encoding="utf-8")
@@ -2606,11 +2845,17 @@ class JRockAgent:
                 continue
             rel = f.relative_to(ROOT) if f.is_relative_to(ROOT) else f
             if re.search(r"except\s*:", src):
+                if not self.take_step(f"bug_fix write {rel}"):
+                    stopped = True
+                    break
                 new = re.sub(r"except\s*:", "except Exception:", src)
                 r = self.tools.write(str(rel), new, reason="bug_fix: bare except")
                 fixes.append(f"{rel}: bare except -> except Exception: {'applied' if r.ok else 'PENDING'}")
             if re.search(r"def \w+\([^)]*=\s*(\[\]|\{\})", src):
                 fixes.append(f"{rel}: mutable default argument - needs manual fix")
+        if stopped:
+            fixes.append(f"[stopped: {self.budget_note()}; the remaining files "
+                         f"were NOT touched]")
         if not fixes:
             return review + "\n\nno auto-fixable issues found"
         return review + "\n\nFIXES:\n" + "\n".join(fixes)
@@ -2720,11 +2965,19 @@ class JRockAgent:
             return "FAIL: API_KEY empty"
         model = self.model or self.s.model
         if not model:
-            res = await autoset_model(self.s.base_url, self.s.api_key)
+            allowed, why = self.provider_calls_allowed(AUTOSET_MAX_PROBE)
+            if not allowed:
+                return f"FAIL: {why}"
+            res = await autoset_model(self.s.base_url, self.s.api_key,
+                                      max_probe=AUTOSET_MAX_PROBE)
             if not res.ok:
                 return f"FAIL: {res.message}"
             model = res.selected
             self.model = model
+        else:
+            allowed, why = self.provider_call_allowed()
+            if not allowed:
+                return f"FAIL: {why}"
         async with aiohttp.ClientSession() as sess:
             p = await probe_model(sess, self.s.base_url, self.s.api_key, model)
         if p.works:
@@ -2761,6 +3014,12 @@ class JRockAgent:
                 lines.append(f"account: available={a.get('available')} mode={a.get('positionMode')}")
             except Exception as e:  # noqa: BLE001
                 lines.append(f"account: FAIL {e}")
+        # The check opened an HTTP session; close it or the event loop keeps
+        # the connector alive and the process prints "Unclosed client session".
+        try:
+            await self.engine.client.close()
+        except Exception:  # noqa: BLE001
+            pass
         lines.append(f"engine: on={self.engine.state.engine_on} "
                      f"autotrade={self.engine.state.autotrade} "
                      f"scans={self.engine.state.scans} errors={len(self.engine.state.errors)}")
