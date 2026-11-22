@@ -57,7 +57,7 @@ def test_env_overrides_the_default(monkeypatch):
 
 def test_env_garbage_falls_back_to_the_default(monkeypatch):
     monkeypatch.setenv("MARGIN_AMOUNT_PCT", "not-a-number")
-    assert load_settings().margin_amount_pct == 10.0
+    assert load_settings().margin_amount_pct == 100.0
 
 
 def test_zero_disables_the_budget(monkeypatch):

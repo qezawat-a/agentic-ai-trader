@@ -367,9 +367,10 @@ def liquidation_price(entry: float, leverage: int, side: str,
 def sl_from_distance(entry: float, side: str, distance_pct: float) -> float:
     """Stop loss `distance_pct`% from the entry price, or 0.0 = none.
 
-    The stop is the user's own setting - the app never invents a distance, a
-    fraction of the liquidation distance, or a volatility floor. 0 disables
-    the stop (a plain market order with no SL attached).
+    This low-level helper applies an explicit percentage. The agent-decided
+    auto policy is implemented in :mod:`jrock.trader.tpsl`, where liquidation
+    distance and signal strength are available. 0 disables the stop (a plain
+    market order with no SL attached).
     """
     frac = min(max(0.0, distance_pct), 50.0) / 100.0
     if frac <= 0.0:

@@ -16,6 +16,7 @@ import json
 import pytest
 
 import jrock.self_heal as sh
+from jrock.permissions import AuditLog, PermissionManager
 from jrock.self_heal import Cycle, Fix, SelfHealer
 
 
@@ -74,6 +75,63 @@ def test_apply_fixes_caps_the_number_of_files(tmp_path, monkeypatch):
     untouched = [p for p in (tmp_path / "jrock").glob("f*.py")
                  if "x = 1" in p.read_text(encoding="utf-8")]
     assert len(untouched) == 2
+
+
+def test_permission_gate_queues_the_fix_instead_of_writing_it(tmp_path, monkeypatch):
+    perms = PermissionManager(auto_accept_edit=False,
+                               audit=AuditLog(tmp_path / "audit.jsonl"),
+                               root=tmp_path)
+    h = _healer(tmp_path, monkeypatch)
+    h.permission_manager = perms
+    (tmp_path / "jrock").mkdir()
+    p = tmp_path / "jrock" / "x.py"
+    p.write_text("a = 1\n", encoding="utf-8")
+
+    fixes = [Fix("jrock/x.py", "a = 1", "a = 2")]
+    changed = h._apply_fixes(fixes)
+
+    assert changed == []
+    assert fixes[0].pending is True
+    assert p.read_text(encoding="utf-8") == "a = 1\n"
+    assert len(perms.pending) == 1
+
+
+def test_two_fixes_to_one_file_queue_as_a_single_edit(tmp_path, monkeypatch):
+    perms = PermissionManager(auto_accept_edit=False,
+                               audit=AuditLog(tmp_path / "audit.jsonl"),
+                               root=tmp_path)
+    h = _healer(tmp_path, monkeypatch)
+    h.permission_manager = perms
+    (tmp_path / "jrock").mkdir()
+    p = tmp_path / "jrock" / "x.py"
+    p.write_text("a = 1\nb = 2\n", encoding="utf-8")
+
+    fixes = [Fix("jrock/x.py", "a = 1", "a = 9"),
+             Fix("jrock/x.py", "b = 2", "b = 8")]
+    assert h._apply_fixes(fixes) == []
+    assert len(perms.pending) == 1, "one file means one queued replacement"
+
+    item = perms.approve_pending()
+    assert item is not None
+    assert p.read_text(encoding="utf-8") == "a = 9\nb = 8\n"
+
+
+def test_approving_a_queued_edit_actually_applies_it(tmp_path):
+    perms = PermissionManager(auto_accept_edit=False,
+                               audit=AuditLog(tmp_path / "audit.jsonl"),
+                               root=tmp_path)
+    p = tmp_path / "jrock" / "x.py"
+    p.parent.mkdir(parents=True)
+    p.write_text("a = 1\n", encoding="utf-8")
+
+    ok, _ = perms.request_edit("jrock/x.py", "a = 1\n", "a = 2\n", reason="test")
+    assert not ok
+    assert p.read_text(encoding="utf-8") == "a = 1\n"
+
+    item = perms.approve_pending()
+    assert item is not None
+    assert p.read_text(encoding="utf-8") == "a = 2\n"
+    assert perms.pending == []
 
 
 # ------------------------------------------------------------------- the log

@@ -209,7 +209,7 @@ engine on | engine off              status
 report on | report off              report interval sec 30
 trades_history | tpsl_history | pnl | positions history
 settings trade                      scan on | scan off
-tpsl method POSITION|PARTIAL        partial ladder 40@1,35@2,25@3
+tpsl method POSITION|PARTIAL        partial ladder 1R:25,2R:25,3R:25,4R:25
 account tp usdt 100                 account sl usdt 50
 mid management position trigger     reversal=true   reversal_confidence=70
 scans interval sec 30               breakeven threshold pct 0.6
@@ -283,7 +283,7 @@ stale ticker whose last price is 0 is ignored instead of being ranked as a
 
 ```
 universe rank GAINERS|LOSERS|VOLUME|MOVERS   # choose the method
-universe sizing 20                          # scan the top 20 (1..200)
+universe sizing 20                          # scan the top 20 (1..50)
 universe volume 1000000                     # 24h quote-volume floor in USDT
 universe rank auto                          # on; keep the method, VOLUME if none
 universe rank off                           # off (the configured size is kept)
@@ -298,7 +298,7 @@ Configuration lives in `.env`:
 | Variable | Meaning |
 |---|---|
 | `UNIVERSE_RANK` | `GAINERS` \| `LOSERS` \| `VOLUME` \| `MOVERS`; empty = off |
-| `UNIVERSE_SIZING` | how many top-ranked symbols to scan (1..200; `0` = off) |
+| `UNIVERSE_SIZING` | how many top-ranked symbols to scan (1..50; `0` = off) |
 | `MIN_24H_VOLUME_USD` | 24h quote-volume floor in USDT; `0` = no floor |
 
 Ranking is active only when **both** a method and a non-zero size are set (the
@@ -323,11 +323,11 @@ Everything else is derived:
    maintenance-margin rate for the position's notional tier:
    - long: `liq = entry * (1 - 1/L + mmr)`
    - short: `liq = entry * (1 + 1/L - mmr)`
-2. **Stop loss** sits exactly `sl distance pct` from the entry — 0 (default) attaches none. `ATR`/`liq`/`ROI` are never used to place it.
+2. **Stop loss** — either exactly `sl distance pct` from the entry (0 = none), or, when `sl distance auto` is on, derived by the agent from the liquidation price, signal strength and ATR. The auto policy keeps about **50% leveraged ROI** between the stop and the liquidation price (`weak 45% · normal 50% · strong 55% · extreme 60%` gap), so a stronger signal places a tighter stop. ATR can only widen the stop, never push it through liquidation.
 3. **Take profit** = SL distance × R-multiple scaled by signal strength:
    `weak 1.2R · normal 1.8R · strong 2.5R · extreme 3.2R`, nudged by confidence.
 4. **Leverage** = your setting, checked against the symbol's live tiered risk-limit table (`get_position_tiers`): the tier your selection maps to is the HIGHEST tier whose max leverage covers it, MMR from that tier, and the position value must fit that tier's nominal cap — otherwise the entry is refused (fail-closed).
-5. **Size**: `MARGIN_AMOUNT_PCT` is the sizing authority — `qty = margin × leverage / price`, capped by the balance with the taker fee reserved, floored to `basePrecision`. With `MARGIN_AMOUNT_PCT=0` it falls back to `qty = (equity × risk_pct) / |entry − stop|`.
+5. **Size**: `MARGIN_PER_TRADE` (legacy alias `MARGIN_AMOUNT_PCT`) is the sizing authority — `qty = margin × leverage / price`, capped by the balance with the taker fee reserved, floored to `basePrecision`. With it set to `0` the engine falls back to `qty = (equity × risk_pct) / |entry − stop|`.
 
 TP/SL are attached to the entry order (`tpPrice`/`slPrice` on `place_order`) and
 later moved with `modify_position_tp_sl_order` for breakeven and trailing.
@@ -1026,7 +1026,7 @@ position. A staged exit is only possible through the standalone endpoint.
 
 ```
 tpsl method PARTIAL            # select the native exit shape
-partial ladder 40@1,35@2,25@3  # PARTIAL: 40% at 1R, 35% at 2R, 25% at 3R
+partial ladder 1R:25,2R:25,3R:25,4R:25  # PARTIAL: 25% at each of 1R..4R
 partial ladder off             # no rungs: falls back to POSITION
 account tp usdt 100            # ACCOUNT: close all at +100 USDT total
 account sl usdt 50             # ACCOUNT: close all at -50 USDT total
@@ -1040,14 +1040,18 @@ Every rung is its own native `/tpsl/place_order` with `tpQty`, sent once at
 entry and parked on the exchange. If the engine dies, the rungs still fill.
 
 ```
-PARTIAL_TP_LADDER=40@1,35@2,25@3
+PARTIAL_TP_LADDER=1R:25,2R:25,3R:25,4R:25
 ```
+
+Both spellings are accepted: `R:share` (as above) and the older `share@R`
+(e.g. `40@1,35@2,25@3`).
 
 | Rung | Trigger | Closes |
 |---|---|---|
-| 1 | price at 1R | 40% of the position |
-| 2 | price at 2R | 35% |
+| 1 | price at 1R | 25% of the position |
+| 2 | price at 2R | 25% |
 | 3 | price at 3R | 25% |
+| 4 | price at 4R | 25% |
 
 `R` is the entry-to-stop distance captured at entry, so the targets do not move
 when the stop does. Shares must sum to `<= 100` and R must increase left to
@@ -1071,7 +1075,7 @@ is never left with only a stop.
 ```
 /tpsl                          # method + ladder + account thresholds
 tpsl method PARTIAL            # select the native exit shape
-partial ladder 40@1,35@2,25@3  # set it (validated; a bad spec changes nothing)
+partial ladder 1R:25,2R:25,3R:25,4R:25  # set it (validated; a bad spec changes nothing)
 partial ladder off             # no rungs
 account tp usdt 100            # ACCOUNT TP threshold
 account sl usdt 50             # ACCOUNT SL threshold

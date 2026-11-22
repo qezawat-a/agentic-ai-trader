@@ -3,17 +3,16 @@
 The user sets the stop-loss distance, breakeven and trailing trigger:
     sl_distance_pct          - stop `distance_pct` % from entry (0 = none)
     sl_distance_auto         - when True the agent derives the stop distance
-                              from signal strength (weak 3%, normal 2%,
-                              strong 1.5%, extreme 1%) instead of using
-                              sl_distance_pct. 0 still disables stops.
+                              from the liquidation price and signal strength.
+                              The stop is kept about 50 ROI points clear of
+                              liquidation; stronger signals place it tighter.
     breakeven_pct            - move SL to entry once ROI >= this %
     trailing_trigger_roi_pct - start trailing once ROI >= this %
 
 Everything else is derived:
     * SL is placed exactly `sl_distance_pct` from the entry (or auto-derived
-      from strength when sl_distance_auto is True) - the app never invents a
-      distance beyond the configured/auto value. 0 disables both the stop
-      and the TP.
+      from liquidation/strength when sl_distance_auto is True). 0 disables
+      both the stop and the TP.
     * TP is a multiple of the SL distance, scaled by confidence/strength:
         weak 1.2R, normal 1.8R, strong 2.5R, extreme 3.2R
       (only when a stop is set; there is no distance to scale otherwise).
@@ -111,6 +110,24 @@ def _roi_pct(p: float, entry: float, side: str, leverage: int) -> float:
     return raw * leverage * 100.0
 
 
+#: How much leveraged ROI distance remains between the stop and liquidation.
+#: The requested policy is approximately 50% ROI from the liquidation price.
+AUTO_SL_LIQ_GAP_ROI_PCT = 50.0
+
+#: Signal-strength adjustment to that gap. A BIGGER gap means the stop sits
+#: closer to the entry, i.e. a tighter stop: stronger signals are trusted more,
+#: weak signals leave more room before the stop.
+AUTO_SL_LIQ_GAP_ADJUST_PCT = {
+    "none": 0.0,
+    "weak": -5.0,
+    "normal": 0.0,
+    "strong": 5.0,
+    "extreme": 10.0,
+}
+
+#: Backward-compatible fixed price-distance policy. It remains available to
+#: callers that explicitly want the old strength-only values; the live engine
+#: uses the liquidation-distance policy below.
 AUTO_SL_DISTANCE_PCT = {
     "none": 0.0,
     "weak": 3.0,
@@ -124,9 +141,10 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
               strength: str, confidence: float, tiers: list[Tier],
               rules: PairRules, sl_distance_pct: float = 0.0,
               sl_distance_auto: bool = False,
-              breakeven_pct: float = 0.6,
-              trailing_trigger_roi_pct: float = 25.0,
+              breakeven_pct: float = 15.0,
+              trailing_trigger_roi_pct: float = 20.0,
               mark: float | None = None,
+              atr_pct: float = 0.0,
               min_stop_ticks: int = 3) -> TpSlPlan:
     """Build a TP/SL plan that is guaranteed to sit on the correct side.
 
@@ -144,12 +162,34 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
     d = min_stop_distance(rules, min_stop_ticks)
     ref = mark if (mark is not None and mark > 0) else entry
 
-    # Auto mode: derive the stop distance from signal strength so the
-    # operator does not have to pick a percentage. It WINS over a stale
-    # manual number - otherwise a leftover sl_distance_pct silently keeps
-    # deciding after "sl distance auto" was typed.
+    # Auto mode: derive the stop from the liquidation distance and signal
+    # strength. The requested policy keeps roughly 50% leveraged ROI between
+    # the stop and liquidation. A stop derived directly from the current
+    # liquidation price would be invalid; this formula starts at the entry and
+    # leaves the configured safety gap.
     if sl_distance_auto:
-        effective_sl_pct = AUTO_SL_DISTANCE_PCT.get(strength, 0.0)
+        # The requested live policy: the stop sits about 50% leveraged ROI
+        # from the liquidation price. Signal strength adjusts that gap, and
+        # ATR can only WIDEN the stop (to avoid ordinary noise) - never
+        # consume the whole gap to liquidation.
+        liq_distance_pct = abs(entry - liq) / entry * 100.0 if entry > 0 else 0.0
+        liq_roi_pct = liq_distance_pct * max(1, leverage)
+        gap_roi_pct = (AUTO_SL_LIQ_GAP_ROI_PCT
+                       + AUTO_SL_LIQ_GAP_ADJUST_PCT.get(strength, 0.0))
+        if strength in ("none", "") or gap_roi_pct <= 0:
+            effective_sl_pct = 0.0
+        else:
+            sl_roi_pct = max(0.0, liq_roi_pct - gap_roi_pct)
+            effective_sl_pct = sl_roi_pct / max(1, leverage)
+            if atr_pct > 0:
+                atr_floor_pct = atr_pct * {
+                    "none": 0.0, "weak": 2.5, "normal": 2.0,
+                    "strong": 1.5, "extreme": 1.0,
+                }.get(strength, 0.0)
+                effective_sl_pct = max(effective_sl_pct, atr_floor_pct)
+            # Hard cap: the stop may never run past 90% of the way to liq, so
+            # a minimum gap always survives.
+            effective_sl_pct = min(effective_sl_pct, liq_distance_pct * 0.90)
     else:
         effective_sl_pct = sl_distance_pct
 
@@ -240,10 +280,12 @@ class LadderRung:
 
 
 def parse_partial_ladder(spec: str) -> list[LadderRung]:
-    """Parse the share@R ladder spec, e.g. "40@1,35@2,25@3".
+    """Parse the ladder spec in either supported spelling.
 
-    One knob, one meaning: each pair is `share@R` - close `share`% of the
-    position when price runs R times the entry-to-stop distance. Rules
+    Canonical form: ``share@R`` (e.g. ``40@1,35@2,25@3``). The operator's
+    compact form is also accepted: ``R:share`` (e.g. ``1R:25,2R:25``).
+    In both forms close `share`% of the position when price runs R times the
+    entry-to-stop distance. Rules
     (mirroring the documented format exactly):
       * share > 0 and share <= 100
       * R > 0
@@ -259,10 +301,16 @@ def parse_partial_ladder(spec: str) -> list[LadderRung]:
     for part in raw.split(","):
         part = part.strip()
         m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*@\s*(\d+(?:\.\d+)?)", part)
-        if not m:
-            raise PartialLadderError(
-                f'bad ladder rung "{part}" - expected "share@R", e.g. "30@1.5"')
-        share, r = float(m.group(1)), float(m.group(2))
+        if m:
+            share, r = float(m.group(1)), float(m.group(2))
+        else:
+            m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*R\s*:\s*(\d+(?:\.\d+)?)",
+                             part, flags=re.IGNORECASE)
+            if not m:
+                raise PartialLadderError(
+                    f'bad ladder rung "{part}" - expected "share@R" or '
+                    '"R:share", e.g. "30@1.5" or "1.5R:30"')
+            r, share = float(m.group(1)), float(m.group(2))
         if not (0 < share <= 100):
             raise PartialLadderError(f"ladder share must be 0-100, got {share}")
         if not (r > 0):

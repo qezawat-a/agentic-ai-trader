@@ -54,6 +54,12 @@ class PermissionManager:
     audit: AuditLog | None = None
     approver: Callable[[str], bool] | None = None
     pending: list[dict] = field(default_factory=list)
+    #: Applied edits retained in memory so a permission-gated self-heal can
+    #: verify and commit exactly the files it owns after `/approve`.
+    applied: list[dict] = field(default_factory=list)
+    #: Repository root used when a queued edit is approved. Keeping the root
+    #: here means an approved edit can never escape the project by accident.
+    root: Path | None = None
 
     def __post_init__(self):
         if self.audit is None:
@@ -87,13 +93,47 @@ class PermissionManager:
         if self.approver is not None and self.approver(f"Apply edit to {path}?\n{d}"):
             self.audit.write("self_edit_approved", path=path, reason=reason, diff=d[:4000])
             return True, d
-        self.pending.append({"path": path, "diff": d, "reason": reason})
+        # Keep the replacement content with the diff. A diff alone cannot be
+        # applied later, so `/approve` used to pop the queue without changing
+        # the file at all.
+        self.pending.append({"path": path, "old": old, "new": new,
+                             "diff": d, "reason": reason})
         self.audit.write("self_edit_pending", path=path, reason=reason, diff=d[:4000])
         return False, d
 
     def approve_pending(self, index: int = 0) -> dict | None:
-        if 0 <= index < len(self.pending):
-            item = self.pending.pop(index)
-            self.audit.write("self_edit_approved_late", path=item["path"])
-            return item
-        return None
+        """Approve and APPLY one queued edit.
+
+        The queue used to be cosmetic: approval removed the diff but left the
+        file untouched. This method now writes the queued replacement, keeps
+        it inside ``root`` when one is configured, and audits the result.
+        """
+        if not 0 <= index < len(self.pending):
+            return None
+        item = self.pending[index]
+        path = Path(item["path"])
+        root = self.root.resolve() if self.root is not None else None
+        target = path if path.is_absolute() else (root or Path.cwd()) / path
+        try:
+            resolved = target.resolve()
+            if root is not None:
+                resolved.relative_to(root)
+            if resolved.exists():
+                current = resolved.read_text(encoding="utf-8", errors="replace")
+                if current != item.get("old", ""):
+                    self.audit.write("self_edit_approval_conflict",
+                                     path=item["path"])
+                    return None
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(item["new"], encoding="utf-8")
+        except (OSError, ValueError) as e:
+            self.audit.write("self_edit_approval_failed", path=item["path"],
+                             error=f"{type(e).__name__}: {e}")
+            return None
+        self.pending.pop(index)
+        self.audit.write("self_edit_approved_late", path=item["path"],
+                         applied=True)
+        item["applied"] = True
+        self.applied.append(item)
+        del self.applied[:-100]
+        return item

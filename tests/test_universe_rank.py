@@ -250,4 +250,4 @@ def test_universe_rank_env_is_read_as_a_string(monkeypatch):
 
 def test_universe_rank_env_is_optional(monkeypatch):
     monkeypatch.delenv("UNIVERSE_RANK", raising=False)
-    assert load_settings().universe_rank == ""
+    assert load_settings().universe_rank == "VOLUME"

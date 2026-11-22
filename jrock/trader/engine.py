@@ -93,7 +93,7 @@ class EngineState:
     autotrade: bool = False
     report_on: bool = False
     report_interval: int = 30
-    scan_interval: int = 30
+    scan_interval: int = 15
     reversal: bool = False
     reversal_confidence: float = 70.0
     mid_management: bool = True
@@ -118,7 +118,7 @@ class EngineState:
     breakeven_pct: float = 0.6
     trailing_trigger_roi_pct: float = 25.0
     #: Stop-loss distance from the entry, as a % of price (0 = none).
-    #: The app never invents one; the user's setting is the only source.
+    #: In auto mode the agent derives it from ATR/strength and liquidation.
     sl_distance_pct: float = 0.0
     sl_distance_auto: bool = False
     min_agreeing: int = 3
@@ -151,11 +151,11 @@ class EngineState:
     #: When ranking is enabled (universe_rank + universe_sizing), the scan loop
     #: replaces the static watchlist with the top symbols ranked by this method.
     universe_rank: str = ""
-    #: How many top-ranked symbols to keep in the auto universe (1..200). 0 = off.
+    #: How many top-ranked symbols to keep in the auto universe (1..50). 0 = off.
     universe_sizing: int = 0
     #: Minimum 24h quote volume (USDT) for a symbol to qualify for the auto universe.
     min_24h_volume_usdt: float = 0.0
-    #: PARTIAL ladder spec, "share@R" pairs, e.g. "40@1,35@2,25@3".
+    #: PARTIAL ladder spec. Both "share@R" and "R:share" are accepted.
     partial_tp_ladder: str = "40@1,35@2,25@3"
     # --- ACCOUNT TP/SL thresholds (USDT). 0 disables a side.
     account_tp_usdt: float = 0.0
@@ -688,7 +688,7 @@ class TraderEngine:
                   + list(self._auto_symbols)
                   + [p.symbol for p in self.positions.values()]):
             u = (s or "").upper()
-            if u and u not in out:
+            if u and u != "AUTO" and u not in out:
                 out.append(u)
         return out
 
@@ -908,7 +908,9 @@ class TraderEngine:
 
     # ================================================================ market data
     async def load_rules(self, symbols: list[str] | None = None) -> None:
-        syms = symbols or self.state.symbols
+        syms = [s for s in (symbols or self.state.symbols) if s.upper() != "AUTO"]
+        if not syms:
+            return
         try:
             data = await self.client.get_trading_pairs(",".join(syms))
             for d in data or []:
@@ -1060,6 +1062,7 @@ class TraderEngine:
         if symbol in self._untradable:
             return Aggregate(symbol=symbol)
         per_tf: dict[str, list] = {}
+        atr_samples: list[float] = []
         for tf in self.state.timeframes:
             try:
                 candles = await self.get_candles(symbol, tf, 300)
@@ -1084,6 +1087,17 @@ class TraderEngine:
             if not candles:
                 continue
             sigs = []
+            try:
+                atr_series = atr(candles, 14)
+                atr_value = next((v for v in reversed(atr_series)
+                                  if v is not None), None)
+                if atr_value and candles:
+                    last_close = candles[-1].close
+                    if last_close > 0:
+                        atr_samples.append(float(atr_value) / last_close * 100.0)
+            except Exception as e:  # noqa: BLE001
+                self.state.errors.append(
+                    f"atr {symbol} {tf}: {type(e).__name__}: {e}")
             for strat in self.strategies:
                 try:
                     sig = strat.evaluate(candles, timeframe=tf, symbol=symbol)
@@ -1098,6 +1112,8 @@ class TraderEngine:
             min_confidence=self.state.min_confidence,
             tf_min_confidence=self.state.tf_min_confidence,
         )
+        if atr_samples:
+            agg.atr_pct = sum(atr_samples) / len(atr_samples)
         self.last_aggregates[symbol] = agg
         self.state.scans += 1
         self.state.last_scan_ts = time.time()
@@ -1184,7 +1200,7 @@ class TraderEngine:
                     # SYMBOLS=AUTO: rank every tradable pair by UNIVERSE_RANK
                     # and scan the top UNIVERSE_SIZING instead of the static
                     # watchlist.
-                    syms = list(self.state.symbols)
+                    syms = [s for s in self.state.symbols if s.upper() != "AUTO"]
                     if self.state.universe_rank and self.state.universe_sizing:
                         auto = await self._universe_symbols()
                         if auto:
@@ -1495,6 +1511,7 @@ class TraderEngine:
                 breakeven_pct=self.state.breakeven_pct,
                 trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
                 mark=ctx.mark, min_stop_ticks=self.state.min_stop_ticks,
+                atr_pct=getattr(ctx.agg, "atr_pct", 0.0),
             )
         except TpSlSideError as e:
             self.state.errors.append(f"tpsl {ctx.sym}: {e}")
@@ -1649,6 +1666,7 @@ class TraderEngine:
                 breakeven_pct=self.state.breakeven_pct,
                 trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
                 mark=ctx.mark, min_stop_ticks=self.state.min_stop_ticks,
+                atr_pct=getattr(ctx.agg, "atr_pct", 0.0),
             )
         except TpSlSideError as e:
             self.state.errors.append(f"tpsl {ctx.sym}: {e}")
@@ -3774,11 +3792,12 @@ class TraderEngine:
                     "automatic ranking, OFF turns it off.")
         if low.startswith("universe sizing"):
             try:
-                s.universe_sizing = int(arg("universe sizing").split()[-1])
+                sizing = int(arg("universe sizing").split()[-1])
             except (ValueError, IndexError):
                 return "Usage: universe sizing 50"
-            if not 1 <= s.universe_sizing <= 200:
-                return f"Universe sizing must be 1..200 ({s.universe_sizing} rejected)."
+            if not 1 <= sizing <= 50:
+                return f"Universe sizing must be 1..50 ({sizing} rejected)."
+            s.universe_sizing = sizing
             msg = f"Universe sizing = {s.universe_sizing}."
             if not s.universe_rank:
                 msg += (" Universe rank is off - set 'universe rank "
@@ -3998,6 +4017,14 @@ class TraderEngine:
             return None
         s = self.state
         val = arg("symbols") if low.startswith("symbols") else arg("symbol")
+        if val.strip().upper() == "AUTO":
+            s.symbols = ["AUTO"]
+            if not s.universe_rank:
+                s.universe_rank = "VOLUME"
+            if s.universe_sizing <= 0:
+                s.universe_sizing = 50
+            return ("Symbols = AUTO (ranked universe; "
+                    f"rank={s.universe_rank}, size={s.universe_sizing})")
         syms: list[str] = []
         bad: list[str] = []
         for x in val.replace("=", " ").split(","):

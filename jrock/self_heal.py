@@ -113,10 +113,12 @@ class SelfHealer:
     """Runs one repair cycle, or forever on a background thread."""
 
     def __init__(self, agent, *, auto_push: bool = True,
-                 max_files: int = MAX_FILES_PER_CYCLE):
+                 max_files: int = MAX_FILES_PER_CYCLE,
+                 permission_manager=None):
         self.agent = agent
         self.auto_push = auto_push
         self.max_files = max_files
+        self.permission_manager = permission_manager or getattr(agent, "perms", None)
         self._stop = threading.Event()
 
     # ------------------------------------------------------------ public API
@@ -128,7 +130,19 @@ class SelfHealer:
 
         if green:
             cyc.phase = "pytest-green"
-            if self._dirty():
+            dirty = self._dirty()
+            owned = self._approved_owned_files(dirty)
+            if owned:
+                cyc.files = owned
+                cyc.note = "tests green after approved self-heal edits"
+                if self.auto_push:
+                    msg = "fix(selfheal): apply approved repair"
+                    cyc.commit = self._commit_and_push(owned, msg)
+                    cyc.pushed = bool(cyc.commit)
+                    cyc.note = (f"tests green; committed and pushed {cyc.commit[:10]}"
+                                if cyc.commit else
+                                "tests green; approved fixes kept but NOT pushed")
+            elif dirty:
                 cyc.note = ("tests green; uncommitted changes exist that "
                             "self-heal did not make - left untouched")
             self._append_log(cyc)
@@ -157,6 +171,14 @@ class SelfHealer:
 
         changed = self._apply_fixes(fixes)
         cyc.files = changed
+        pending = [fx.file for fx in fixes if fx.pending]
+        if pending:
+            cyc.phase = "permission-required"
+            cyc.note = ("fixes queued for approval (AUTO_ACCEPT_EDIT is "
+                        f"off): {', '.join(sorted(set(pending)))}")
+            cyc.fixes_applied = []
+            self._append_log(cyc)
+            return cyc
         if not changed:
             cyc.note = "no fix applied (anchors missing or files not allowed)"
             self._append_log(cyc)
@@ -251,6 +273,19 @@ class SelfHealer:
         except Exception:  # noqa: BLE001
             return []
 
+    def _approved_owned_files(self, dirty: list[str]) -> list[str]:
+        """Dirty files that came from an approved self-heal edit."""
+        if self.permission_manager is None:
+            return []
+        dirty_set = set(dirty)
+        owned: list[str] = []
+        for item in getattr(self.permission_manager, "applied", []):
+            path = str(item.get("path") or "").replace("\\", "/")
+            reason = str(item.get("reason") or "")
+            if path in dirty_set and reason.startswith("self-heal:") and path not in owned:
+                owned.append(path)
+        return owned
+
     def _review(self, tests: str) -> tuple[str, list["Fix"]]:
         """Ask the LLM for concrete, exact-string fixes.
 
@@ -306,33 +341,65 @@ class SelfHealer:
         return _parse_json(reply)
 
     def _apply_fixes(self, fixes: list["Fix"]) -> list[str]:
-        changed: list[str] = []
+        """Apply (or queue) the reviewed fixes.
+
+        Fixes are grouped PER FILE: several fixes may target one file, and
+        each queued edit is a whole-file replacement. Applying them one by
+        one would leave the second edit's "old" snapshot stale, so approving
+        the first would make the second conflict and silently fail.
+        """
+        by_file: dict[str, list["Fix"]] = {}
         for fx in fixes:
-            # Cap on DISTINCT files, not on fixes - several fixes may target
-            # one file, but a cycle that rewrites half the repo is wrong.
-            if len(set(changed)) >= self.max_files:
-                break
             if not _is_allowed(fx.file):
                 log.warning("selfheal: refusing %s (outside jrock/|tests)",
                             fx.file)
                 fx.applied = False
                 continue
-            p = ROOT / fx.file
+            if fx.file not in by_file:
+                if len(by_file) >= self.max_files:
+                    # Cap on DISTINCT files, not on fixes.
+                    continue
+                by_file[fx.file] = []
+            by_file[fx.file].append(fx)
+
+        changed: list[str] = []
+        for rel, file_fixes in by_file.items():
+            p = ROOT / rel
             try:
                 src = p.read_text(encoding="utf-8")
             except OSError:
-                fx.applied = False
+                for fx in file_fixes:
+                    fx.applied = False
                 continue
-            n = src.count(fx.old)
-            if n != 1:
-                log.warning("selfheal: anchor in %s matched %d times - skipped",
-                            fx.file, n)
-                fx.applied = False
+
+            working = src
+            touched = False
+            for fx in file_fixes:
+                n = working.count(fx.old)
+                if n != 1:
+                    log.warning("selfheal: anchor in %s matched %d times - skipped",
+                                rel, n)
+                    fx.applied = False
+                    continue
+                working = working.replace(fx.old, fx.new, 1)
+                fx.applied = True
+                touched = True
+            if not touched:
                 continue
-            p.write_text(src.replace(fx.old, fx.new, 1), encoding="utf-8")
-            fx.applied = True
-            if fx.file not in changed:
-                changed.append(fx.file)
+
+            if self.permission_manager is not None:
+                allowed, _diff = self.permission_manager.request_edit(
+                    rel, src, working,
+                    reason=f"self-heal: {rel}: exact-anchor repair")
+                if not allowed:
+                    # The fix is queued for explicit approval. Do not write it
+                    # now and do not claim it as applied.
+                    for fx in file_fixes:
+                        fx.applied = False
+                        fx.pending = True
+                    continue
+            p.write_text(working, encoding="utf-8")
+            changed.append(rel)
         return changed
 
     def _revert(self, files: list[str]) -> None:
@@ -371,6 +438,7 @@ class Fix:
     old: str
     new: str
     applied: bool = False
+    pending: bool = False
 
 
 # --------------------------------------------------------------------- helpers

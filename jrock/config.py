@@ -134,11 +134,10 @@ class Settings:
     breakeven_pct: float = 0.6
     trailing_trigger_roi_pct: float = 25.0
     #: Stop-loss distance from the entry, % of price (0 = none).
-    #: The stop is the user's setting; the app never invents one.
+    #: The stop is the user's setting unless ``sl_distance_auto`` is enabled.
     sl_distance_pct: float = 0.0
-    #: When True the agent derives the stop distance from signal strength
-    #: instead of using sl_distance_pct (weak 3%, normal 2%, strong 1.5%,
-    #: extreme 1%). 0 = none still disables stops entirely.
+    #: When True the agent derives the stop from signal strength, ATR and the
+    #: liquidation price (about 50 ROI points clear of liquidation).
     sl_distance_auto: bool = False
     min_agreeing: int = 3
     timeframes: list[str] = field(default_factory=lambda: ["1m", "3m", "5m", "15m"])
@@ -199,7 +198,7 @@ class Settings:
     #: by MIN_24H_VOLUME_USD, ranks by this method, and scans the top
     #: UNIVERSE_SIZING symbols instead of the static watchlist.
     universe_rank: str = ""
-    #: How many top-ranked symbols to keep in the auto universe (1..200). 0 = off.
+    #: How many top-ranked symbols to keep in the auto universe (1..50). 0 = off.
     universe_sizing: int = 0
     #: Minimum 24h quote volume (USDT) for a symbol to qualify for the auto universe.
     min_24h_volume_usdt: float = 0.0
@@ -230,9 +229,9 @@ class Settings:
     #:   PARTIAL  - scale out in stages: every rung of PARTIAL_TP_LADDER is its
     #:              own native tpsl/place_order with tpQty, parked at entry.
     tpsl_method: str = "POSITION"
-    #: PARTIAL ladder, "share@R" pairs: close share% of the position once price
-    #: runs R x the entry-to-stop distance. Example: "40@1,35@2,25@3" closes
-    #: 40% at 1R, 35% at 2R, 25% at 3R; the remainder rides the trailing stop.
+    #: PARTIAL ladder. Both "share@R" and "R:share" pairs are accepted:
+    #: close share% of the position once price runs R x the entry-to-stop
+    #: distance. Example: "1R:25,2R:25,3R:25,4R:25" scales out 25% at each R.
     partial_tp_ladder: str = "40@1,35@2,25@3"
     #: ACCOUNT: close every position when total unrealized PnL reaches these
     #: USDT thresholds. 0 disables that side. Both 0 = account TP/SL is off.
@@ -262,7 +261,8 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         load_dotenv(override=False)
 
     tfs = [t.strip() for t in os.getenv("TRADE_TIMEFRAMES", "1m,3m,5m,15m").split(",") if t.strip()]
-    syms = [s.strip().upper() for s in os.getenv("TRADE_SYMBOLS", "BTCUSDT").split(",") if s.strip()]
+    symbols_raw = os.getenv("SYMBOLS", os.getenv("TRADE_SYMBOLS", "AUTO"))
+    syms = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
 
     return Settings(
         base_url=os.getenv("BASE_URL", "https://api.openai.com/v1").rstrip("/"),
@@ -276,26 +276,26 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         auto_accept_edit=_b("AUTO_ACCEPT_EDIT", False),
         full_device_access=_b("FULL_DEVICE_ACCESS", False),
         block_destructive=_b("BLOCK_DESTRUCTIVE", True),
-        symbols=syms or ["BTCUSDT"],
+        symbols=syms or ["AUTO"],
         leverage=_i("TRADE_LEVERAGE", 10),
         margin_mode=os.getenv("TRADE_MARGIN_MODE", "ISOLATION").upper(),
         position_mode=os.getenv("TRADE_POSITION_MODE", "ONE_WAY").upper(),
-        max_open_positions=_i("TRADE_MAX_OPEN_POSITIONS", 3),
+        max_open_positions=_i("TRADE_MAX_OPEN_POSITIONS", 1),
         risk_pct=_f("TRADE_RISK_PCT", 1.0),
-        breakeven_pct=_f("TRADE_BREAKEVEN_PCT", 0.6),
-        trailing_trigger_roi_pct=_f("TRADE_TRAILING_TRIGGER_ROI_PCT", 25.0),
+        breakeven_pct=_f("TRADE_BREAKEVEN_PCT", 15.0),
+        trailing_trigger_roi_pct=_f("TRADE_TRAILING_TRIGGER_ROI_PCT", 20.0),
         sl_distance_pct=_f("TRADE_SL_DISTANCE_PCT", 0.0),
-        sl_distance_auto=_b("TRADE_SL_DISTANCE_AUTO", False),
-        min_agreeing=_i("TRADE_MIN_AGREING", 3),
+        sl_distance_auto=_b("TRADE_SL_DISTANCE_AUTO", True),
+        min_agreeing=_i("TRADE_MIN_AGREING", 2),
         timeframes=tfs or ["1m", "3m", "5m", "15m"],
-        min_confidence=_f("TRADE_MIN_CONFIDENCE", 70.0),
+        min_confidence=_f("TRADE_MIN_CONFIDENCE", 80.0),
         tf_min_confidence=_f("TRADE_TF_MIN_CONFIDENCE", 60.0),
-        scan_interval=_i("TRADE_SCAN_INTERVAL", 30),
+        scan_interval=_i("TRADE_SCAN_INTERVAL", 15),
         report_interval=_i("TRADE_REPORT_INTERVAL", 30),
         thinking_level=level_from_env(),
-        universe_rank=(os.getenv("UNIVERSE_RANK") or "").strip().upper(),
-        universe_sizing=_i("UNIVERSE_SIZING", 0),
-        min_24h_volume_usdt=_f("MIN_24H_VOLUME_USD", 0.0),
+        universe_rank=(os.getenv("UNIVERSE_RANK", "VOLUME") or "").strip().upper(),
+        universe_sizing=_i("UNIVERSE_SIZING", 50),
+        min_24h_volume_usdt=_f("MIN_24H_VOLUME_USD", 1_000_000.0),
         agent_max_steps=_i("AGENT_MAX_STEPS", 128),
         agent_thinking=(os.getenv("AGENT_THINKING") or "max").strip().lower(),
         agent_autonomous_sec=_i("AGENT_AUTONOMOUS_SEC", 15),
@@ -305,11 +305,11 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),
         max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
         max_notional_usdt=_f("MAX_NOTIONAL_USDT", 0.0),
-        margin_amount_pct=_f("MARGIN_AMOUNT_PCT", 10.0),
+        margin_amount_pct=_f("MARGIN_PER_TRADE", _f("MARGIN_AMOUNT_PCT", 100.0)),
         taker_fee_rate=_f("TAKER_FEE_RATE", 0.0006),
         margin_safety_pct=_f("MARGIN_SAFETY_PCT", 2.0),
         tpsl_method=_tpsl_method(),
-        partial_tp_ladder=os.getenv("PARTIAL_TP_LADDER", "40@1,35@2,25@3").strip(),
+        partial_tp_ladder=os.getenv("PARTIAL_TP_LADDER", "1R:25,2R:25,3R:25,4R:25").strip(),
         account_tp_usdt=_f("ACCOUNT_TP_USDT", 0.0),
         account_sl_usdt=_f("ACCOUNT_SL_USDT", 0.0),
         self_heal_interval_hours=_f("SELF_HEAL_INTERVAL_HOURS", 6.0),
@@ -319,14 +319,14 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
 
 
 def _tpsl_method() -> str:
-    """TPSL_METHOD=POSITION|PARTIAL, default POSITION.
+    """TPSL_METHOD=POSITION|PARTIAL, default PARTIAL.
 
     Trailing and Account TP/SL are always armed (they need no native endpoint
     and no selector), so the only real choice is which NATIVE exit shape a new
-    position gets. Anything unrecognised falls back to POSITION.
+    position gets. Anything unrecognised falls back to PARTIAL.
     """
-    v = (os.getenv("TPSL_METHOD") or "POSITION").strip().upper()
-    return v if v in ("POSITION", "PARTIAL") else "POSITION"
+    v = (os.getenv("TPSL_METHOD") or "PARTIAL").strip().upper()
+    return v if v in ("POSITION", "PARTIAL") else "PARTIAL"
 
 
 def _order_unit() -> str:

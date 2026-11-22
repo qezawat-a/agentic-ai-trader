@@ -29,6 +29,9 @@ class Aggregate:
     votes_short: list[Signal] = field(default_factory=list)
     reason: str = ""
     strength: str = "none"     # none | weak | normal | strong | extreme
+    #: Latest ATR as a percentage of price, averaged over the scanned
+    #: timeframes. 0 means no usable volatility sample.
+    atr_pct: float = 0.0
 
     @property
     def actionable(self) -> bool:

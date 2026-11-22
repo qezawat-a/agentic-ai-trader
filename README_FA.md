@@ -174,7 +174,7 @@ engine on | engine off              status
 report on | report off              report interval sec 30
 trades_history | tpsl_history | pnl | positions history
 settings trade                      scan on | scan off
-tpsl method POSITION|PARTIAL        partial ladder 40@1,35@2,25@3
+tpsl method POSITION|PARTIAL        partial ladder 1R:25,2R:25,3R:25,4R:25
 account tp usdt 100                 account sl usdt 50
 mid management position trigger     reversal=true   reversal_confidence=70
 scans interval sec 30               breakeven threshold pct 0.6
@@ -239,7 +239,7 @@ universe rank auto                  universe rank off
 
 ```
 universe rank GAINERS|LOSERS|VOLUME|MOVERS   # انتخاب روش
-universe sizing 20                          # اسکن ۲۰ نماد برتر (۱ تا ۲۰۰)
+universe sizing 20                          # اسکن ۲۰ نماد برتر (۱ تا ۵۰)
 universe volume 1000000                     # کف حجم ۲۴ ساعته به USDT
 universe rank auto                          # روشن؛ روش فعلی حفظ می‌شود، در نبود روش VOLUME
 universe rank off                           # خاموش (اندازهٔ تنظیم‌شده حفظ می‌شود)
@@ -252,7 +252,7 @@ universe rank off                           # خاموش (اندازهٔ تنظ�
 | متغیر | معنی |
 |---|---|
 | `UNIVERSE_RANK` | `GAINERS` \| `LOSERS` \| `VOLUME` \| `MOVERS`؛ خالی = خاموش |
-| `UNIVERSE_SIZING` | تعداد نمادهای برتر برای اسکن (۱ تا ۲۰۰؛ `0` = خاموش) |
+| `UNIVERSE_SIZING` | تعداد نمادهای برتر برای اسکن (۱ تا ۵۰؛ `0` = خاموش) |
 | `MIN_24H_VOLUME_USD` | کف حجم معاملات ۲۴ ساعته به USDT؛ `0` = بدون کف |
 
 رتبه‌بندی فقط وقتی فعال است که **هم** روش و **هم** اندازهٔ غیرصفر تنظیم شده باشند (مقدار زمان اجرا در `data/state.json` بر `.env` اولویت دارد). در این حالت، واچ‌لیست ثابت `TRADE_SYMBOLS` برای اسکن جایگزین می‌شود؛ اما فید وب‌سوکت همچنان نمادهای تنظیم‌شده و پوزیشن‌های باز را قیمت‌گذاری می‌کند. `/settings` مقادیر `universe rank`، `universe sizing` و `min 24h volume` را نشان می‌دهد.
@@ -780,7 +780,7 @@ python scripts/audit_api_contract.py --strict   # خروج ۱ روی هر یاف
 
 ```
 tpsl method PARTIAL            # انتخاب شکل خروج بومی
-partial ladder 40@1,35@2,25@3  # PARTIAL: ۴۰٪ در 1R، ۳۵٪ در 2R، ۲۵٪ در 3R
+partial ladder 1R:25,2R:25,3R:25,4R:25  # PARTIAL: ۲۵٪ در هر یک از 1R..4R
 partial ladder off             # بدون پله: بازگشت به POSITION
 account tp usdt 100            # ACCOUNT: بستن همه در +۱۰۰ USDT کل
 account sl usdt 50             # ACCOUNT: بستن همه در -۵۰ USDT کل
@@ -793,7 +793,7 @@ account sl usdt 50             # ACCOUNT: بستن همه در -۵۰ USDT کل
 هر پله یک `/tpsl/place_order` بومی مستقل با `tpQty` است که یک بار هنگام ورود فرستاده و روی صرافی پارک می‌شود. اگر موتور بمیرد، پله‌ها همچنان پر می‌شوند.
 
 ```
-PARTIAL_TP_LADDER=40@1,35@2,25@3
+PARTIAL_TP_LADDER=1R:25,2R:25,3R:25,4R:25
 ```
 
 | پله | تریگر | می‌بندد |
@@ -815,7 +815,7 @@ PARTIAL_TP_LADDER=40@1,35@2,25@3
 ```
 /tpsl                          # روش + نردبان + آستانه‌های حساب
 tpsl method PARTIAL            # انتخاب شکل خروج بومی
-partial ladder 40@1,35@2,25@3  # تنظیم (اعتبارسنجی‌شده؛ مشخصات غلط چیزی را عوض نمی‌کند)
+partial ladder 1R:25,2R:25,3R:25,4R:25  # تنظیم (اعتبارسنجی‌شده؛ مشخصات غلط چیزی را عوض نمی‌کند)
 partial ladder off             # بدون پله
 account tp usdt 100            # آستانهٔ TP حساب
 account sl usdt 50             # آستانهٔ SL حساب

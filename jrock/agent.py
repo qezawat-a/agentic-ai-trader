@@ -335,6 +335,7 @@ class JRockAgent:
             auto_accept_edit=self.s.auto_accept_edit,
             full_device_access=self.s.full_device_access,
             block_destructive=self.s.block_destructive,
+            root=ROOT,
         )
         self.tools = Tools(self.perms)
         self.store = open_store(self.s)
@@ -385,6 +386,14 @@ class JRockAgent:
         stored_model = self.store.get("model")
         if isinstance(stored_model, str) and stored_model:
             self.s.model = stored_model
+        stored_auto = self.store.get("auto_accept_edit")
+        if isinstance(stored_auto, bool):
+            self.s.auto_accept_edit = stored_auto
+            self.perms.auto_accept_edit = stored_auto
+        stored_device = self.store.get("full_device_access")
+        if isinstance(stored_device, bool):
+            self.s.full_device_access = stored_device
+            self.perms.full_device_access = stored_device
 
     # ------------------------------------------------------- thinking level
     @property
@@ -652,7 +661,7 @@ class JRockAgent:
             return self.cmd_think(rest)
         if cmd == "/memory":
             return self.cmd_memory(rest)
-        if cmd == "/code_review":
+        if cmd in ("/code_review", "/code_reveiew"):
             return self.cmd_code_review(rest)
         if cmd == "/bug_fix":
             return self.cmd_bug_fix(rest)
@@ -689,13 +698,20 @@ class JRockAgent:
             val = low.split()[-1]
             on = val in ("on", "true", "1", "yes")
             self.perms.auto_accept_edit = on
+            self.s.auto_accept_edit = on
+            self.store.set("auto_accept_edit", on)
+            mirror_env(ROOT / ".env", "AUTO_ACCEPT_EDIT", "true" if on else "false")
             self.perms.audit.write("toggle_auto_accept", value=on)
             return f"auto accept edit = {on}"
         if low.startswith("device access"):
             val = low.split()[-1]
-            self.perms.full_device_access = val in ("on", "true", "1", "yes")
-            self.perms.audit.write("toggle_device_access", value=self.perms.full_device_access)
-            return f"device access = {self.perms.full_device_access}"
+            on = val in ("on", "true", "1", "yes")
+            self.perms.full_device_access = on
+            self.s.full_device_access = on
+            self.store.set("full_device_access", on)
+            mirror_env(ROOT / ".env", "FULL_DEVICE_ACCESS", "true" if on else "false")
+            self.perms.audit.write("toggle_device_access", value=on)
+            return f"device access = {on}"
         if low == "audit":
             return json.dumps(self.perms.audit.tail(30), indent=2)
         if low == "pending":
@@ -708,8 +724,10 @@ class JRockAgent:
             idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
             item = self.perms.approve_pending(idx)
             if not item:
-                return "nothing to approve"
-            return f"approved {item['path']} - re-run the edit to apply it"
+                return ("nothing to approve (or the file changed since the "
+                        "edit was queued; review and retry)")
+            return (f"approved and applied {item['path']}. "
+                    "Run /selfheal once to verify and commit it.")
         return None
 
     async def _dispatch_trading_command(self, cmd: str, rest: str) -> str | None:
@@ -2612,7 +2630,8 @@ class JRockAgent:
         mode = mode.split()[0] if mode else "once"
         healer = getattr(self, "_healer", None)
         if healer is None:
-            healer = SelfHealer(self, auto_push=self.s.self_heal_auto_push)
+            healer = SelfHealer(self, auto_push=self.s.self_heal_auto_push,
+                                 permission_manager=self.perms)
             self._healer = healer
 
         if mode in ("status", "log"):

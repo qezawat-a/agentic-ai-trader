@@ -1,9 +1,10 @@
 import pytest
 
 from jrock.trader.risk import PairRules, Tier
-from jrock.trader.tpsl import (PositionState, mid_management_action,
-                               next_trailing_stop, plan_tpsl, should_breakeven,
-                               should_trail)
+from jrock.trader.tpsl import (PartialLadderError, PositionState,
+                               mid_management_action, next_trailing_stop,
+                               parse_partial_ladder, plan_tpsl,
+                               should_breakeven, should_trail)
 
 RULES = PairRules("BTCUSDT", base_precision=4, quote_precision=2)
 TIERS = [Tier(1, 0, 50000, 125, 0.004), Tier(2, 50000, 200000, 100, 0.005)]
@@ -55,8 +56,8 @@ def test_auto_sl_distance_comes_from_signal_strength():
     strong = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
                        strength="strong", confidence=90, tiers=TIERS,
                        rules=RULES, sl_distance_auto=True)
-    assert weak.sl == pytest.approx(97.0, rel=1e-6)      # 3% stop
-    assert strong.sl == pytest.approx(98.5, rel=1e-6)    # 1.5% stop
+    assert weak.sl == pytest.approx(94.9, rel=1e-6)      # 51% ROI stop
+    assert strong.sl == pytest.approx(95.9, rel=1e-6)    # 41% ROI stop
     assert strong.sl > weak.sl                           # tighter when stronger
     # a stop exists, so the TP the R-multiple derives from it exists too
     assert weak.tp > 100 and strong.tp > 100
@@ -71,7 +72,7 @@ def test_auto_wins_over_a_stale_manual_distance():
     p = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
                   strength="strong", confidence=90, tiers=TIERS, rules=RULES,
                   sl_distance_pct=35.0, sl_distance_auto=True)
-    assert p.sl == pytest.approx(98.5, rel=1e-6)         # 1.5%, not 35%
+    assert p.sl == pytest.approx(95.9, rel=1e-6)         # 41% ROI, not 35%
 
 
 def test_auto_with_no_signal_still_places_no_stop():
@@ -81,6 +82,35 @@ def test_auto_with_no_signal_still_places_no_stop():
                   sl_distance_auto=True)
     assert p.sl == 0.0
     assert p.tp == 0.0
+
+
+def test_auto_sl_keeps_about_fifty_roi_points_from_liquidation():
+    """The live auto policy anchors the stop near the liquidation price."""
+    p = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
+                  strength="normal", confidence=80, tiers=TIERS, rules=RULES,
+                  sl_distance_auto=True)
+    liq_roi = abs(p.liq - p.entry) / p.entry * 10 * 100
+    sl_roi = abs(p.entry - p.sl) / p.entry * 10 * 100
+    assert liq_roi - sl_roi == pytest.approx(50.0, rel=1e-6)
+
+
+def test_atr_can_only_widen_the_auto_stop_not_cross_liquidation():
+    p = plan_tpsl(side="LONG", entry=100.0, leverage=10, notional=1000,
+                  strength="normal", confidence=80, tiers=TIERS, rules=RULES,
+                  sl_distance_auto=True, atr_pct=8.0)
+    assert p.liq < p.sl < 100
+    assert p.sl_roi_pct <= abs((p.entry - p.liq) / p.entry * 10 * 100)
+
+
+def test_partial_ladder_accepts_the_operator_r_share_spelling():
+    rungs = parse_partial_ladder("1R:25,2R:25,3R:25,4R:25")
+    assert [(r.r, r.share) for r in rungs] == [
+        (1.0, 25.0), (2.0, 25.0), (3.0, 25.0), (4.0, 25.0)]
+
+
+def test_partial_ladder_rejects_a_bad_rung():
+    with pytest.raises(PartialLadderError):
+        parse_partial_ladder("1R:25,banana")
 
 
 def test_manual_distance_is_unchanged_when_auto_is_off():
